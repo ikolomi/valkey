@@ -5,20 +5,22 @@
  */
 
 /*
- * compression_header.c — Phase 0 stub (with working encode/decode).
+ * compression_header.c — per-value header codec + robj alloc/free helpers.
  *
- * The header format is simple and stable enough to implement in Phase
- * 0: encode writes four uint32s in native byte order; decode validates
- * that alg_magic matches a known algorithm tag. createCompressedObject
- * / freeCompressedObject are stubs because no code path actually
- * produces compressed frames yet.
+ * Phase 1 / S2.1 (plan §5):
+ *   - compressionHeaderEncode / Decode: native-byte-order codec for the
+ *     four-uint32 header described in detailed-design.md §5.2.
+ *   - createCompressedObject / freeCompressedObject: zero-copy install
+ *     and matching teardown for OBJ_ENCODING_COMPRESSED robjs.
  *
- * The encode/decode helpers are written to be used by unit tests in
- * Phase 1 (per-value header round-trip tests per plan §7).
+ * Concurrency: all entry points run on the main thread. Workers produce
+ * a flat buffer (header + frame) and hand it to createCompressedObject;
+ * the worker side never touches a robj (R2.11.4).
  */
 
 #include "server.h"
 #include "compression_header.h"
+#include "compression_registry.h"
 
 #include <string.h>
 
@@ -57,19 +59,65 @@ int compressionHeaderDecode(const unsigned char *src, compressedHeader *out) {
 }
 
 robj *createCompressedObject(void *buffer, size_t buffer_len) {
-    UNUSED(buffer);
-    UNUSED(buffer_len);
-    /* Phase 0: feature disabled, we never allocate compressed robjs.
-     * Returning NULL signals "fall back to uncompressed storage" to
-     * the Phase 1 installer. Note the header contract: on NULL
-     * return the caller retains ownership of `buffer` and must
-     * reclaim it with zfree — Phase 1 will follow the same rule for
-     * the validation-failure path. */
-    return NULL;
+    if (buffer == NULL) return NULL;
+    if (buffer_len < COMPRESSION_HEADER_SIZE) return NULL;
+
+    compressedHeader h;
+    if (compressionHeaderDecode((const unsigned char *)buffer, &h) != 0) {
+        /* Unknown alg_magic — treat as corrupt. Per the contract in
+         * compression_header.h, the caller retains ownership of
+         * `buffer` and must reclaim it. */
+        return NULL;
+    }
+
+    /* Validate that the buffer's size matches what the header claims.
+     * `compressed_len` is the frame size only; the buffer holds the
+     * 16-byte header in front of it. */
+    if (buffer_len != (size_t)COMPRESSION_HEADER_SIZE + h.compressed_len) {
+        return NULL;
+    }
+
+    /* Allocate the robj with the buffer as its value pointer. The
+     * caller already wrote the header + frame into `buffer`, so
+     * ownership transfers without a memcpy. createObject defaults
+     * encoding to OBJ_ENCODING_RAW; we override after construction. */
+    robj *o = createObject(OBJ_STRING, buffer);
+    o->encoding = OBJ_ENCODING_COMPRESSED;
+
+    /* Reference the dictionary that the frame was encoded with so the
+     * registry cannot retire it while this frame still exists
+     * (R2.3.4). For ZSTD, alg_meta is the dict_id; the
+     * COMPRESSION_DICT_ID_NONE sentinel (0) means "no dictionary"
+     * and is skipped. Other algorithms (none in v1) may use alg_meta
+     * for non-dictionary metadata; we deliberately gate the IncRef
+     * on the algorithm. */
+    if (h.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
+        h.alg_meta != COMPRESSION_DICT_ID_NONE) {
+        compressionRegistryIncRef(h.alg_meta);
+    }
+
+    return o;
 }
 
 void freeCompressedObject(robj *o) {
-    UNUSED(o);
-    /* Phase 0: no-op. In Phase 1 this will zfree(o->val_ptr) and
-     * compressionRegistryDecRef(header.alg_meta). */
+    if (o == NULL) return;
+    if (o->encoding != OBJ_ENCODING_COMPRESSED) return;
+
+    void *buffer = objectGetVal(o);
+    if (buffer == NULL) return;
+
+    /* Drop the dictionary reference taken in createCompressedObject.
+     * If the buffer's header is corrupt for any reason we still
+     * release the storage; we just cannot identify which dict_id to
+     * DecRef. This path is unreachable in normal operation because
+     * the header is validated on install. */
+    compressedHeader h;
+    if (compressionHeaderDecode((const unsigned char *)buffer, &h) == 0) {
+        if (h.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
+            h.alg_meta != COMPRESSION_DICT_ID_NONE) {
+            compressionRegistryDecRef(h.alg_meta);
+        }
+    }
+
+    zfree(buffer);
 }

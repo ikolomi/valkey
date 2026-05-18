@@ -776,6 +776,9 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_QUICKLIST 9  /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
+#define OBJ_ENCODING_COMPRESSED 12 /* String stored as compressedHeader + compressed frame.
+                                    * Storage is owned by a zmalloc'd buffer pointed to by
+                                    * val_ptr; see src/compression_header.h for the layout. */
 
 #define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */

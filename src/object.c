@@ -36,6 +36,7 @@
 #include "util.h"
 #include "vset.h"
 #include "zmalloc.h"
+#include "compression_header.h"
 #include "sds.h"
 #include "module.h"
 #include <math.h>
@@ -555,6 +556,8 @@ robj *createModuleObject(moduleType *mt, void *value) {
 void freeStringObject(robj *o) {
     if (o->encoding == OBJ_ENCODING_RAW) {
         sdsfree(objectGetVal(o));
+    } else if (o->encoding == OBJ_ENCODING_COMPRESSED) {
+        freeCompressedObject(o);
     }
 }
 
