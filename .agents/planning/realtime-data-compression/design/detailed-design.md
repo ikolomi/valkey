@@ -197,7 +197,7 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 - **R2.11.1** Dedicated compression worker pool, sized by `compression-threads` (int, default `1`, range `0..16`, `MODIFIABLE_CONFIG`). `0` = disabled (feature becomes no-op). Separate from `io-threads`. (Q8)
 - **R2.11.2** Sweep pacing: `compression-sweep-max-cpu-pct` (int, default `25`, range `1..100`, `MODIFIABLE_CONFIG`). Applied only to background sweep batches; training and multi-key compression are naturally arrival-bounded. (Q8)
 - **R2.11.3** CPU pinning: `compression_cpulist` (string, default empty). Follows the existing `bio_cpulist` / `aof_rewrite_cpulist` precedent. (Q8)
-- **R2.11.4** Compression workers never touch `robj`. They consume and produce flat byte buffers. The main thread owns all `robj` mutation. (Q8)
+- **R2.11.4** Compression workers never touch `robj`, the dictionary registry, or refcounts. They receive flat byte buffers and a `CDict*` pointer in the job struct, produce a compressed output buffer, and return it via the outbox. The main thread owns all `robj` mutation, all registry access, and all refcount management. (Q8)
 
 ### 2.12 Configuration summary
 
@@ -323,7 +323,7 @@ graph LR
 
 Separation invariants:
 - The worker pool is independent of `io-threads`. They are sized and scheduled separately.
-- Workers never touch `robj`. Main thread owns all `robj` mutation.
+- Workers never touch `robj`, the dictionary registry, or refcounts. They receive flat bytes + a `CDict*` pointer and produce compressed output. Main thread owns all `robj` mutation and registry access.
 - `bio` is reused for training (one-at-a-time, long-running); not for per-value compression.
 - Synchronous decompression runs on the main thread directly; no offload.
 
@@ -418,7 +418,7 @@ typedef struct compressionRegistry {
 } compressionRegistry;
 ```
 
-The registry is **single-writer (main thread)**. Reads can happen from workers (for digested dicts) and the main thread (for decompression). Readers atomically load `active` or look up by dictID; they hold a pointer for the duration of a single compress/decompress call, then release it. Retirement waits until `refcount == 0`; this is guaranteed to happen eventually as old frames are rewritten/expired, or forced via `COMPRESSION SWEEP`.
+The registry is **main-thread only** — both reads and writes happen exclusively on the main thread. Workers never access the registry; they receive the `CDict*` pointer directly in the job struct (see §4.6 `compressionJob`). Decompression also runs on the main thread (R2.5.1), so `compressionRegistryLookup` is single-threaded. Retirement waits until `refcount == 0`; this is guaranteed to happen eventually as old frames are rewritten/expired, or forced via `COMPRESSION SWEEP`.
 
 ### 4.5 `COMPRESSION` subcommand container
 
@@ -473,8 +473,15 @@ typedef struct compressionJob {
                                   because the immutable-snapshot invariant (R2.4.4)
                                   guarantees the sds metadata bytes are not mutated
                                   while the worker holds the reference. */
-    uint32_t      dict_id;     /* snapshot of active dict_id at enqueue (see rationale
-                                  below) */
+    uint32_t      dict_id;     /* snapshot of active dict_id at enqueue; carried into
+                                  the compressed frame header so decompression can
+                                  look up the correct DDict. */
+    ZSTD_CDict   *cdict;      /* pointer to the CDict resolved by the main thread at
+                                  enqueue time. The worker uses this directly — it
+                                  never accesses the registry. The pointer remains
+                                  valid because the main thread holds a registry
+                                  refcount (via compressionRegistryIncRef) for the
+                                  duration of the in-flight job. */
     /* filled by worker: */
     void         *dst;         /* zmalloc'd buffer: compressedHeader + compressed frame.
                                   Ownership transfers to the main thread on outbox
@@ -491,8 +498,14 @@ typedef struct compressionJob {
 - Enqueue holds `incrRefCount(val)` so the sds pointer stays valid for the worker **and** the object has `refcount >= 2`, which forces any subsequent mutating command to COW instead of mutating in place (Valkey's `dbUnshareStringValue` discipline — see R2.4.4 and R2.4.5 for the invariant and its enforcement).
 - On the outbox side, the main thread re-fetches the current `robj` for the key; if it has changed (version counter moved), the compressed result is discarded.
 - `decrRefCount(val)` is called after the outbox handler finishes. This drops the refcount back to 1 and restores in-place-mutate eligibility for future commands.
+- `compressionRegistryDecRef(dict_id)` is called by the main thread on **every** completion path (success, discard due to version mismatch, or error). This is the single point where the dict refcount is released for in-flight jobs. The main thread owns all refcount operations — workers never call incRef/decRef.
 
-**Why the main thread snapshots `dict_id` at enqueue** (rather than letting the worker read `registry->active`): the registry is documented in §4.4 as single-writer with no worker readers. If the worker read `active` at compress time, it would become a reader, and refcount management would have to be thread-safe from workers too — incref-on-load with retry against retirement, decref-on-done on every path. Snapshotting `dict_id` at enqueue on the main thread, paired with the existing refcount bump, keeps the registry's concurrency surface at "main-thread writes, no reads from workers." Staleness is bounded and harmless: if retraining promotes a new dict between enqueue and worker pickup, the in-flight job compresses with the older (still valid) dict, the frame carries its `dict_id` so decompression continues to work, and the next enqueue picks up the new dict.
+**Why the main thread passes `cdict` directly in the job** (rather than letting the worker look it up from `dict_id`): the registry is single-writer (main thread) with no concurrent readers. If workers called `compressionRegistryLookup(dict_id)` at compress time, the registry would need read-side synchronization and workers would need to manage refcounts (incref-on-load, decref-on-done on every path including error paths). Passing the `cdict` pointer directly avoids all of this — the main thread resolves the pointer and holds the refcount; the worker just uses it. The pointer is guaranteed valid because:
+1. The main thread calls `compressionRegistryIncRef(dict_id)` before enqueue.
+2. A dict with refcount > 0 cannot be freed (retirement only frees at refcount == 0).
+3. The main thread calls `compressionRegistryDecRef(dict_id)` after processing the result.
+
+Staleness is bounded and harmless: if retraining promotes a new dict between enqueue and worker pickup, the in-flight job compresses with the older (still valid) dict, the frame carries its `dict_id` so decompression continues to work, and the next enqueue picks up the new dict.
 
 **Why the worker produces a flat `dst` buffer and not an `robj`**: this is the §2.11 R2.11.4 invariant — compression workers never touch `robj`. Three reasons it stays this way: (1) `robj` manipulation in Valkey assumes single-threaded access (no atomics on refcount, shared-object singletons, LRU/LFU bit updates, encoding-tag swaps); moving `robj` work to workers would silently break those assumptions. (2) Failed compressions (net-savings guard in R2.4.3) are cheap to discard — `zfree(dst)` — rather than allocate-and-free an entire `robj` container. (3) The `robj` container still has to be allocated and installed on the main thread anyway, because it carries LRU/LFU bits inherited from the old object and has to be swapped into the kvstore. Worker-side flat buffer + main-thread `createCompressedObject(buffer, len)` splits the work along the invariant without a memcpy — the zero-copy ownership contract in `compression_header.h` makes this explicit.
 
