@@ -376,16 +376,16 @@ ifeq ($(BUILD_TLS),module)
 endif
 
 # Real-time compression feature (BUILD_ZSTD=yes by default).
-# When BUILD_ZSTD=yes the compression.c stubs are compiled into
-# valkey-server as ordinary .o files (Phase 0 — no ZSTD linkage yet).
-# When BUILD_ZSTD=no the USE_ZSTD macro is not defined; the stubs
-# continue to compile (they do not call any ZSTD APIs in Phase 0)
-# but Phase 1 code that relies on ZSTD will compile out.
+# When BUILD_ZSTD=yes the compression code links against the vendored
+# libzstd.a (deps/zstd/) and defines USE_ZSTD so ZSTD API calls compile in.
+# When BUILD_ZSTD=no USE_ZSTD is not defined; the
+# compression stubs compile but all ZSTD-dependent code paths are elided.
 # See .agents/planning/realtime-data-compression/implementation/plan.md §5.
 BUILD_ZSTD ?= yes
 ifeq ($(BUILD_ZSTD),yes)
-	FINAL_CFLAGS+=-DUSE_ZSTD=$(BUILD_YES)
-	# Phase 1 will append: FINAL_LIBS += ../deps/zstd/lib/libzstd.a
+	DEPENDENCY_TARGETS+= zstd
+	FINAL_CFLAGS+=-DUSE_ZSTD=$(BUILD_YES) -I../deps/zstd
+	FINAL_LIBS+=../deps/zstd/libzstd.a
 endif
 
 RDMA_LIBS=

@@ -42,6 +42,7 @@ distclean:
 	-(cd jemalloc && [ -f Makefile ] && $(MAKE) distclean) > /dev/null || true
 	-(cd hdr_histogram && $(MAKE) clean) > /dev/null || true
 	-(cd fpconv && $(MAKE) clean) > /dev/null || true
+	-(cd zstd && $(MAKE) clean) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
@@ -81,6 +82,12 @@ fpconv: .make-prerequisites
 	cd fpconv && $(MAKE) CFLAGS="-fPIC $(CFLAGS)"
 
 .PHONY: fpconv
+
+zstd: .make-prerequisites
+	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
+	cd zstd && $(MAKE) libzstd.a CFLAGS="-fPIC -O3 $(CFLAGS)"
+
+.PHONY: zstd
 
 ifeq ($(uname_S),SunOS)
 	# Make isinf() available
