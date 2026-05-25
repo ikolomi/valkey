@@ -62,23 +62,34 @@ int compressionHeaderDecode(const unsigned char *src, compressedHeader *out) {
 }
 
 robj *createCompressedObject(int type, void *buffer, size_t buffer_len) {
-    if (buffer == NULL) return NULL;
-    if (buffer_len < COMPRESSION_HEADER_SIZE) return NULL;
+    /* Most input checks here are programmer-error guards, not corruption
+     * checks. The convention is documented in
+     *   .agents/planning/realtime-data-compression/research/error-handling-conventions.md
+     *
+     * - `buffer != NULL`: callers (worker outbox, RDB load) never pass
+     *   NULL legitimately. Bug.
+     * - `buffer_len >= COMPRESSION_HEADER_SIZE`: callers allocate the
+     *   buffer as HEADER + compressed_len. Smaller is impossible by
+     *   construction. Bug.
+     * - `buffer_len == HEADER + h.compressed_len`: same — the caller
+     *   wrote the header value matching the allocation. Mismatch is
+     *   impossible by construction. Bug.
+     *
+     * Only the alg_magic check is true corruption handling: bytes from
+     * disk can present any 4-byte sequence, so we return NULL and let
+     * the caller (typically RDB load) report via rdbReportCorruptRDB. */
+    serverAssert(buffer != NULL);
+    serverAssert(buffer_len >= COMPRESSION_HEADER_SIZE);
 
     compressedHeader h;
     if (compressionHeaderDecode((const unsigned char *)buffer, &h) != 0) {
-        /* Unknown alg_magic — treat as corrupt. Per the contract in
+        /* Unknown alg_magic — treat as corruption. Per the contract in
          * compression_header.h, the caller retains ownership of
          * `buffer` and must reclaim it. */
         return NULL;
     }
 
-    /* Validate that the buffer's size matches what the header claims.
-     * `compressed_len` is the frame size only; the buffer holds the
-     * 16-byte header in front of it. */
-    if (buffer_len != (size_t)COMPRESSION_HEADER_SIZE + h.compressed_len) {
-        return NULL;
-    }
+    serverAssert(buffer_len == (size_t)COMPRESSION_HEADER_SIZE + h.compressed_len);
 
     /* Allocate the robj with the buffer as its value pointer. The
      * caller already wrote the header + frame into `buffer`, so

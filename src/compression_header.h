@@ -126,9 +126,9 @@ int compressionHeaderDecode(const unsigned char *src,
  * OBJ_STRING; future types extend without changing this signature.
  *
  * Contract (zero-copy by construction):
- *   - `buffer` MUST have been allocated with zmalloc (or zrealloc'd
- *     down from a zmalloc'd allocation). `freeCompressedObject` will
- *     eventually reclaim it via `zfree`.
+ *   - `buffer` MUST be non-NULL and MUST have been allocated with
+ *     zmalloc (or zrealloc'd down from a zmalloc'd allocation).
+ *     `freeCompressedObject` will eventually reclaim it via `zfree`.
  *   - `buffer` MUST start with a valid `compressedHeader` followed by
  *     `compressed_len` bytes of compressed frame payload. Producers
  *     (compression workers) write the header + frame directly into the
@@ -137,14 +137,16 @@ int compressionHeaderDecode(const unsigned char *src,
  *   - After this call returns, the caller MUST NOT use, free, or
  *     mutate `buffer`. Ownership transfers to the returned robj.
  *
- * No memcpy is performed: the worker's compressed output is the
- * robj's storage, end-to-end. This is load-bearing for the §2.11
- * R2.11.4 invariant (workers never touch robj) combined with the
- * design's memory-accounting goals — cheap install, cheap discard.
+ * Contract violations (NULL buffer, undersized buffer, size mismatch
+ * vs. header) are treated as programmer errors and raise serverAssert.
+ * The convention is documented under
+ *   .agents/planning/realtime-data-compression/research/error-handling-conventions.md
  *
- * Returns NULL if the buffer's header fails validation (in which case
- * `buffer` is NOT freed — the caller retains ownership and must
- * reclaim it). */
+ * Returns NULL only when the header's `alg_magic` is unrecognized — the
+ * one input byte that can legitimately be corrupt (e.g. when called
+ * from an RDB load path with disk corruption). On NULL return the
+ * caller retains ownership of `buffer` and must reclaim it via zfree;
+ * RDB-load callers additionally invoke rdbReportCorruptRDB(). */
 robj *createCompressedObject(int type, void *buffer, size_t buffer_len);
 
 /* Frees the compressed buffer owned by a robj with

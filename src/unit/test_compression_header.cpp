@@ -167,18 +167,15 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectSuccess) {
     decrRefCount(o);
 }
 
-TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsNull) {
-    ASSERT_EQ(nullptr, createCompressedObject(OBJ_STRING, nullptr, 100));
-}
-
-TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsTooSmall) {
-    /* Buffer smaller than the 16-byte header cannot possibly be valid. */
-    unsigned char tiny[COMPRESSION_HEADER_SIZE - 1] = {0};
-    ASSERT_EQ(nullptr, createCompressedObject(OBJ_STRING, tiny, sizeof(tiny)));
-}
-
 TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsBadMagic) {
-    /* Header decodes structurally but has an unknown alg_magic. */
+    /* Header decodes structurally but has an unknown alg_magic. This is
+     * the only legitimate "rejection" path: bytes from disk can present
+     * any 4-byte sequence, so we return NULL (caller — typically RDB
+     * load — wraps with rdbReportCorruptRDB). The other rejection-style
+     * conditions (NULL buffer, undersized buffer, size mismatch vs.
+     * header) are programmer errors and raise serverAssert; tests for
+     * those would crash the gtest process and aren't included here.
+     * See research/error-handling-conventions.md for the convention. */
     constexpr uint32_t kCompressedLen = 8u;
     void *buf = makeCompressedBuffer(/*alg_magic=*/0xBAADF00Du,
                                      /*alg_meta=*/0u,
@@ -190,22 +187,6 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsBadMagic) {
     ASSERT_EQ(nullptr, o);
 
     /* Caller retains ownership on rejection. */
-    zfree(buf);
-}
-
-TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsSizeMismatch) {
-    /* Header advertises a 32-byte frame but we hand it a buffer sized
-     * for a 16-byte frame. createCompressedObject must reject. */
-    void *buf = makeCompressedBuffer(COMPRESSION_ALG_ZSTD_MAGIC,
-                                     /*dict_id=*/1u,
-                                     /*uncompressed_len=*/64u,
-                                     /*compressed_len=*/32u);
-    /* Lie about the buffer length: only header + 16 bytes. */
-    size_t too_small = (size_t)COMPRESSION_HEADER_SIZE + 16u;
-
-    robj *o = createCompressedObject(OBJ_STRING, buf, too_small);
-    ASSERT_EQ(nullptr, o);
-
     zfree(buf);
 }
 
