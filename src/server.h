@@ -764,21 +764,19 @@ typedef struct ValkeyModuleType moduleType;
 /* Objects encoding. Some kind of objects like Strings and Hashes can be
  * internally represented in multiple ways. The 'encoding' field of the object
  * is set to one of this fields for this object. */
-#define OBJ_ENCODING_RAW 0        /* Raw representation */
-#define OBJ_ENCODING_INT 1        /* Encoded as integer */
-#define OBJ_ENCODING_HASHTABLE 2  /* Encoded as a hashtable */
-#define OBJ_ENCODING_ZIPMAP 3     /* No longer used: old hash encoding. */
-#define OBJ_ENCODING_LINKEDLIST 4 /* No longer used: old list encoding. */
-#define OBJ_ENCODING_ZIPLIST 5    /* No longer used: old list/hash/zset encoding. */
-#define OBJ_ENCODING_INTSET 6     /* Encoded as intset */
-#define OBJ_ENCODING_SKIPLIST 7   /* Encoded as skiplist */
-#define OBJ_ENCODING_EMBSTR 8     /* Embedded sds string encoding */
-#define OBJ_ENCODING_QUICKLIST 9  /* Encoded as linked list of listpacks */
-#define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
-#define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
-#define OBJ_ENCODING_COMPRESSED 12 /* String stored as compressedHeader + compressed frame.
-                                    * Storage is owned by a zmalloc'd buffer pointed to by
-                                    * val_ptr; see src/compression_header.h for the layout. */
+#define OBJ_ENCODING_RAW 0         /* Raw representation */
+#define OBJ_ENCODING_INT 1         /* Encoded as integer */
+#define OBJ_ENCODING_HASHTABLE 2   /* Encoded as a hashtable */
+#define OBJ_ENCODING_ZIPMAP 3      /* No longer used: old hash encoding. */
+#define OBJ_ENCODING_LINKEDLIST 4  /* No longer used: old list encoding. */
+#define OBJ_ENCODING_ZIPLIST 5     /* No longer used: old list/hash/zset encoding. */
+#define OBJ_ENCODING_INTSET 6      /* Encoded as intset */
+#define OBJ_ENCODING_SKIPLIST 7    /* Encoded as skiplist */
+#define OBJ_ENCODING_EMBSTR 8      /* Embedded sds string encoding */
+#define OBJ_ENCODING_QUICKLIST 9   /* Encoded as linked list of listpacks */
+#define OBJ_ENCODING_STREAM 10     /* Encoded as a radix tree of listpacks */
+#define OBJ_ENCODING_LISTPACK 11   /* Encoded as a listpack */
+#define OBJ_ENCODING_COMPRESSED 12 /* String encoded as compressedHeader + ZSTD frame; see compression_header.h */
 
 #define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */

@@ -50,6 +50,7 @@
 
 #include "server.h"
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -75,8 +76,11 @@ typedef struct compressedHeader {
     uint32_t compressed_len;
 } compressedHeader;
 
-_Static_assert(sizeof(compressedHeader) == COMPRESSION_HEADER_SIZE,
-               "compressedHeader must be exactly 16 bytes");
+/* Compile-time size check. `static_assert` is C11 (via <assert.h>) and C++11
+ * (keyword), so this header is includable from both C sources and the gtest
+ * unit tests under src/unit/. */
+static_assert(sizeof(compressedHeader) == COMPRESSION_HEADER_SIZE,
+              "compressedHeader must be exactly 16 bytes");
 
 /* ========================================================================
  * Encoding / decoding
@@ -93,8 +97,8 @@ void compressionHeaderEncode(unsigned char *dst,
                              uint32_t compressed_len);
 
 /* Reads a header from `src` and validates that alg_magic is one of the
- * supported algorithms. Returns 0 on success, -1 if the magic is not
- * recognized (caller treats as corrupt value). */
+ * supported algorithms. `out` MUST be non-NULL. Returns 0 on success,
+ * -1 if the magic is not recognized (caller treats as corrupt value). */
 int compressionHeaderDecode(const unsigned char *src,
                             compressedHeader *out);
 
@@ -105,10 +109,21 @@ int compressionHeaderDecode(const unsigned char *src,
  * Called by the compression main-thread install path (§2.4 R2.4.3) and
  * the complementary free path (driven by `freeStringObject` /
  * `decrRefCount` in object.c once the hot path is wired in Phase 1).
+ *
+ * The API is type-polymorphic by design: the per-value compressed
+ * buffer (header + ZSTD frame) is type-agnostic, and the create/free
+ * pair operates the same way regardless of which object type the
+ * compressed value came from. v1 only emits compressed values for
+ * `OBJ_STRING` (the eligibility predicate enforces this); v2+ may
+ * emit compressed values for HASH / ZSET / etc. without API changes
+ * to this layer — they only need to extend the eligibility filter.
  */
 
-/* Creates an OBJ_STRING robj with encoding=OBJ_ENCODING_COMPRESSED that
+/* Creates an robj with `type` and encoding=OBJ_ENCODING_COMPRESSED that
  * TAKES OWNERSHIP of `buffer`.
+ *
+ * `type` is one of OBJ_STRING / OBJ_HASH / etc. v1 only ever passes
+ * OBJ_STRING; future types extend without changing this signature.
  *
  * Contract (zero-copy by construction):
  *   - `buffer` MUST have been allocated with zmalloc (or zrealloc'd
@@ -130,10 +145,15 @@ int compressionHeaderDecode(const unsigned char *src,
  * Returns NULL if the buffer's header fails validation (in which case
  * `buffer` is NOT freed — the caller retains ownership and must
  * reclaim it). */
-robj *createCompressedObject(void *buffer, size_t buffer_len);
+robj *createCompressedObject(int type, void *buffer, size_t buffer_len);
 
 /* Frees the compressed buffer owned by a robj with
- * encoding=OBJ_ENCODING_COMPRESSED. Called from freeStringObject. */
+ * encoding=OBJ_ENCODING_COMPRESSED. Called from freeStringObject (and,
+ * in v2, from analogous free helpers for other types). The free path
+ * is type-agnostic — it operates on the compressed buffer's header,
+ * not on the source object's type — so this single function services
+ * every type that uses OBJ_ENCODING_COMPRESSED. The caller guarantees
+ * `o->encoding == OBJ_ENCODING_COMPRESSED`. */
 void freeCompressedObject(robj *o);
 
 #endif /* __COMPRESSION_HEADER_H */

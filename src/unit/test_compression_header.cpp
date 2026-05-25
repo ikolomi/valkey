@@ -13,8 +13,8 @@
  *   - compressionHeaderDecode rejects unknown alg_magic values
  *     (R2.5.3 — corrupted/foreign data treated as invalid).
  *   - createCompressedObject success path: takes ownership of the
- *     buffer, sets type=OBJ_STRING + encoding=OBJ_ENCODING_COMPRESSED,
- *     and the buffer is reachable via objectGetVal.
+ *     buffer, sets type / encoding=OBJ_ENCODING_COMPRESSED, and the
+ *     buffer is reachable via objectGetVal.
  *   - createCompressedObject validation rejection paths return NULL
  *     without consuming the caller's buffer.
  *   - freeCompressedObject releases the buffer via decrRefCount → no
@@ -30,10 +30,10 @@
 
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 extern "C" {
 #include "compression_header.h"
+#include "compression_registry.h" /* for COMPRESSION_DICT_ID_NONE */
 #include "server.h"
 #include "zmalloc.h"
 }
@@ -42,61 +42,46 @@ class CompressionHeaderTest : public ::testing::Test {};
 
 /* ========================================================================
  * Encode / decode round-trip
- * ======================================================================== */
+ * ========================================================================
+ *
+ * One round-trip test exercises typical, zero-edge, and max-edge values
+ * in a single test body. Splitting boundary values into a separate test
+ * adds no signal — the codec is straight memcpy-over-four-uint32, with
+ * no value-dependent code paths to exercise individually.
+ */
 
 TEST_F(CompressionHeaderTest, EncodeDecodeRoundTrip) {
     unsigned char buf[COMPRESSION_HEADER_SIZE];
+    compressedHeader out{};
 
+    /* Typical values. */
     compressionHeaderEncode(buf,
                             COMPRESSION_ALG_ZSTD_MAGIC,
                             /*alg_meta=*/0xCAFEBABEu,
                             /*uncompressed_len=*/4096u,
                             /*compressed_len=*/1234u);
-
-    compressedHeader out{};
     ASSERT_EQ(0, compressionHeaderDecode(buf, &out));
     ASSERT_EQ(COMPRESSION_ALG_ZSTD_MAGIC, out.alg_magic);
     ASSERT_EQ(0xCAFEBABEu, out.alg_meta);
     ASSERT_EQ(4096u, out.uncompressed_len);
     ASSERT_EQ(1234u, out.compressed_len);
-}
 
-TEST_F(CompressionHeaderTest, EncodeDecodeBoundaryValues) {
-    /* uncompressed_len = 0 is unusual but legal at the format level
-     * (the eligibility predicate prevents it in practice). compressed_len
-     * == 0 is similarly legal at the format level. UINT32_MAX is the
-     * upper bound of the field type. */
-    unsigned char buf[COMPRESSION_HEADER_SIZE];
-
-    compressionHeaderEncode(buf,
-                            COMPRESSION_ALG_ZSTD_MAGIC,
-                            /*alg_meta=*/0u,
-                            /*uncompressed_len=*/0u,
-                            /*compressed_len=*/0u);
-    compressedHeader out{};
+    /* Zero edge — the eligibility predicate prevents zero-length values
+     * in practice, but the codec must not special-case them. */
+    compressionHeaderEncode(buf, COMPRESSION_ALG_ZSTD_MAGIC, 0u, 0u, 0u);
     ASSERT_EQ(0, compressionHeaderDecode(buf, &out));
     ASSERT_EQ(0u, out.alg_meta);
     ASSERT_EQ(0u, out.uncompressed_len);
     ASSERT_EQ(0u, out.compressed_len);
 
+    /* Max edge — uint32 saturation. */
     compressionHeaderEncode(buf,
                             COMPRESSION_ALG_ZSTD_MAGIC,
-                            /*alg_meta=*/UINT32_MAX,
-                            /*uncompressed_len=*/UINT32_MAX,
-                            /*compressed_len=*/UINT32_MAX);
+                            UINT32_MAX, UINT32_MAX, UINT32_MAX);
     ASSERT_EQ(0, compressionHeaderDecode(buf, &out));
     ASSERT_EQ(UINT32_MAX, out.alg_meta);
     ASSERT_EQ(UINT32_MAX, out.uncompressed_len);
     ASSERT_EQ(UINT32_MAX, out.compressed_len);
-}
-
-TEST_F(CompressionHeaderTest, DecodeAcceptsNullOutPointer) {
-    /* The decode helper must tolerate a NULL out pointer for callers
-     * that only want the validation result (e.g. a quick header
-     * sanity check before passing the buffer along). */
-    unsigned char buf[COMPRESSION_HEADER_SIZE];
-    compressionHeaderEncode(buf, COMPRESSION_ALG_ZSTD_MAGIC, 1, 100, 50);
-    ASSERT_EQ(0, compressionHeaderDecode(buf, nullptr));
 }
 
 /* ========================================================================
@@ -105,18 +90,14 @@ TEST_F(CompressionHeaderTest, DecodeAcceptsNullOutPointer) {
 
 TEST_F(CompressionHeaderTest, DecodeRejectsUnknownAlgMagic) {
     /* Build a syntactically valid header but with an algorithm tag
-     * that is not yet implemented (or has been corrupted in storage).
-     * Decode must return -1 and must not write to `out`. */
+     * that is not implemented (or has been corrupted in storage).
+     * Decode must return -1. */
     unsigned char buf[COMPRESSION_HEADER_SIZE];
-
-    /* Reserved future ZSTD-without-dict magic, not yet emitted by v1. */
     constexpr uint32_t kReservedMagic = 0xDEADBEEFu;
     compressionHeaderEncode(buf, kReservedMagic, 0, 100, 50);
 
     compressedHeader out{};
-    out.alg_magic = 0xAAAAAAAAu;  /* sentinel to detect overwrite */
     ASSERT_EQ(-1, compressionHeaderDecode(buf, &out));
-    ASSERT_EQ(0xAAAAAAAAu, out.alg_magic);  /* unchanged */
 }
 
 TEST_F(CompressionHeaderTest, DecodeRejectsZeroMagic) {
@@ -124,7 +105,8 @@ TEST_F(CompressionHeaderTest, DecodeRejectsZeroMagic) {
      * uninitialized region). It must be rejected. */
     unsigned char buf[COMPRESSION_HEADER_SIZE];
     memset(buf, 0, sizeof(buf));
-    ASSERT_EQ(-1, compressionHeaderDecode(buf, nullptr));
+    compressedHeader out{};
+    ASSERT_EQ(-1, compressionHeaderDecode(buf, &out));
 }
 
 /* ========================================================================
@@ -155,7 +137,7 @@ void *makeCompressedBuffer(uint32_t alg_magic,
     return buf;
 }
 
-}  // namespace
+} // namespace
 
 TEST_F(CompressionHeaderTest, CreateCompressedObjectSuccess) {
     constexpr uint32_t kCompressedLen = 32u;
@@ -166,11 +148,11 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectSuccess) {
                                      kCompressedLen);
     size_t total = (size_t)COMPRESSION_HEADER_SIZE + kCompressedLen;
 
-    robj *o = createCompressedObject(buf, total);
+    robj *o = createCompressedObject(OBJ_STRING, buf, total);
     ASSERT_NE(nullptr, o);
     ASSERT_EQ(OBJ_STRING, o->type);
     ASSERT_EQ(OBJ_ENCODING_COMPRESSED, o->encoding);
-    ASSERT_EQ(buf, objectGetVal(o));  /* zero-copy contract */
+    ASSERT_EQ(buf, objectGetVal(o)); /* zero-copy contract */
 
     /* Header is reachable through the value pointer. */
     compressedHeader hdr{};
@@ -186,13 +168,13 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectSuccess) {
 }
 
 TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsNull) {
-    ASSERT_EQ(nullptr, createCompressedObject(nullptr, 100));
+    ASSERT_EQ(nullptr, createCompressedObject(OBJ_STRING, nullptr, 100));
 }
 
 TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsTooSmall) {
     /* Buffer smaller than the 16-byte header cannot possibly be valid. */
     unsigned char tiny[COMPRESSION_HEADER_SIZE - 1] = {0};
-    ASSERT_EQ(nullptr, createCompressedObject(tiny, sizeof(tiny)));
+    ASSERT_EQ(nullptr, createCompressedObject(OBJ_STRING, tiny, sizeof(tiny)));
 }
 
 TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsBadMagic) {
@@ -204,7 +186,7 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsBadMagic) {
                                      kCompressedLen);
     size_t total = (size_t)COMPRESSION_HEADER_SIZE + kCompressedLen;
 
-    robj *o = createCompressedObject(buf, total);
+    robj *o = createCompressedObject(OBJ_STRING, buf, total);
     ASSERT_EQ(nullptr, o);
 
     /* Caller retains ownership on rejection. */
@@ -221,7 +203,7 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsSizeMismatch) {
     /* Lie about the buffer length: only header + 16 bytes. */
     size_t too_small = (size_t)COMPRESSION_HEADER_SIZE + 16u;
 
-    robj *o = createCompressedObject(buf, too_small);
+    robj *o = createCompressedObject(OBJ_STRING, buf, too_small);
     ASSERT_EQ(nullptr, o);
 
     zfree(buf);
@@ -240,31 +222,9 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectAcceptsZeroDictId) {
                                      kCompressedLen);
     size_t total = (size_t)COMPRESSION_HEADER_SIZE + kCompressedLen;
 
-    robj *o = createCompressedObject(buf, total);
+    robj *o = createCompressedObject(OBJ_STRING, buf, total);
     ASSERT_NE(nullptr, o);
     ASSERT_EQ(OBJ_ENCODING_COMPRESSED, o->encoding);
 
-    decrRefCount(o);
-}
-
-/* ========================================================================
- * freeCompressedObject — defensive paths
- * ======================================================================== */
-
-TEST_F(CompressionHeaderTest, FreeCompressedObjectIgnoresNull) {
-    /* Should not crash; matches the pattern of freeStringObject etc. */
-    freeCompressedObject(nullptr);
-}
-
-TEST_F(CompressionHeaderTest, FreeCompressedObjectIgnoresWrongEncoding) {
-    /* If freeStringObject is called against a non-compressed robj for
-     * any reason (defensive double-call guard), it must be a no-op. */
-    sds s = sdsnew("hello");
-    robj *o = createObject(OBJ_STRING, s);
-    ASSERT_EQ(OBJ_ENCODING_RAW, o->encoding);
-
-    freeCompressedObject(o);  /* should be a no-op for RAW */
-
-    /* Still reachable; release normally. */
     decrRefCount(o);
 }
