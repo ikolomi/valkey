@@ -84,8 +84,14 @@ robj *objectGetUncompressedView(robj *o, sds *scratch);
  *
  * Runs on the main thread. Cheap; designed to be inlined at the call site
  * once the Phase 1 eligibility predicate lands.
+ *
+ * The signature takes `robj *` (not `const robj *`) because the predicate's
+ * LFU branch reads the freq counter via `lfu_getFrequency()`, which decays
+ * the counter in place — matching the standard Valkey "decay-on-read"
+ * pattern (see objectGetIdleness in src/object.c). For LRU/noeviction
+ * modes there is no mutation.
  */
-int compressionIsEligible(const robj *o, const sds key);
+int compressionIsEligible(robj *o, const sds key);
 void compressionEnqueueCandidate(const sds key, robj *o);
 
 /* ========================================================================
