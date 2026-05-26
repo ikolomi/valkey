@@ -186,10 +186,13 @@ Within `OBJ_STRING`, not every value is a good compression candidate. We need a 
 - `encoding == OBJ_ENCODING_RAW`. Skip `OBJ_ENCODING_INT` (already memory-optimal — a packed long) and `OBJ_ENCODING_EMBSTR` (≤ 44 B, also memory-optimal; header overhead would exceed any possible compression savings).
 - `refcount != OBJ_SHARED_REFCOUNT`. Shared RESP constants are never in a db anyway, but we assert it.
 - `sdslen(val) >= compression-min-value-size` (default `256 B`). Values below this cannot recoup the ~16 B header plus dict-registry amortized cost. Research §6 of the previous message.
-- **Skip hot items — universal, not tied to `maxmemory-policy`.** The `robj->lru` field is updated on every read regardless of eviction policy (gated only by `LOOKUP_NOTOUCH` and fork), so idle-time data is available under every policy — including `noeviction`. Two independent checks, both applied in every mode:
-  - **Recent-write protection** (settle): skip if `write_age(obj) < compression-settle-seconds` (default `60 s`). Prevents compressing a key that was just written and is likely to be rewritten.
-  - **Recent-access protection** (idle): skip if `idle_seconds(obj) < compression-min-idle-seconds` (default `60 s`). Prevents compressing a key that was just read. Uses `estimateObjectIdleTime()` which works uniformly across LRU, LFU, and `noeviction`.
-  - **LFU-specific additional guard** (only when LFU is the eviction policy, since the counter isn't maintained otherwise): skip if `lfu_freq(obj) >= compression-lfu-threshold` (default `5`, on the 0–255 log scale). Acts as a belt-and-suspenders check for frequency-of-access patterns LRU idle can miss.
+- **Skip hot items — policy-aware.** Valkey's 24-bit `robj->lru` field stores different metrics depending on `maxmemory-policy` (see `src/lrulfu.h`). The eligibility predicate uses the appropriate metric for each:
+  - **LRU / `noeviction` modes** (`robj->lru` is seconds-based): apply two time thresholds against `lru_idle_secs(obj)`:
+    - **Recent-write protection** (settle): skip if `lru_idle_secs(obj) < compression-settle-seconds` (default `60 s`). Prevents compressing a key that was just written.
+    - **Recent-access protection** (idle): skip if `lru_idle_secs(obj) < compression-min-idle-seconds` (default `60 s`). Prevents compressing a key that was just read.
+
+      Both knobs apply to the same metric — `robj->lru` is touched on read AND write, so v1 cannot distinguish source. The dual surface lets operators express two intents ("recently written" vs "recently read"); effective threshold is `max(settle, min_idle)`.
+  - **LFU mode** (`robj->lru` encodes a freq counter, no per-second timestamp): apply the freq threshold instead — skip if `lfu_freq(obj) >= compression-lfu-threshold` (default `5`, on the 0–255 log scale). The time-based knobs are inactive in this mode; the freq counter IS the access-recency signal.
 - **Skip post-compression if we don't actually save.** After the worker compresses, on the main thread we compare `compressed_size + header >= uncompressed_size * (1 - compression-min-savings-ratio)` (default `10%`). If true: discard the compressed form, leave the value uncompressed, and **mark the key as incompressible-under-this-dict** — record `(key, failed_dict_id, timestamp)` in a side hashtable so sweepers skip the key. The key becomes retry-eligible when **either** (primary) the active dictID differs from `failed_dict_id` (new dict was promoted → incompressibility may have changed), **or** (fallback) `age(timestamp) >= compression-retry-interval` (default `1 h`, handles edge cases like content changes that alter compressibility while the dict stays stable). This honors the semantic that incompressibility is dict-scoped, not time-scoped (Q6b, PR-review T-3188785185).
 
 **Open sub-questions for you:**
@@ -206,7 +209,7 @@ Within `OBJ_STRING`, not every value is a good compression candidate. We need a 
 
 **Answer:** All three sub-decisions go with the recommendation.
 
-- **(Q6a)** *Superseded by review (see PR threads T-3167775681 / T-3167859080): the eligibility model is no longer policy-dependent.* The write-age settle window AND an idle-time (read-recency) check are **both always applied, in every eviction policy, including `noeviction`**. This uses Valkey's 24-bit `robj->lru` field, which is updated on every read regardless of whether the policy is LRU/LFU/noeviction/etc., so `estimateObjectIdleTime()` is a reliable read-hotness signal universally. An extra LFU-frequency check runs on top when LFU is the eviction policy (since LFU's counter is only maintained in that mode).
+- **(Q6a)** *Superseded by review (see PR threads T-3167775681 / T-3167859080), then refined again during S2.2 implementation review: the eligibility model is **policy-aware**, not policy-uniform.* In **LRU and `noeviction` modes**, both thresholds (`compression-settle-seconds`, `compression-min-idle-seconds`) apply to `lru_idle_secs(obj)` — Valkey's 24-bit `robj->lru` field is seconds-based in these modes. In **LFU mode**, `robj->lru` encodes a freq counter (not a timestamp), so the time-based thresholds do not apply meaningfully; the LFU branch (`lfu_freq(obj) < compression-lfu-threshold`) filters by frequency instead. The dual-knob operator surface is preserved across modes, but the underlying metric switches with policy. (See `src/lrulfu.h` for the encoding details. A future v2 could add a per-object write-time field to make the time-based checks meaningful in LFU mode too; v1 explicitly rejected this because the 24-bit LRU field is packed tight.)
 - **(Q6b)** Include the **dict-scoped retry guard** in v1. When the post-compression savings check fails, record `(key, failed_dict_id, timestamp)` in a side hashtable `incompressibleKeys{}`; sweepers skip keys present in this table. Retry-eligibility is `failed_dict_id != current_active_dict_id` (primary signal: new dict promoted) **or** `age(timestamp) >= compression-retry-interval` (fallback: handles content changes under a stable dict, default `1 h`). Entries are evicted from the table on successful compression or on explicit `DEL` of the key. Counter tracked in `INFO compression` (`compression_skipped_incompressible`).
 - **(Q6c)** **v1 scope is STRING only** (`type == OBJ_STRING`, eligible encoding `RAW`; `EMBSTR` ≤ 44 B and `INT` are skipped — see eligibility filter). HASH/SET/ZSET/LIST/STREAM are explicit v2+ work. The encoding-tag approach remains structurally extensible so future types can piggyback on the same infrastructure.
 
@@ -215,14 +218,19 @@ Within `OBJ_STRING`, not every value is a good compression candidate. We need a 
 ```
 eligible(obj) ⇔
     obj->type == OBJ_STRING
- && obj->encoding == RAW
- && obj->refcount != SHARED
+ && obj->encoding == OBJ_ENCODING_RAW
+ && obj->refcount != OBJ_SHARED_REFCOUNT
  && sdslen(val) >= compression-min-value-size
  && (compression-max-value-size == 0 || sdslen(val) <= compression-max-value-size)
- && retry_eligible(obj)                                       // see post-compression guard below
- && write_age(obj)       >= compression-settle-seconds        // always applied
- && idle_seconds(obj)    >= compression-min-idle-seconds      // always applied (works under LRU, LFU, noeviction)
- && (!lfu_mode || lfu_freq(obj) < compression-lfu-threshold)  // LFU additional guard, only when LFU is active
+ && retry_eligible(obj)                                                      // see post-compression guard below
+ //
+ // Hot-key skip — the metric depends on maxmemory-policy. In LRU and
+ // noeviction modes, robj->lru is seconds-based; in LFU mode it encodes a
+ // freq counter (see src/lrulfu.h). Apply the appropriate guard:
+ //
+ && (lfu_mode || lru_idle_secs(obj) >= compression-settle-seconds)            // LRU/noeviction
+ && (lfu_mode || lru_idle_secs(obj) >= compression-min-idle-seconds)          // LRU/noeviction
+ && (!lfu_mode || lfu_freq(obj) < compression-lfu-threshold)                  // LFU
 ```
 
 Where, for `entry = incompressibleKeys[key_hash]`:
