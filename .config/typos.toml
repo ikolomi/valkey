@@ -19,6 +19,7 @@ optin = "optin"
 smove = "smove"
 Parth = "Parth" # seems like the spellchecker does not like it is similar to "Path"
 nd = "nd"
+clen = "clen" # "compressed length" abbreviation; allowed in code excerpts in markdown
 
 [default]
 extend-ignore-re = [

@@ -33,10 +33,21 @@
 
 extern "C" {
 #include "compression_header.h"
-#include "compression_registry.h" /* for COMPRESSION_DICT_ID_NONE */
 #include "server.h"
 #include "zmalloc.h"
 }
+
+/* Sentinel value for "no dictionary" — mirrors COMPRESSION_DICT_ID_NONE
+ * in src/compression_registry.h. We don't include compression_registry.h
+ * from C++ because the Phase 0 stub uses `<stdatomic.h>` and
+ * `atomic_size_t`, which are C-only pre-C++23. The pattern that DOES
+ * work for C++ (see src/queues.h + tests/unit/test_queues.cpp) is the
+ * `_Atomic(T)` keyword syntax without including `<stdatomic.h>` in the
+ * public header. Refactoring compression_registry.h to follow that
+ * pattern is tracked as a follow-up for S1's owner; until then, this
+ * literal mirrors the constant. If COMPRESSION_DICT_ID_NONE ever
+ * changes from 0, this file must update with it. */
+static constexpr uint32_t kNoDictId = 0u;
 
 class CompressionHeaderTest : public ::testing::Test {};
 
@@ -150,8 +161,8 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectSuccess) {
 
     robj *o = createCompressedObject(OBJ_STRING, buf, total);
     ASSERT_NE(nullptr, o);
-    ASSERT_EQ(OBJ_STRING, o->type);
-    ASSERT_EQ(OBJ_ENCODING_COMPRESSED, o->encoding);
+    ASSERT_EQ((unsigned)OBJ_STRING, o->type);
+    ASSERT_EQ((unsigned)OBJ_ENCODING_COMPRESSED, o->encoding);
     ASSERT_EQ(buf, objectGetVal(o)); /* zero-copy contract */
 
     /* Header is reachable through the value pointer. */
@@ -191,21 +202,21 @@ TEST_F(CompressionHeaderTest, CreateCompressedObjectRejectsBadMagic) {
 }
 
 TEST_F(CompressionHeaderTest, CreateCompressedObjectAcceptsZeroDictId) {
-    /* alg_meta == COMPRESSION_DICT_ID_NONE (0) is structurally valid
-     * — it means "ZSTD without a dictionary." v1 doesn't emit this
-     * (the eligibility filter requires a trained dict) but the
-     * codec must accept it; the IncRef call is conditional on
-     * dict_id != 0 so this also exercises that branch. */
+    /* alg_meta == 0 (the COMPRESSION_DICT_ID_NONE sentinel) is
+     * structurally valid — it means "ZSTD without a dictionary." v1
+     * doesn't emit this (the eligibility filter requires a trained
+     * dict) but the codec must accept it; the IncRef call is
+     * conditional on dict_id != 0 so this also exercises that branch. */
     constexpr uint32_t kCompressedLen = 4u;
     void *buf = makeCompressedBuffer(COMPRESSION_ALG_ZSTD_MAGIC,
-                                     /*dict_id=*/COMPRESSION_DICT_ID_NONE,
+                                     /*dict_id=*/kNoDictId,
                                      /*uncompressed_len=*/8u,
                                      kCompressedLen);
     size_t total = (size_t)COMPRESSION_HEADER_SIZE + kCompressedLen;
 
     robj *o = createCompressedObject(OBJ_STRING, buf, total);
     ASSERT_NE(nullptr, o);
-    ASSERT_EQ(OBJ_ENCODING_COMPRESSED, o->encoding);
+    ASSERT_EQ((unsigned)OBJ_ENCODING_COMPRESSED, o->encoding);
 
     decrRefCount(o);
 }
