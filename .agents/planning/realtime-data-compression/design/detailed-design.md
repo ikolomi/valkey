@@ -74,15 +74,15 @@ eligible(obj) ⇔
  && obj->refcount != OBJ_SHARED_REFCOUNT
  && sdslen(val) >= compression-min-value-size
  && (compression-max-value-size == 0 || sdslen(val) <= compression-max-value-size)
- && retry_eligible(obj)                                                      // see post-compression guard below
- //
- // Hot-key skip — the metric depends on maxmemory-policy. In LRU and
- // noeviction modes, robj->lru is seconds-based; in LFU mode it encodes a
- // freq counter (see src/lrulfu.h). Apply the appropriate guard:
- //
- && (lfu_mode || lru_idle_secs(obj) >= compression-settle-seconds)            // LRU/noeviction
- && (lfu_mode || lru_idle_secs(obj) >= compression-min-idle-seconds)          // LRU/noeviction
- && (!lfu_mode || lfu_freq(obj) < compression-lfu-threshold)                  // LFU
+ && retry_eligible(obj)                                       // see post-compression guard below
+ && hot_key_check(obj)                                        // see below — policy-aware
+
+where hot_key_check(obj) is:
+    if lfu_mode:                                              // robj->lru encodes a freq counter
+        lfu_freq(obj) < compression-lfu-threshold
+    else:                                                     // LRU/noeviction: robj->lru is seconds-based
+        lru_idle_secs(obj) >= compression-settle-seconds
+        AND lru_idle_secs(obj) >= compression-min-idle-seconds
 ```
 (Q6, Q7)
 
