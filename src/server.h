@@ -2412,8 +2412,7 @@ struct valkeyServer {
     int compression_min_savings_ratio;              /* Post-compression net-savings guard (percent). Default: 10. */
     int compression_retry_interval;                 /* Fallback retry period (seconds). Default: 3600. */
     int compression_lfu_threshold;                  /* LFU skip-hot-key additional guard. Default: 5. */
-    int compression_min_idle_seconds;               /* Universal read-hotness skip. Default: 60. */
-    int compression_settle_seconds;                 /* Universal write-recency skip. Default: 60. */
+    int compression_min_idle_seconds;               /* LRU/noeviction read-recency skip; inactive in LFU mode. Default: 60. */
     int compression_dict_first_training_keys_count; /* First-training trigger. Default: 10000. */
     int compression_dict_drift_ratio;               /* Retrain drift trigger (percent). Default: 70. */
     int compression_dict_refresh_interval;          /* Optional periodic retrain (seconds; 0 = disabled). Default: 0. */

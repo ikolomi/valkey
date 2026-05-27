@@ -81,17 +81,16 @@ where hot_key_check(obj) is:
     if lfu_mode:                                              // robj->lru encodes a freq counter
         lfu_freq(obj) < compression-lfu-threshold
     else:                                                     // LRU/noeviction: robj->lru is seconds-based
-        lru_idle_secs(obj) >= compression-settle-seconds
-        AND lru_idle_secs(obj) >= compression-min-idle-seconds
+        lru_idle_secs(obj) >= compression-min-idle-seconds
 ```
 (Q6, Q7)
 
-The dual-knob operator surface (`compression-settle-seconds` and `compression-min-idle-seconds`) is preserved across policies, but the underlying metric switches with policy:
+The eligibility surface has a single time-based knob in LRU/noeviction modes (`compression-min-idle-seconds`) and a single freq-based knob in LFU mode (`compression-lfu-threshold`):
 
-- **LRU and noeviction modes:** `robj->lru` is touched on every read and every write, so `lru_idle_secs(obj)` reflects time-since-last-touch regardless of source. Both knobs apply to the same metric; effective threshold is `max(settle, min_idle)`. The two knobs let operators express two intents — "recently written" and "recently read" — even though v1 doesn't track them separately.
-- **LFU mode:** `robj->lru` encodes a 16-bit minutes counter + 8-bit freq counter. There is no per-second access timestamp, so the time-based thresholds cannot be applied meaningfully. The freq counter IS the access-recency signal — high freq = recently or repeatedly accessed — and `compression-lfu-threshold` filters on it directly.
+- **LRU and noeviction modes:** `robj->lru` is touched on every read and every write, so `lru_idle_secs(obj)` reflects time-since-last-touch regardless of source. v1 cannot distinguish read-recency from write-recency from this single signal, so a single threshold gates eligibility on the "value has been quiet long enough to be worth compressing" property.
+- **LFU mode:** `robj->lru` encodes a 16-bit minutes counter + 8-bit freq counter. There is no per-second access timestamp, so the time-based threshold cannot be applied meaningfully. The freq counter IS the access-recency signal — high freq = recently or repeatedly accessed — and `compression-lfu-threshold` filters on it directly.
 
-A future v2 could add a per-object write-time field to make the time-based checks meaningful in LFU mode too. v1 explicitly rejected this (Thread #19) because the 24-bit LRU field is packed tight.
+Earlier drafts of this design also exposed `compression-settle-seconds` as a "recent-write protection" knob alongside `compression-min-idle-seconds`. Both compared to the same metric (`lru_idle_secs(obj)`), so the effective behavior was always `idle >= max(settle, min_idle)` — the second knob added no expressive power v1 could deliver, only a footgun (operators tuning them differently expecting different effects). The dual surface was justified as forward-compat for a hypothetical v2 with per-object write-time tracking; per the YAGNI principle and Valkey's preference for minimal operator surfaces (see PR #1 Thread #3, the 5+11 → 5+10 split), v1 ships only the single knob. v2 can reintroduce a second knob non-breakingly when the underlying signal genuinely supports it.
 
 **Post-compression net-savings guard** runs on the main thread after the worker returns:
 
@@ -230,7 +229,7 @@ All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is do
 | `compression-max-value-size` | bytes | `131072` | upper size bound (0 = unbounded; default 128 KiB bounds worst-case sync decompression latency) |
 | `compression-dict-size` | bytes | `102400` | zstd trainer target dict size |
 
-#### Advanced knobs (11)
+#### Advanced knobs (10)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
@@ -238,9 +237,8 @@ All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is do
 | `compression_cpulist` | string | `""` | CPU pinning |
 | `compression-min-savings-ratio` | percent | `10` | post-compression net-savings guard |
 | `compression-retry-interval` | seconds | `3600` | fallback retry period for the dict-scoped incompressible-keys guard (primary retry signal is active-dict change; this interval catches content changes that alter compressibility while the dict stays stable — see R2.4 / Q6b) |
-| `compression-lfu-threshold` | int | `5` | LFU skip-hot-key additional guard (only active in LFU eviction mode) |
-| `compression-min-idle-seconds` | seconds | `60` | LRU/noeviction read-recency skip; applies to `lru_idle_secs(obj)`. Inactive in LFU mode (LFU branch uses `compression-lfu-threshold` instead). |
-| `compression-settle-seconds` | seconds | `60` | LRU/noeviction write-recency skip; applies to `lru_idle_secs(obj)`. Inactive in LFU mode (see above). |
+| `compression-lfu-threshold` | int | `5` | LFU skip-hot-key guard (only active in LFU eviction mode) |
+| `compression-min-idle-seconds` | seconds | `60` | LRU/noeviction time-based skip; applies to `lru_idle_secs(obj)`. Inactive in LFU mode (LFU branch uses `compression-lfu-threshold` instead). |
 | `compression-dict-first-training-keys-count` | int | `10000` | first-training trigger |
 | `compression-dict-drift-ratio` | percent | `70` | retrain drift trigger |
 | `compression-dict-refresh-interval` | seconds | `0` | optional periodic retrain (0 = disabled) |
@@ -749,7 +747,6 @@ A new `--compression` flag on each Tcl test driver starts the server under test 
 --compression-max-value-size 0            # no upper bound
 --compression-lfu-threshold 255
 --compression-min-idle-seconds 0
---compression-settle-seconds 0
 --compression-min-savings-ratio 0
 --compression-retry-interval 0
 --compression-dict-first-training-keys-count 10

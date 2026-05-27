@@ -3530,7 +3530,6 @@ standardConfig static_configs[] = {
     createIntConfig("compression-retry-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_retry_interval, 3600, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-lfu-threshold", NULL, MODIFIABLE_CONFIG, 0, 255, server.compression_lfu_threshold, 5, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-min-idle-seconds", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_min_idle_seconds, 60, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("compression-settle-seconds", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_settle_seconds, 60, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-dict-first-training-keys-count", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_dict_first_training_keys_count, 10000, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-dict-drift-ratio", NULL, MODIFIABLE_CONFIG, 0, 100, server.compression_dict_drift_ratio, 70, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-dict-refresh-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_dict_refresh_interval, 0, INTEGER_CONFIG, NULL, NULL),

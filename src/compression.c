@@ -141,17 +141,18 @@ int compressionIsEligible(robj *o, const sds key) {
      * different `maxmemory-policy` modes (see src/lrulfu.h):
      *
      *   - LRU and noeviction: seconds-based access time.
-     *     `lru_getIdleSecs(o->lru)` returns seconds-since-last-touch.
-     *     Both `compression-settle-seconds` (recent-write proxy) and
-     *     `compression-min-idle-seconds` (recent-read proxy) apply to
-     *     this metric. v1 cannot distinguish read-recency from
-     *     write-recency (both touch the lru field), so the dual surface
-     *     gives operators two intents that share an underlying signal;
-     *     effective threshold is max(settle, min_idle).
+     *     `lru_getIdleSecs(o->lru)` returns seconds-since-last-touch
+     *     (read OR write — the lru field is touched on every access,
+     *     gated only by LOOKUP_NOTOUCH and fork). v1 cannot
+     *     distinguish read-recency from write-recency from this
+     *     single signal, so a single threshold —
+     *     `compression-min-idle-seconds` — gates eligibility on the
+     *     "value has been quiet long enough to be worth compressing"
+     *     property.
      *
      *   - LFU: 16-bit minutes counter + 8-bit log freq counter. There
-     *     is no per-second access timestamp, so the time-based knobs
-     *     are inactive in this mode. The freq counter IS the
+     *     is no per-second access timestamp, so the time-based knob
+     *     is inactive in this mode. The freq counter IS the
      *     access-recency signal; `compression-lfu-threshold` filters
      *     directly on it.
      *
@@ -168,7 +169,6 @@ int compressionIsEligible(robj *o, const sds key) {
     } else {
         /* LRU / noeviction. Read-only — no decay. */
         uint32_t idle_secs = lru_getIdleSecs(o->lru);
-        if (idle_secs < (uint32_t)server.compression_settle_seconds) return 0;
         if (idle_secs < (uint32_t)server.compression_min_idle_seconds) return 0;
     }
 

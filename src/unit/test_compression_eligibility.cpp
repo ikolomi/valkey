@@ -36,7 +36,6 @@ class CompressionEligibilityTest : public ::testing::Test {
     int saved_compression_enabled;
     size_t saved_min_value_size;
     size_t saved_max_value_size;
-    int saved_settle_seconds;
     int saved_min_idle_seconds;
     int saved_lfu_threshold;
     int saved_maxmemory_policy;
@@ -46,7 +45,6 @@ class CompressionEligibilityTest : public ::testing::Test {
         saved_compression_enabled = server.compression_enabled;
         saved_min_value_size = server.compression_min_value_size;
         saved_max_value_size = server.compression_max_value_size;
-        saved_settle_seconds = server.compression_settle_seconds;
         saved_min_idle_seconds = server.compression_min_idle_seconds;
         saved_lfu_threshold = server.compression_lfu_threshold;
         saved_maxmemory_policy = server.maxmemory_policy;
@@ -55,7 +53,6 @@ class CompressionEligibilityTest : public ::testing::Test {
         server.compression_enabled = 1;
         server.compression_min_value_size = 256;
         server.compression_max_value_size = 131072;
-        server.compression_settle_seconds = 60;
         server.compression_min_idle_seconds = 60;
         server.compression_lfu_threshold = 5;
 
@@ -67,7 +64,6 @@ class CompressionEligibilityTest : public ::testing::Test {
         server.compression_enabled = saved_compression_enabled;
         server.compression_min_value_size = saved_min_value_size;
         server.compression_max_value_size = saved_max_value_size;
-        server.compression_settle_seconds = saved_settle_seconds;
         server.compression_min_idle_seconds = saved_min_idle_seconds;
         server.compression_lfu_threshold = saved_lfu_threshold;
         server.maxmemory_policy = saved_maxmemory_policy;
@@ -238,8 +234,7 @@ TEST_F(CompressionEligibilityTest, MaxSizeZeroDisablesUpperBound) {
  * ============================================================ */
 
 TEST_F(CompressionEligibilityTest, LruRejectsRecentTouch) {
-    /* Idle below settle threshold → not eligible. */
-    server.compression_settle_seconds = 60;
+    /* Idle below threshold → not eligible. */
     server.compression_min_idle_seconds = 60;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 30);
@@ -247,18 +242,7 @@ TEST_F(CompressionEligibilityTest, LruRejectsRecentTouch) {
     decrRefCount(o);
 }
 
-TEST_F(CompressionEligibilityTest, LruRejectsBetweenSettleAndMinIdle) {
-    /* When the two knobs differ, the larger one dominates. */
-    server.compression_settle_seconds = 30;
-    server.compression_min_idle_seconds = 120;
-    robj *o = makeRawString(1024);
-    setLruIdleSecs(o, 60);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
-    decrRefCount(o);
-}
-
-TEST_F(CompressionEligibilityTest, LruAcceptsBeyondBothThresholds) {
-    server.compression_settle_seconds = 60;
+TEST_F(CompressionEligibilityTest, LruAcceptsBeyondThreshold) {
     server.compression_min_idle_seconds = 60;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 120);
@@ -266,8 +250,16 @@ TEST_F(CompressionEligibilityTest, LruAcceptsBeyondBothThresholds) {
     decrRefCount(o);
 }
 
-TEST_F(CompressionEligibilityTest, LruZeroThresholdsAcceptImmediately) {
-    server.compression_settle_seconds = 0;
+TEST_F(CompressionEligibilityTest, LruAtThresholdAcceptsBoundary) {
+    /* Exact-equal idle is "old enough" — boundary is `>=`. */
+    server.compression_min_idle_seconds = 60;
+    robj *o = makeRawString(1024);
+    setLruIdleSecs(o, 60);
+    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    decrRefCount(o);
+}
+
+TEST_F(CompressionEligibilityTest, LruZeroThresholdAcceptsImmediately) {
     server.compression_min_idle_seconds = 0;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 0);
@@ -286,7 +278,6 @@ TEST_F(CompressionEligibilityTest, NoevictionUsesLruTimeBasedCheck) {
     server.maxmemory_policy = MAXMEMORY_NO_EVICTION;
     lrulfu_updateClockAndPolicy(server.mstime,
                                 (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != 0);
-    server.compression_settle_seconds = 60;
     server.compression_min_idle_seconds = 60;
 
     robj *o = makeRawString(1024);
@@ -326,17 +317,16 @@ TEST_F(CompressionEligibilityTest, LfuAcceptsBelowThreshold) {
     decrRefCount(o);
 }
 
-TEST_F(CompressionEligibilityTest, LfuTimeKnobsAreInactive) {
-    /* Setting the time-based knobs to extreme values must NOT affect
+TEST_F(CompressionEligibilityTest, LfuTimeKnobIsInactive) {
+    /* Setting the time-based knob to an extreme value must NOT affect
      * the LFU branch — the time check is policy-skipped. */
     useLfuPolicy();
     server.compression_lfu_threshold = 255; /* always pass freq guard */
-    server.compression_settle_seconds = INT_MAX;
     server.compression_min_idle_seconds = INT_MAX;
 
     robj *o = makeRawString(1024);
     setLfuFreq(o, 0); /* well below freq threshold */
-    /* Despite settle/min_idle being max, the LFU branch ignores them. */
+    /* Despite min_idle being INT_MAX, the LFU branch ignores it. */
     EXPECT_EQ(1, compressionIsEligible(o, NULL));
     decrRefCount(o);
 }

@@ -161,7 +161,7 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 #### @ikolomi track (S2/S5)
 
 - [x] **S2.1 — Header encode/decode** (`compression_header.c`): round-trip tests, malformed-header rejection (R2.5.3). Allocation helpers for `OBJ_ENCODING_COMPRESSED` robjs.
-- [ ] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), `write_age`, `idle_seconds`, LFU-freq guard (only when LFU policy active), incompressible-keys hashtable check.
+- [ ] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), policy-aware hot-key skip (`lru_idle_secs` >= `compression-min-idle-seconds` in LRU/noeviction, `lfu_freq` < `compression-lfu-threshold` in LFU), incompressible-keys hashtable check.
 - [ ] **S2.3 — Incompressible-keys hashtable**: dict-ID scoped primary + time fallback. Implements Thread #20 resolution.
 - [ ] **S2.4 — Worker pool** (`compression_workers.c`): thread startup/shutdown per `compression-threads`, SPMC inbox, MPSC outbox. Workers never touch `robj` (R2.11.4).
 - [ ] **S2.5 — Encoder path**: main thread enqueues candidate with `incrRefCount`; worker reads sds bytes, compresses via `ZSTD_compress_usingCDict`, enqueues result.
