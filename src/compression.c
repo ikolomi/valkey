@@ -33,12 +33,27 @@
  * ======================================================================== */
 
 void compressionInit(void) {
-    /* Phase 0: no-op. */
-    /* TODO(Phase 1):
-     *   compressionRegistryInit();
-     *   compressionWorkersStart(server.compression_threads);
-     *   compressionTrainInit();
-     */
+    /* Order matters: registry must be ready before workers start, so
+     * any in-flight worker that loads the active dict pointer sees a
+     * fully-initialized registry. compressionRegistryRelease in
+     * compressionShutdown() runs AFTER the workers have been joined
+     * (its header comment requires this). */
+    compressionRegistryInit();
+    if (compressionWorkersStart(server.compression_threads) != 0) {
+        serverLog(LL_WARNING,
+                  "Compression: worker pool failed to start. The feature "
+                  "will be inert until restart or 'CONFIG SET compression-threads' "
+                  "succeeds.");
+    }
+    /* TODO(S1.x): compressionTrainInit(); */
+}
+
+/* Called from finishShutdown in src/server.c. Must run BEFORE
+ * compressionRegistryRelease so workers do not race the registry's
+ * teardown. */
+void compressionShutdown(void) {
+    compressionWorkersStop();
+    compressionRegistryRelease();
 }
 
 void compressionCron(void) {
@@ -47,10 +62,28 @@ void compressionCron(void) {
 }
 
 void compressionAfterSleep(void) {
-    /* Phase 0: no-op. */
-    /* TODO(Phase 1):
-     *   compressionWorkersDrainOutbox(budget);
-     */
+    /* Drain up to 256 results per main-loop iteration. The bound
+     * exists so a backlog cannot starve other afterSleep work; it is
+     * an internal safety knob, not a tunable config.
+     *
+     * Why 256: the per-result main-thread cost in the production path
+     * (S2.5 onward) is dominated by createCompressedObject + the
+     * net-savings guard + the kvstore overwrite — empirically ~5-15
+     * µs/result. 256 results × ~10 µs ≈ 2.5 ms, which fits inside the
+     * usual afterSleep budget (event loops typically run on the order
+     * of 1-10 ms per iteration). 256 is also large enough to absorb a
+     * full-pool burst: at 16 workers × ~50 jobs/sec/worker (typical
+     * compression rate for 1KB values), one second of queued work
+     * fits in two iterations.
+     *
+     * If we underestimate: the outbox accumulates,
+     * compression_outbox_backpressure_total (R2.10.4) climbs, and a
+     * worker retries posting rather than dropping completed work —
+     * surfacing operationally before correctness is at risk. If we
+     * overestimate: a deep outbox can stall the main loop, which
+     * shows up in INFO latency. Both ends are observable; 256 is a
+     * sound default and tunable later if measurement justifies. */
+    compressionWorkersDrainOutbox(256);
 }
 
 /* ========================================================================

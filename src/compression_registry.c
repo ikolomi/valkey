@@ -16,6 +16,7 @@
 
 #include "server.h"
 #include "compression_registry.h"
+#include "compression_workers.h"
 
 #ifdef USE_ZSTD
 #include <zstd.h>
@@ -32,8 +33,10 @@ static struct {
     uint32_t next_id;                                 /* next dict_id to assign (monotonic, starts at 1) */
 } registry;
 
-/* TODO: replace 16 with a shared COMPRESSION_WORKERS_MAX constant in a follow-up PR. */
-static _Atomic(uint64_t) worker_quiescent_gen[16];
+/* QSBR per-worker quiescent generation counters. Sized by the worker
+ * pool's compile-time max (compression_workers.h) — the registry is
+ * indexed by worker_id which the pool assigns in [0, n_threads). */
+static _Atomic(uint64_t) worker_quiescent_gen[COMPRESSION_WORKERS_MAX];
 
 /* ========================================================================
  * Internal helpers
@@ -64,7 +67,17 @@ static void dictPairFree(compressionDictPair *p) {
 static int canFree(compressionDictPair *dict) {
     if (dict->state != COMPRESSION_DICT_STATE_RETIRING) return 0;
     if (dict->frame_refs > 0) return 0;
-    for (int i = 0; i < server.compression_threads; i++) {
+    /* Only check slots that BOTH had a worker at retire time AND have
+     * a worker now. See dict->retire_n_workers in compression_registry.h
+     * for the rationale. The min() handles both directions cleanly:
+     *   - resize-up after retire: new slot didn't observe this dict,
+     *     so its gen doesn't constrain us.
+     *   - resize-down after retire: dead-slot worker is joined, so
+     *     it can't hold a pointer.
+     */
+    int n = dict->retire_n_workers;
+    if (server.compression_threads < n) n = server.compression_threads;
+    for (int i = 0; i < n; i++) {
         uint64_t gen = atomic_load(&worker_quiescent_gen[i]);
         if (gen <= dict->retire_worker_gen[i]) return 0;
     }
@@ -73,9 +86,17 @@ static int canFree(compressionDictPair *dict) {
 
 static void startRetirement(compressionDictPair *dict) {
     dict->state = COMPRESSION_DICT_STATE_RETIRING;
+    dict->retire_n_workers = server.compression_threads;
     for (int i = 0; i < server.compression_threads; i++) {
         dict->retire_worker_gen[i] = atomic_load(&worker_quiescent_gen[i]);
     }
+    /* QSBR grace barrier: wake every parked worker so they advance
+     * their quiescent_gen counter past the just-snapshotted value.
+     * Without this, an idle worker's gen could remain at the snapshot
+     * indefinitely and compressionRegistryTryGc() would never reclaim
+     * this dict. No-op when the pool is uninitialized or has zero
+     * workers (e.g. during shutdown teardown). */
+    compressionWorkersWakeAll();
 }
 
 /* ========================================================================
@@ -207,10 +228,9 @@ void compressionRegistryTryGc(void) {
  * ======================================================================== */
 
 void compressionWorkerReportQuiescent(int worker_id) {
-    /* Bounded by compression-threads config (max 16).
-     * TODO: Replace 16 with static var.
-     */
-    serverAssert(worker_id >= 0 && worker_id < 16);
+    /* Bounded by COMPRESSION_WORKERS_MAX (the worker pool's compile-
+     * time upper bound, == runtime upper bound on `compression-threads`). */
+    serverAssert(worker_id >= 0 && worker_id < COMPRESSION_WORKERS_MAX);
     atomic_fetch_add(&worker_quiescent_gen[worker_id], 1);
 }
 

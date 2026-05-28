@@ -4978,6 +4978,14 @@ int finishShutdown(void) {
 
     moduleUnloadAllModules();
 
+    /* Tear down the compression worker pool and dictionary registry.
+     * Order matters: this MUST run after modules are unloaded (modules
+     * may have been holding compressed values during their cleanup
+     * paths) and before the process exits. compressionShutdown
+     * internally joins the worker threads before releasing the
+     * registry — see compression.h. */
+    compressionShutdown();
+
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;
 

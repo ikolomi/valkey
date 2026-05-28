@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "compression_workers.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -60,26 +61,36 @@ typedef enum compressionDictState {
  *
  */
 typedef struct compressionDictPair {
-    uint32_t dict_id;               /* monotonic ID, never reused; 0 = no-dict. Stored in compressed frame headers
-                                       so decompression can find the correct DDict. */
-    unsigned char *bytes;           /* raw dictionary bytes from training. Persisted to RDB AUX entries and used
-                                       to recreate CDict/DDict on RDB load. */
-    size_t bytes_len;               /* length of raw dictionary bytes */
-    ZSTD_CDict *cdict;              /* digested dictionary for compression. Immutable after creation — workers
-                                        read it concurrently without locks. */
-    ZSTD_DDict *ddict;              /* digested dictionary for decompression. Used by the main thread to
-                                        decompress frames that reference this dict. */
-    size_t frame_refs;              /* number of installed compressed robjs referencing this dict. Main-thread
-                                       only. Dict cannot be freed while frame_refs > 0. */
-    compressionDictState state;     /* lifecycle state: ACTIVE (used for new compressions), RETIRING
-                                       (decompress-only, pending GC), or RETIRED (safe to free). */
-    mstime_t promoted_at_ms;        /* timestamp when this dict became active. Used for INFO reporting
-                                        (dict age) and drift-retrain trigger. */
-    uint64_t retire_worker_gen[16]; /* per-worker quiescent-gen snapshot taken at retirement time.
-                                       Dict is safe to free only after all workers have advanced past
-                                       their snapshotted value.
-                                       TODO: replace 16 with a shared COMPRESSION_WORKERS_MAX constant
-                                       from the worker pool header in a follow-up PR. */
+    uint32_t dict_id;           /* monotonic ID, never reused; 0 = no-dict. Stored in compressed frame headers
+                                   so decompression can find the correct DDict. */
+    unsigned char *bytes;       /* raw dictionary bytes from training. Persisted to RDB AUX entries and used
+                                   to recreate CDict/DDict on RDB load. */
+    size_t bytes_len;           /* length of raw dictionary bytes */
+    ZSTD_CDict *cdict;          /* digested dictionary for compression. Immutable after creation — workers
+                                    read it concurrently without locks. */
+    ZSTD_DDict *ddict;          /* digested dictionary for decompression. Used by the main thread to
+                                    decompress frames that reference this dict. */
+    size_t frame_refs;          /* number of installed compressed robjs referencing this dict. Main-thread
+                                   only. Dict cannot be freed while frame_refs > 0. */
+    compressionDictState state; /* lifecycle state: ACTIVE (used for new compressions), RETIRING
+                                   (decompress-only, pending GC), or RETIRED (safe to free). */
+    mstime_t promoted_at_ms;    /* timestamp when this dict became active. Used for INFO reporting
+                                    (dict age) and drift-retrain trigger. */
+    uint64_t retire_worker_gen[COMPRESSION_WORKERS_MAX];
+    /* per-worker quiescent-gen snapshot taken at retirement time.
+       Dict is safe to free only after all workers have advanced
+       past their snapshotted value (bounded by retire_n_workers
+       below — see canFree() rationale). */
+    int retire_n_workers; /* number of live workers at retire time (server.compression_threads
+                             captured by startRetirement). canFree iterates only this many
+                             slots: a worker spawned AFTER this dict retired cannot have
+                             observed it (compressionRegistryActive() returns the current
+                             active dict, never a retiring one), so its slot doesn't
+                             constrain reclamation. Equally, a worker that died via resize-
+                             down before reaching the snapshot is no longer running and
+                             cannot hold a pointer either. By bounding the iteration to the
+                             lesser of "snapshotted n_workers" and "current n_workers" we
+                             handle both directions cleanly. */
 } compressionDictPair;
 
 /* ========================================================================

@@ -41,6 +41,12 @@ void compressionCron(void);
 /* Called from the event-loop afterSleep hook. Drains the worker outbox. */
 void compressionAfterSleep(void);
 
+/* Called once from finishShutdown(). Stops the worker pool (joins all
+ * worker threads), then releases the dictionary registry. The order
+ * matters — workers must be joined before the registry is freed; this
+ * function preserves that contract internally. */
+void compressionShutdown(void);
+
 /* ========================================================================
  * Master-switch toggle
  * ========================================================================

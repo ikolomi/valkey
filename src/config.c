@@ -32,6 +32,7 @@
 #include "sds.h"
 #include "server.h"
 #include "cluster.h"
+#include "compression_workers.h"
 #include "connection.h"
 #include "bio.h"
 #include "module.h"
@@ -3253,6 +3254,19 @@ static int isValidDbHashSeed(sds val, const char **err) {
     return 1;
 }
 
+static int applyCompressionThreads(const char **err) {
+    /* server.compression_threads has already been written by the
+     * config layer; resize the worker pool to match. Resize is
+     * graceful (stop + restart, see compression_workers.c). */
+    if (compressionWorkersResize(server.compression_threads) != 0) {
+        *err = "Failed to resize the compression worker pool. "
+               "The new value has been recorded but the pool may be in an "
+               "inconsistent state — check the server log for details.";
+        return 0;
+    }
+    return 1;
+}
+
 standardConfig static_configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -3519,7 +3533,7 @@ standardConfig static_configs[] = {
      * =========================================================
      * Primary knobs (5) */
     createBoolConfig("compression-enabled", NULL, MODIFIABLE_CONFIG, server.compression_enabled, 0, NULL, NULL),
-    createIntConfig("compression-threads", NULL, MODIFIABLE_CONFIG, 0, 16, server.compression_threads, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-threads", NULL, MODIFIABLE_CONFIG, 0, 16, server.compression_threads, 1, INTEGER_CONFIG, NULL, applyCompressionThreads),
     createSizeTConfig("compression-min-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_min_value_size, 256, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("compression-max-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_max_value_size, 131072, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("compression-dict-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_dict_size, 102400, MEMORY_CONFIG, NULL, NULL),

@@ -430,6 +430,16 @@ typedef struct compressionDict {
     uint64_t        retire_worker_gen[COMPRESSION_WORKERS_MAX];
                                     /* per-worker quiescent-gen snapshot taken at
                                        retirement time (see QSBR model below) */
+    int             retire_n_workers;
+                                    /* number of live workers at retirement time
+                                       (server.compression_threads captured during
+                                       startRetirement). canFree iterates only
+                                       min(retire_n_workers, current n_threads).
+                                       Handles resize cleanly: a slot occupied by
+                                       a worker spawned AFTER retire couldn't have
+                                       observed this dict; a slot vacated by a
+                                       worker joined via resize-down can no longer
+                                       hold a pointer. */
 } compressionDict;
 
 typedef struct compressionRegistry {
@@ -463,7 +473,7 @@ The registry uses a grace-period reclamation model inspired by the Linux kernel'
 
 5. **GC:** Periodically (from `compressionCron`, after result drain, etc.), the main thread calls `compressionDictTryGc()` which checks each retiring dict: if `frame_refs == 0` AND all workers have crossed the grace period, the dict is freed.
 
-6. **Grace barriers (wake-all via cond_broadcast):** If a worker is idle (blocked on the SPMC inbox cond var waiting for work), it may never advance its generation. The main thread forces progress by issuing a wake-all on the inbox (see §4.6 "wake-all primitive"). Every blocked consumer wakes simultaneously via `pthread_cond_broadcast`, advances its generation if a barrier signal is set, then either resumes consuming or re-blocks. Enqueueing barrier jobs into the SPMC inbox is *not* sufficient — under work-stealing semantics a single worker could drain all barriers while siblings stay asleep on the cond var.
+6. **Grace barriers (wake-all via cond_broadcast):** If a worker is idle (blocked on the SPMC inbox cond var waiting for work), it may never advance its generation. The main thread forces progress by issuing a wake-all on the inbox (see §4.6 "wake-all primitive"). Every blocked consumer wakes simultaneously via `pthread_cond_broadcast`, advances its generation if a barrier signal is set, then either resumes consuming or re-blocks. Enqueueing barrier jobs into the SPMC inbox is *not* sufficient under work-stealing semantics — a single worker could drain all barriers while siblings stay asleep on the cond var.
 
 7. **Bounding retiring dicts (cap interaction with R2.3.3):** Retiring dicts remain in `dicts[]`, which is capped at `compression-dict-max-versions` (R2.3.3, default 4). Each retiring dict occupies a slot until step 5 reclaims it. Under normal load the grace-barrier mechanism (step 6) keeps reclamation latency bounded and the cap is not hit. If draining cannot keep up — e.g. workers are starved, or `frame_refs` stays > 0 on retiring dicts because old frames are not being rewritten/expired — the cap is reached and **both training and promotion are refused** per R2.3.3: a `LL_WARNING` log entry is emitted, `compression_dict_cap_reached` is set to `1` in `INFO`, and the operator must intervene (raise the cap, or run `COMPRESSION SWEEP` to force-rewrite frames referencing the oldest retiring dict so it can drain). No separate retiring list is maintained — GC scans `dicts[]` directly (max 16 entries).
 
@@ -525,12 +535,21 @@ The outbox side has its own back-pressure: if a worker has a result to post but 
 
 Both back-pressure events are categorized separately from the normal operating signals (`compression_candidates_pending` gauge, `compression_sweep_pacing_sleeps_total`) so operators can identify the exact root cause without reading logs. See §2.10 R2.10.4 for the remediation table.
 
-**Wake-all primitive (used by QSBR grace barriers — §4.4 step 6).** The QSBR model needs a way to advance the generation counter of every worker, including idle workers blocked on the inbox cond var. The existing `mutexqueue.h` (which provides the pthread-cond-var-based blocking semantics underneath the SPMC inbox) is extended with **two new APIs** that broadcast to every blocked consumer rather than waking one at a time:
+**Wake-all primitive (used by QSBR grace barriers — §4.4 step 6).** The QSBR model needs a way to advance the generation counter of every worker, including idle workers blocked on the inbox cond var. The existing `mutexqueue.h` (which provides the pthread-cond-var-based blocking semantics underneath the SPMC inbox) is extended with **a wake-aware pop variant plus an explicit broadcast primitive** that lets new callers opt in to wake-all semantics without changing the contract for existing callers (e.g. `bio.c`):
 
-- A wake-all primitive that calls `pthread_cond_broadcast` on the queue's cond var so every idle worker exits its `pthread_cond_wait` simultaneously. Each woken worker checks registry-side state for the wake reason (advance generation? shutdown?) and acts accordingly without consuming a real job.
-- A shutdown-signal primitive that combines the wake-all with a flag the workers read after waking, used during pool teardown.
+- `mutexQueueWakeAll(q)` — calls `pthread_cond_broadcast` on the queue's cond var. Every consumer parked in `pthread_cond_wait` exits simultaneously.
+- `mutexQueuePop(q, blocking=true)` — **unchanged contract**: never returns NULL when blocking. If the cond_wait wakes spuriously (POSIX-spec or because of a `mutexQueueWakeAll`), the loop re-parks until a real item arrives. Existing callers (`bio.c`) keep their original behavior.
+- `mutexQueuePopWakable(q, blocking=true)` — **new**: returns NULL once on a spurious wake or wake-all. Callers use this when they want to be notified by `mutexQueueWakeAll` so they can perform a per-loop housekeeping step (e.g. advance a QSBR generation counter) before re-entering the wait.
 
-Enqueueing N "barrier jobs" into the SPMC inbox is **not** equivalent to a wake-all: under work-stealing semantics the dequeue is not round-robin, so a single fast worker can drain all barrier jobs while siblings stay asleep on the cond var. The cond_broadcast path is the only mechanism that guarantees every worker wakes up.
+The compression worker loop uses `mutexQueuePopWakable`; bio uses `mutexQueuePop`.
+
+**Sentinel-based shutdown (used by pool teardown).** Wake-all alone is unsafe for shutdown: there is a small race window where a worker has read its `shutdown_requested` flag at the top of the loop and is about to enter `mutexQueuePopWakable`. If `compressionWorkersStop` fires its broadcast in that window, the broadcast hits no waiters and is lost; the worker then parks and deadlocks against `pthread_join`.
+
+The pool teardown therefore uses **shutdown sentinels** — N pointers to a static address are pushed into the inbox via `mutexQueueAdd` (one per worker). Each parked consumer's `mutexQueuePopWakable` sees length>0 under the mutex and pops a sentinel without entering `cond_wait`. The race is impossible because the sentinels are data-in-queue, not a transient broadcast. Workers distinguish jobs from sentinels by pointer equality with the static address (zero memory cost).
+
+Wake-all is reserved for grace barriers because **missed barrier wakes are benign** — the next event (real job, another retire) catches the worker. Shutdown is correctness-critical and cannot tolerate the race.
+
+Enqueueing N "barrier jobs" into the SPMC inbox is **not** equivalent to a wake-all for grace barriers either: under work-stealing semantics the dequeue is not round-robin, so a single fast worker can drain all barrier jobs while siblings stay asleep on the cond var. The cond_broadcast path is the only mechanism that guarantees every worker wakes up.
 
 Job structure:
 

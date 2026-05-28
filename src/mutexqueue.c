@@ -111,7 +111,27 @@ void mutexQueueAddMultiple(mutexQueue *theQueue, fifo *valueFifo) {
 }
 
 
-/* Note: If 'blocking' is true, this method will block until an item is available.  */
+/* Wake every thread parked in mutexQueuePopWakable(blocking=true)
+ * without enqueuing anything. The standard mutexQueuePop /
+ * mutexQueuePopAll APIs absorb this wake internally and re-park; only
+ * mutexQueuePopWakable returns NULL on a wake.
+ *
+ * Implementation: pthread_cond_broadcast under the mutex. */
+void mutexQueueWakeAll(mutexQueue *theQueue) {
+    mutexQueue *mq = theQueue;
+
+    pthread_mutex_lock(&mq->mutex);
+    pthread_cond_broadcast(&mq->notify_cv);
+    pthread_mutex_unlock(&mq->mutex);
+}
+
+
+/* If 'blocking' is true and the queue is empty, parks the caller on
+ * the queue's condition variable. NEVER returns NULL when blocking=true:
+ * spurious wakes (POSIX-spec or mutexQueueWakeAll) are absorbed by the
+ * `while` re-check below — the caller re-parks until an item appears.
+ *
+ * Callers that want to observe wake-all events use mutexQueuePopWakable. */
 void *mutexQueuePop(mutexQueue *theQueue, bool blocking) {
     mutexQueue *mq = theQueue;
     void *value = NULL;
@@ -119,6 +139,10 @@ void *mutexQueuePop(mutexQueue *theQueue, bool blocking) {
     pthread_mutex_lock(&mq->mutex);
 
     if (blocking) {
+        /* `while` loop: re-check on every wake. POSIX explicitly
+         * permits spurious cond_wait wake-ups; we also receive
+         * mutexQueueWakeAll broadcasts here. Re-park if the queue is
+         * still empty. */
         while (mutexQueueLengthInternal(mq) == 0) {
             pthread_cond_wait(&mq->notify_cv, &mq->mutex);
         }
@@ -134,7 +158,7 @@ void *mutexQueuePop(mutexQueue *theQueue, bool blocking) {
     return value;
 }
 
-/* Note: If 'blocking' is true, this method will block until an item is available.  */
+/* Same blocking + spurious-wake-absorbing contract as mutexQueuePop. */
 fifo *mutexQueuePopAll(mutexQueue *theQueue, bool blocking) {
     mutexQueue *mq = theQueue;
     fifo *result = NULL;
@@ -155,4 +179,33 @@ fifo *mutexQueuePopAll(mutexQueue *theQueue, bool blocking) {
 
     pthread_mutex_unlock(&mq->mutex);
     return result;
+}
+
+/* Wake-all-aware variant: returns NULL on a spurious wake or wake-all
+ * broadcast. Callers handle NULL as "wake event happened, no item",
+ * typically performing a per-loop housekeeping step (e.g., advancing
+ * a QSBR generation counter) before re-entering the wait. */
+void *mutexQueuePopWakable(mutexQueue *theQueue, bool blocking) {
+    mutexQueue *mq = theQueue;
+    void *value = NULL;
+
+    pthread_mutex_lock(&mq->mutex);
+
+    if (blocking) {
+        /* `if` (not `while`): exactly one cond_wait, then return
+         * whatever state we find — possibly NULL if the queue is
+         * still empty. */
+        if (mutexQueueLengthInternal(mq) == 0) {
+            pthread_cond_wait(&mq->notify_cv, &mq->mutex);
+        }
+    }
+
+    if (fifoLength(mq->priority_fifo) > 0) {
+        fifoPop(mq->priority_fifo, &value);
+    } else if (fifoLength(mq->normal_fifo) > 0) {
+        fifoPop(mq->normal_fifo, &value);
+    }
+
+    pthread_mutex_unlock(&mq->mutex);
+    return value;
 }
