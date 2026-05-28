@@ -29,7 +29,6 @@
 
 #include "server.h"
 
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,17 +54,20 @@ typedef enum compressionDictState {
  * A dictionary + its digested handles. Named "pair" because it bundles
  * CDict and DDict, which the registry treats as one lifecycle unit.
  *
+ * TODO: discuss with @ikolomi whether to encapsulate this struct behind
+ * accessor functions (getDictId, getCDict, etc.) for consistency with
+ * the registry being private. Follow-up PR.
+ *
  * Field conventions:
  *   - dict_id: monotonically-increasing, never reused. 0 = no-dict.
  *   - bytes / bytes_len: the raw dictionary bytes (persisted to RDB AUX
  *     entries, see §2.6 R2.6.1).
- *   - cdict: may be NULL for retiring dicts (decompress-only path).
- *   - ddict: required — retirement cannot free until refcount hits zero.
- *   - refcount: incremented per compressed-frame reference (R2.3.4).
- *     Atomic because decompression reads may observe this field from
- *     workers during background compression; the read side only needs
- *     Acquire semantics and write side only Release, but C11 atomic_*
- *     with default seq_cst is fine for v1 (registry ops are not hot).
+ *   - cdict: immutable after publication; workers read it without locks.
+ *   - ddict: used by main thread for decompression.
+ *   - frame_refs: number of installed compressed frames referencing this
+ *     dict (main-thread only, replaces the old atomic refcount).
+ *   - retire_worker_gen: per-worker quiescent-gen snapshot taken at
+ *     retirement time (QSBR — see design §4.4).
  */
 typedef struct compressionDictPair {
     uint32_t dict_id;
@@ -73,9 +75,10 @@ typedef struct compressionDictPair {
     size_t bytes_len;
     ZSTD_CDict *cdict;
     ZSTD_DDict *ddict;
-    atomic_size_t refcount;
+    size_t frame_refs;
     compressionDictState state;
     mstime_t promoted_at_ms;
+    uint64_t retire_worker_gen[COMPRESSION_DICT_MAX];
 } compressionDictPair;
 
 /* ========================================================================
@@ -95,11 +98,11 @@ compressionDictPair *compressionRegistryActive(void);
  * decompression helper (compression.h) and by the RDB loader. */
 compressionDictPair *compressionRegistryLookup(uint32_t dict_id);
 
-/* Atomically installs `p` as the new active dict. Transitions any prior
- * active to RETIRING. Returns the newly-assigned dict_id (0 on failure,
- * e.g. when the registry cap has been reached — R2.3.3). Takes
- * ownership of `p`. */
-uint32_t compressionRegistryAdd(compressionDictPair *p);
+/* Adds a new dict to the registry. If promote=1, publishes as active
+ * and retires the previous active. If promote=0, adds as RETIRING
+ * (decompress-only, for RDB load). Returns the newly-assigned dict_id
+ * (0 on failure — cap reached per R2.3.3). Takes ownership of `p`. */
+uint32_t compressionRegistryAdd(compressionDictPair *p, int promote);
 
 /* Marks the dict as RETIRING. A dict is freed only when its refcount
  * reaches zero, either through frame rewrites or via
@@ -117,5 +120,24 @@ void compressionRegistryDecRef(uint32_t dict_id);
  * `COMPRESSION DICT LIST` and by the RDB writer to emit AUX
  * entries. Must not modify the registry from inside the callback. */
 void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *), void *ctx);
+
+/* ========================================================================
+ * QSBR grace-period GC
+ * ======================================================================== */
+
+/* Scan the retiring list, free dicts that are safe to reclaim.
+ * Called from compressionCron, after result drain, after SWEEP. */
+void compressionRegistryTryGc(void);
+
+/* ========================================================================
+ * Worker-side QSBR API
+ * ======================================================================== */
+
+/* Called by a worker after finishing a job. Advances the worker's
+ * generation counter. */
+void compressionWorkerReportQuiescent(int worker_id);
+
+/* Returns the current quiescent generation for a worker. */
+uint64_t compressionWorkerGetGen(int worker_id);
 
 #endif /* __COMPRESSION_REGISTRY_H */
