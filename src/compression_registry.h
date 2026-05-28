@@ -44,24 +44,24 @@ typedef struct ZSTD_DDict_s ZSTD_DDict;
 #define COMPRESSION_DICT_ID_NONE 0u
 
 typedef enum compressionDictState {
-    DICT_STATE_ACTIVE = 0,   /* current dict for new compressions */
-    DICT_STATE_RETIRING,     /* decompress-only, pending GC */
-    DICT_STATE_RETIRED,      /* safe to free */
+    DICT_STATE_ACTIVE = 0, /* current dict for new compressions */
+    DICT_STATE_RETIRING,   /* decompress-only, pending GC */
+    DICT_STATE_RETIRED,    /* safe to free */
 } compressionDictState;
 
-typedef struct compressionDict {
-    uint32_t dict_id;            /* monotonic, never reused; 0 = no-dict */
-    unsigned char *bytes;        /* raw training output (persisted to RDB AUX) */
+typedef struct compressionDictPair {
+    uint32_t dict_id;     /* monotonic, never reused; 0 = no-dict */
+    unsigned char *bytes; /* raw training output (persisted to RDB AUX) */
     size_t bytes_len;
-    ZSTD_CDict *cdict;          /* immutable after publication; used by workers */
-    ZSTD_DDict *ddict;          /* used by main thread for decompression */
-    size_t frame_refs;           /* installed compressed frames referencing this dict
-                                    (main-thread only) */
+    ZSTD_CDict *cdict; /* immutable after publication; used by workers */
+    ZSTD_DDict *ddict; /* used by main thread for decompression */
+    size_t frame_refs; /* installed compressed frames referencing this dict
+                          (main-thread only) */
     compressionDictState state;
     mstime_t promoted_at_ms;
     uint64_t retire_worker_gen[COMPRESSION_WORKERS_MAX];
-                                 /* per-worker gen snapshot at retirement time */
-} compressionDict;
+    /* per-worker gen snapshot at retirement time */
+} compressionDictPair;
 
 /* ========================================================================
  * Registry lifecycle — main-thread only unless noted.
@@ -79,7 +79,7 @@ void compressionRegistryRelease(void);
  * If promote=0: adds as RETIRING (decompress-only, for RDB load).
  * Returns dict_id on success, 0 on failure (cap reached).
  * Takes ownership of bytes. Main-thread only. */
-uint32_t compressionDictAdd(unsigned char *bytes, size_t len, int promote);
+uint32_t compressionRegistryAdd(unsigned char *bytes, size_t len, int promote);
 
 /* ========================================================================
  * Retirement and GC
@@ -87,11 +87,11 @@ uint32_t compressionDictAdd(unsigned char *bytes, size_t len, int promote);
 
 /* Moves a dict from ACTIVE to RETIRING. Snapshots worker generations.
  * Main-thread only. */
-void compressionDictStartRetirement(compressionDict *dict);
+void compressionDictStartRetirement(compressionDictPair *dict);
 
 /* Returns 1 if a retiring dict is safe to free (frame_refs == 0 AND
  * all workers advanced past retirement snapshot). Main-thread only. */
-int compressionDictCanFree(compressionDict *dict);
+int compressionDictCanFree(compressionDictPair *dict);
 
 /* Scan the retiring list, free dicts that are safe to reclaim.
  * Main-thread only. */
@@ -99,7 +99,7 @@ void compressionDictTryGc(void);
 
 /* Free a dict and all owned resources. Must only be called when
  * state == DICT_STATE_RETIRED. Main-thread only. */
-void compressionDictFree(compressionDict *dict);
+void compressionDictFree(compressionDictPair *dict);
 
 /* ========================================================================
  * Accessors
@@ -108,11 +108,11 @@ void compressionDictFree(compressionDict *dict);
 /* Returns the currently active dict. Thread-safe (atomic load).
  * Workers call this to get the CDict for compression.
  * Returns NULL if no active dict exists. */
-compressionDict *compressionDictGetActive(void);
+compressionDictPair *compressionDictGetActive(void);
 
 /* Find a dict by ID. Returns NULL if not found.
  * Main-thread only. */
-compressionDict *compressionDictLookup(uint32_t dict_id);
+compressionDictPair *compressionDictLookup(uint32_t dict_id);
 
 /* ========================================================================
  * Frame reference counting — main-thread only
@@ -126,7 +126,7 @@ void compressionDictDecrFrameRef(uint32_t dict_id);
  * ======================================================================== */
 
 /* Iterate all non-retired dicts. Callback must not modify the registry. */
-void compressionRegistryForEach(void (*cb)(const compressionDict *, void *), void *ctx);
+void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *), void *ctx);
 
 /* ========================================================================
  * Worker-side QSBR API

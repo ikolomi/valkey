@@ -51,7 +51,7 @@ extern "C" {
 static constexpr uint32_t kNoDictId = 0u;
 
 class CompressionHeaderTest : public ::testing::Test {
-protected:
+  protected:
     void SetUp() override {
         server.compression_dict_max_versions = 4;
         server.compression_threads = 1;

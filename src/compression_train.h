@@ -29,7 +29,7 @@
  *
  *   Main thread   : on bio completion, creates ZSTD_CDict/ZSTD_DDict
  *                   handles from the returned dictionary bytes and
- *                   installs via compressionDictAdd (promotion,
+ *                   installs via compressionRegistryAdd (promotion,
  *                   §2.3 R2.3.9).
  *
  * Why a new BIO_COMPRESSION_TRAIN job type and not the worker pool:
@@ -84,14 +84,14 @@ int compressionTrainAdvanceSampling(int budget);
  * Bio completion — back on main thread via bio's completion path
  * ========================================================================
  *
- * `new_pair`: on success, a fully-populated compressionDict ready
+ * `new_pair`: on success, a fully-populated compressionDictPair ready
  *             for registry install. Ownership transfers to the callee
  *             (main-thread promoter).
  * `err`     : on failure, the caller passes an sds error message and
  *             new_pair must be NULL. Callee takes ownership of the sds
  *             (will sdsfree after logging).
  */
-void compressionTrainCompleteFromBio(compressionDict *new_pair,
+void compressionTrainCompleteFromBio(compressionDictPair *new_pair,
                                      sds err);
 
 #endif /* __COMPRESSION_TRAIN_H */

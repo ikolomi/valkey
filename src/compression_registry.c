@@ -31,9 +31,9 @@
  * ======================================================================== */
 
 static struct {
-    compressionDict *dicts[COMPRESSION_DICT_MAX];
+    compressionDictPair *dicts[COMPRESSION_DICT_MAX];
     int count;
-    _Atomic(compressionDict *) active;
+    _Atomic(compressionDictPair *) active;
     list *retiring;
     uint32_t next_id;
 } registry;
@@ -48,11 +48,13 @@ static _Atomic(uint64_t) worker_quiescent_gen[COMPRESSION_WORKERS_MAX];
  * ======================================================================== */
 
 /* Remove a dict from the dicts[] array, shifting remaining entries down. */
-static void removeFromDicts(compressionDict *dict) {
+static void removeFromDicts(compressionDictPair *dict) {
     for (int i = 0; i < registry.count; i++) {
         if (registry.dicts[i] == dict) {
-            for (int j = i; j < registry.count - 1; j++) {
-                registry.dicts[j] = registry.dicts[j + 1];
+            int remaining = registry.count - 1 - i;
+            if (remaining > 0) {
+                memmove(&registry.dicts[i], &registry.dicts[i + 1],
+                        (size_t)remaining * sizeof(compressionDictPair *));
             }
             registry.dicts[registry.count - 1] = NULL;
             registry.count--;
@@ -97,7 +99,7 @@ void compressionRegistryRelease(void) {
  * If promote=0: adds as RETIRING (decompress-only, for RDB load).
  * Returns dict_id on success, 0 on failure (cap reached).
  * Takes ownership of bytes. Main-thread only. */
-uint32_t compressionDictAdd(unsigned char *bytes, size_t len, int promote) {
+uint32_t compressionRegistryAdd(unsigned char *bytes, size_t len, int promote) {
     serverAssert(bytes != NULL);
 
     /* Cap check (R2.3.3): try GC first to make room. */
@@ -126,7 +128,7 @@ uint32_t compressionDictAdd(unsigned char *bytes, size_t len, int promote) {
     void *ddict = NULL;
 #endif
 
-    compressionDict *d = zcalloc(sizeof(*d));
+    compressionDictPair *d = zcalloc(sizeof(*d));
     d->dict_id = registry.next_id++;
     d->bytes = bytes;
     d->bytes_len = len;
@@ -139,7 +141,7 @@ uint32_t compressionDictAdd(unsigned char *bytes, size_t len, int promote) {
         d->state = DICT_STATE_ACTIVE;
 
         /* Retire previous active. */
-        compressionDict *prev = atomic_load(&registry.active);
+        compressionDictPair *prev = atomic_load(&registry.active);
         if (prev) compressionDictStartRetirement(prev);
 
         /* Publish new dict — atomic store visible to workers. */
@@ -164,7 +166,7 @@ uint32_t compressionDictAdd(unsigned char *bytes, size_t len, int promote) {
 
 /* Moves a dict from ACTIVE to RETIRING. Snapshots worker generations.
  * Adds to the retiring list. Main-thread only. */
-void compressionDictStartRetirement(compressionDict *dict) {
+void compressionDictStartRetirement(compressionDictPair *dict) {
     serverAssert(dict->state == DICT_STATE_ACTIVE);
     dict->state = DICT_STATE_RETIRING;
 
@@ -185,7 +187,7 @@ void compressionDictStartRetirement(compressionDict *dict) {
  *   - state is RETIRING
  *   - frame_refs == 0 (no compressed frames need the DDict)
  *   - every worker has advanced past its retirement snapshot */
-int compressionDictCanFree(compressionDict *dict) {
+int compressionDictCanFree(compressionDictPair *dict) {
     if (dict->state != DICT_STATE_RETIRING) return 0;
     if (dict->frame_refs > 0) return 0;
 
@@ -207,7 +209,7 @@ void compressionDictTryGc(void) {
     listRewind(registry.retiring, &li);
 
     while ((ln = listNext(&li)) != NULL) {
-        compressionDict *dict = listNodeValue(ln);
+        compressionDictPair *dict = listNodeValue(ln);
         if (compressionDictCanFree(dict)) {
             dict->state = DICT_STATE_RETIRED;
             listDelNode(registry.retiring, ln);
@@ -224,7 +226,7 @@ void compressionDictTryGc(void) {
 /* Free a dict and all its owned resources.
  * Must only be called after compressionDictCanFree() returned true
  * (or during shutdown via compressionRegistryRelease). */
-void compressionDictFree(compressionDict *dict) {
+void compressionDictFree(compressionDictPair *dict) {
     serverAssert(dict->state == DICT_STATE_RETIRED);
 #ifdef USE_ZSTD
     if (dict->cdict) ZSTD_freeCDict(dict->cdict);
@@ -247,14 +249,14 @@ void compressionDictFree(compressionDict *dict) {
  * discard compressed results whose dict_id != active dict_id at install
  * time (avoids adding frame_refs to retiring dicts, helping them drain
  * faster). */
-compressionDict *compressionDictGetActive(void) {
+compressionDictPair *compressionDictGetActive(void) {
     return atomic_load(&registry.active);
 }
 
 /* Find a dict by ID. Returns NULL if not found.
  * Used by decompression path and RDB loader.
  * Main-thread only. */
-compressionDict *compressionDictLookup(uint32_t dict_id) {
+compressionDictPair *compressionDictLookup(uint32_t dict_id) {
     if (dict_id == COMPRESSION_DICT_ID_NONE) return NULL;
     for (int i = 0; i < registry.count; i++) {
         if (registry.dicts[i]->dict_id == dict_id) return registry.dicts[i];
@@ -272,7 +274,7 @@ compressionDict *compressionDictLookup(uint32_t dict_id) {
  * (handles RDB load ordering where frames may precede dict AUX). */
 void compressionDictIncrFrameRef(uint32_t dict_id) {
     if (dict_id == COMPRESSION_DICT_ID_NONE) return;
-    compressionDict *d = compressionDictLookup(dict_id);
+    compressionDictPair *d = compressionDictLookup(dict_id);
     if (!d) return;
     d->frame_refs++;
 }
@@ -284,7 +286,7 @@ void compressionDictIncrFrameRef(uint32_t dict_id) {
  * during shutdown or error recovery). */
 void compressionDictDecrFrameRef(uint32_t dict_id) {
     if (dict_id == COMPRESSION_DICT_ID_NONE) return;
-    compressionDict *d = compressionDictLookup(dict_id);
+    compressionDictPair *d = compressionDictLookup(dict_id);
     if (!d) return;
     serverAssert(d->frame_refs > 0);
     d->frame_refs--;
@@ -302,7 +304,7 @@ void compressionDictDecrFrameRef(uint32_t dict_id) {
  * Note: retired dicts are never in dicts[] — TryGc removes them from
  * the array before freeing.
  * Main-thread only. */
-void compressionRegistryForEach(void (*cb)(const compressionDict *, void *), void *ctx) {
+void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *), void *ctx) {
     for (int i = 0; i < registry.count; i++) {
         serverAssert(registry.dicts[i]->state != DICT_STATE_RETIRED);
         cb(registry.dicts[i], ctx);

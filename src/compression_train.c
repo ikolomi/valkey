@@ -39,7 +39,7 @@ int compressionTrainAdvanceSampling(int budget) {
     return 0;
 }
 
-void compressionTrainCompleteFromBio(compressionDict *new_pair,
+void compressionTrainCompleteFromBio(compressionDictPair *new_pair,
                                      sds err) {
     /* Phase 0: if somehow called (should not be until the bio training
      * job is wired), we must honor the ownership contract: free both
@@ -47,7 +47,7 @@ void compressionTrainCompleteFromBio(compressionDict *new_pair,
      * this path is unreachable in practice, but the defensive free
      * keeps later wiring honest. */
     if (new_pair) {
-        /* In Phase 1 this will go through a compressionDict free
+        /* In Phase 1 this will go through a compressionDictPair free
          * helper that also decrements the registry's cap counter. */
         if (new_pair->bytes) zfree(new_pair->bytes);
         zfree(new_pair);
