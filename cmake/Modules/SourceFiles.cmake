@@ -51,6 +51,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/commandlog.c
     ${CMAKE_SOURCE_DIR}/src/compression.c
     ${CMAKE_SOURCE_DIR}/src/compression_header.c
+    ${CMAKE_SOURCE_DIR}/src/compression_incompressible.c
     ${CMAKE_SOURCE_DIR}/src/compression_registry.c
     ${CMAKE_SOURCE_DIR}/src/compression_train.c
     ${CMAKE_SOURCE_DIR}/src/compression_workers.c

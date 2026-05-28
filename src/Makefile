@@ -503,6 +503,7 @@ ENGINE_SERVER_OBJ = \
     commands.o \
     compression.o \
     compression_header.o \
+    compression_incompressible.o \
     compression_registry.o \
     compression_train.o \
     compression_workers.o \

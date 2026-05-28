@@ -23,6 +23,7 @@
 
 #include "server.h"
 #include "compression.h"
+#include "compression_incompressible.h"
 #include "compression_registry.h"
 #include "compression_workers.h"
 #include "compression_train.h"
@@ -33,7 +34,12 @@
  * ======================================================================== */
 
 void compressionInit(void) {
-    /* Phase 0: no-op. */
+    /* Incompressible-keys side hashtable: cheap to create empty (no
+     * buckets allocated until first insert), so we initialize even when
+     * the feature is disabled — keeps the eligibility predicate from
+     * having to special-case "feature off" for the retry-guard branch. */
+    compressionIncompressibleInit();
+
     /* TODO(Phase 1):
      *   compressionRegistryInit();
      *   compressionWorkersStart(server.compression_threads);
@@ -83,17 +89,11 @@ robj *objectGetUncompressedView(robj *o, sds *scratch) {
  *
  * Returns 1 iff the value is a candidate for background compression.
  * Cheap by construction — every check is a bitfield read, a config
- * comparison, or a `robj->lru` decode; no allocations, no hash lookups
- * in this revision. Callable from the write path (dbAdd / dbSetValue /
- * dbOverwrite) and from the sweep cron tick.
- *
- * The `key` parameter is reserved for S2.3 (incompressible-keys
- * hashtable lookup); the dict-ID-scoped retry guard described in R2.4 /
- * Thread #20 will be wired in here once `compressionRetryEligible(key)`
- * lands. For S2.2 every key is treated as "always retry-eligible."
+ * comparison, a `robj->lru` decode, or a single hashtable lookup; no
+ * allocations on the hot path. Callable from the write path (dbAdd /
+ * dbSetValue / dbOverwrite) and from the sweep cron tick.
  */
 int compressionIsEligible(robj *o, const sds key) {
-    UNUSED(key); /* Reserved for S2.3 incompressible-keys lookup. */
 
     /* 1. Master switch. Zero overhead when disabled. */
     if (!server.compression_enabled) return 0;
@@ -173,9 +173,21 @@ int compressionIsEligible(robj *o, const sds key) {
     }
 
     /* 6. Incompressible-keys retry guard (R2.4 post-compression / Q6 /
-     * Thread #20). For S2.2 this branch is stubbed as "always retry-
-     * eligible." S2.3 lands the real side hashtable and wires the
-     * `compressionRetryEligible(key)` lookup here. */
+     * Thread #20). The dict-ID-scoped + time-fallback retry semantics
+     * are handled internally by compressionIncompressibleRetryEligible.
+     * Cheap: one hashtable lookup; no allocations.
+     *
+     * We resolve the active dict_id once here. If no dict has been
+     * promoted yet, the active dict_id is COMPRESSION_DICT_ID_NONE (0).
+     * In that pre-train state the predicate is consulted only by code
+     * paths that don't actually compress (since there's no dict to
+     * compress against), so the lookup is mostly defensive — but still
+     * correct: a key recorded under dict_id 0 stays incompressible
+     * until the next dict gets promoted (whereupon failed_dict_id != 0
+     * triggers retry). */
+    compressionDictPair *active = compressionRegistryActive();
+    uint32_t active_dict_id = (active != NULL) ? active->dict_id : COMPRESSION_DICT_ID_NONE;
+    if (!compressionIncompressibleRetryEligible(key, active_dict_id)) return 0;
 
     return 1;
 }

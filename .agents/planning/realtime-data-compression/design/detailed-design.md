@@ -352,6 +352,7 @@ All new source files live under `src/`. Every `.c` is registered in **both** `sr
 | `src/compression_workers.c` | Worker pool: thread startup/shutdown, SPMC inbox, MPSC outbox, sweep pacing. |
 | `src/compression_train.c` | Training: keyspace-scan sample collector, `ZDICT_trainFromBuffer` invocation (called by `bio`). |
 | `src/compression_header.c` | Per-value header encode/decode, `OBJ_ENCODING_COMPRESSED` allocation / free helpers. |
+| `src/compression_incompressible.c` | Side hashtable of keys whose post-compression net-savings guard rejected them; dict-ID scoped retry semantics with a `compression-retry-interval` time fallback (R2.4 / Q6b / Thread #20). |
 | `src/commands/compression-*.json` | Subcommand JSON metadata for `COMPRESSION *` (see §4.5). |
 
 ### 4.2 Touched existing files
