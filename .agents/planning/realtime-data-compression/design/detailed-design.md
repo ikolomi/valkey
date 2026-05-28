@@ -74,7 +74,6 @@ eligible(obj) ⇔
  && obj->refcount != OBJ_SHARED_REFCOUNT
  && sdslen(val) >= compression-min-value-size
  && (compression-max-value-size == 0 || sdslen(val) <= compression-max-value-size)
- && retry_eligible(obj)                                       // see post-compression guard below
  && hot_key_check(obj)                                        // see below — policy-aware
 
 where hot_key_check(obj) is:
@@ -96,10 +95,16 @@ Earlier drafts of this design also exposed `compression-settle-seconds` as a "re
 
 ```
 compressed_size + header_size >= uncompressed_size * (1 - compression-min-savings-ratio)
-  → discard compressed form, mark key with retry cooldown, increment
+  → discard compressed form, leave value uncompressed, increment
     compression_skipped_incompressible.
 ```
 (Q6)
+
+v1 does **not** track per-key rejection state. Under a fixed dict and a fixed workload, the probability that any given write at key K produces compressible bytes is constant — time-based throttling between retries doesn't shift this probability, it only spaces attempts. CPU bounding is already provided at the sweep level (`compression-sweep-max-cpu-pct`); per-key throttling would be redundant with that, while adding correctness burden (stale entries when a key is overwritten via `dbOverwrite` or in-place-mutated via APPEND/SETRANGE/BITOP/BITFIELD/module DMA writes — every mutation path would need a `Clear` integration point).
+
+The legitimate trigger for "the dict has stopped fitting the workload" is **dict change**, which is handled at the system level. Rejected attempts contribute their actual measured ratio to `compression_live_ratio_10m` (R2.10.1) — typically in `[0.9, 1.05]` since the net-savings guard rejected them for being too close to 1.0 — so a sustained high rejection rate naturally drives the metric toward "no savings" and trips the drift threshold, firing retraining (R2.3.5). After dict promotion, the next sweep tick re-attempts under the new dict naturally — no per-key state required.
+
+This is a deliberate simplification over an earlier design (PR #10) which proposed a per-key `incompressibleKeys` side hashtable scoped by `(key, failed_dict_id)` with a `compression-retry-interval` time fallback. That approach added a module + a config knob + integration points in every mutating code path, but the underlying assumption (waiting between retries improves the per-attempt hit rate) is incorrect for fixed-distribution workloads under a fixed dict. The simpler model — retry on every sweep tick, let the drift signal handle systemic dict-fit issues — is correct and operationally cleaner.
 
 ### 2.3 Dictionary lifecycle
 
@@ -109,7 +114,11 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 - **R2.3.4** A dict's refcount tracks the number of compressed frames that reference its dictID. When refcount hits zero, the dict transitions to `retired` and its CDict/DDict/raw_bytes are freed. (Q1)
 - **R2.3.5** **Training triggers** (Q9):
   - **First training**: fires when the eligible-keys write counter reaches `compression-dict-first-training-keys-count` (default `10000`).
-  - **Drift-based steady-state retraining**: fires when `compression_live_ratio_10m < compression-dict-drift-ratio × post_training_ratio` (default drift ratio `70%`).
+  - **Drift-based steady-state retraining**: fires when `compression_live_ratio_10m > post_training_ratio / compression-dict-drift-ratio` (default drift ratio `70%`).
+
+    The ratio convention is `compressed/uncompressed` (lower is better; see R2.10.1). `compression_live_ratio_10m` is computed over compression *attempts* (successful + rejected) in the rolling 10 min window, weighted by uncompressed bytes. Each successful compression contributes its actual `compressed/uncompressed` ratio. Each rejection (post-compression net-savings guard, R2.4 / §6.6) contributes its actual measured ratio (typically in `[0.9, 1.05]` since the net-savings guard rejected it for being too close to 1.0). Worker errors are excluded from the metric — they're tracked separately via `compression_errors_total`. With drift_ratio = 0.7, drift fires when the current ratio exceeds post-training by a factor of `1/0.7 ≈ 1.43` — i.e., compression efficiency has degraded by about 43%. Both forms of degradation feed the metric uniformly:
+      - workload-content drift among compressible values (post-training values were highly compressible; live values compress worse), and
+      - workload composition drift (a growing fraction of values compress poorly enough to fail the net-savings guard).
   - **Optional time-based retraining**: `compression-dict-refresh-interval` (default `0` = disabled).
   - **Manual**: `COMPRESSION TRAIN` forces an immediate training job.
 - **R2.3.6** **Training sampling — main-thread iteration, bio-thread training, no sustained reservoir.** The main thread walks `kvstore` shards in random order (reusing the active-expiry / defrag incremental-iteration pattern, spliced across `serverCron` ticks), selects eligible samples, and **copies sample bytes into a pre-allocated contiguous training buffer** with a parallel `sizes[]` array. When `compression-dict-first-training-keys-count` samples are collected, the main thread submits `(buffer, sizes[], count)` as a `BIO_COMPRESSION_TRAIN` job. Iteration and any `kvstore` / `refcount` manipulation stay on the main thread; bio never touches `robj`, `kvstore`, or refcounts (consistent with R2.11.4). Scan uses `LOOKUP_NOTOUCH` semantics — training reads do not update LRU/LFU. The training buffer is transient (~10–16 MiB for default settings, freed once bio returns), not a long-lived reservoir. Iteration window is bounded to ~1 s for default settings (hz=10, ~1000 keys/tick) — ≪ the dict's post-training active lifetime, so spread-in-time sampling does not meaningfully affect dictionary quality; each collected sample is an immutable snapshot of real bytes at copy time, and drift-retraining (R2.3.5) is the backstop for post-training workload shifts. Low-keyspace edge case: if fewer than `first-training-keys-count` eligible values exist, training aborts with a logged warning and retries on the next trigger. (Q9)
@@ -236,11 +245,10 @@ All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is do
 | `compression-sweep-max-cpu-pct` | int | `25` | sweep pacing (1..100) |
 | `compression_cpulist` | string | `""` | CPU pinning |
 | `compression-min-savings-ratio` | percent | `10` | post-compression net-savings guard |
-| `compression-retry-interval` | seconds | `3600` | fallback retry period for the dict-scoped incompressible-keys guard (primary retry signal is active-dict change; this interval catches content changes that alter compressibility while the dict stays stable — see R2.4 / Q6b) |
 | `compression-lfu-threshold` | int | `5` | LFU skip-hot-key guard (only active in LFU eviction mode) |
 | `compression-min-idle-seconds` | seconds | `60` | LRU/noeviction time-based skip; applies to `lru_idle_secs(obj)`. Inactive in LFU mode (LFU branch uses `compression-lfu-threshold` instead). |
 | `compression-dict-first-training-keys-count` | int | `10000` | first-training trigger |
-| `compression-dict-drift-ratio` | percent | `70` | retrain drift trigger |
+| `compression-dict-drift-ratio` | percent | `70` | retrain drift trigger; fires when `compression_live_ratio_10m > post_training_ratio / drift_ratio` (R2.3.5). Lower values mean less tolerance for degradation (drift fires sooner). |
 | `compression-dict-refresh-interval` | seconds | `0` | optional periodic retrain (0 = disabled) |
 | `compression-dict-max-versions` | int | `4` | registry cap (min 2) |
 
@@ -725,7 +733,7 @@ See §4.6 `compressionJob`.
 
 ### 6.6 Net-savings guard failure
 
-- Post-compression check determines the compressed form is not worth keeping: discard the compressed buffer, leave the value as-is, record `(key, failed_dict_id=active_dict_id, timestamp=now)` in the `incompressibleKeys` side hashtable, increment `compression_skipped_incompressible`. Entry is cleared on successful compression (new dict promoted → retry succeeds) or on `DEL`. Not an error — normal operation for incompressible data. Retry-eligibility is `entry.failed_dict_id != active_dict_id OR age(entry.timestamp) >= compression-retry-interval`.
+- Post-compression check determines the compressed form is not worth keeping: discard the compressed buffer, leave the value as-is, increment `compression_skipped_incompressible`. Not an error — normal operation for incompressible data. v1 does not track per-key rejection state; the next sweep tick will re-attempt compression of the same value (or whatever value is at that key by then). Under a fixed dict and a fixed input distribution, time-based throttling doesn't change the per-attempt hit probability — it only spaces attempts, which is what sweep pacing already does at the global level. Sustained high rejection rate inflates `compression_live_ratio_10m` (rejections contribute their actual measured ratio, typically in `[0.9, 1.05]`; see R2.10.1), trips the drift threshold (R2.3.5), and triggers retraining; after dict promotion the retry naturally succeeds (or fails again under the new dict, in which case the value is truly incompressible regardless of dict).
 
 ### 6.7 Worker thread crash
 
@@ -748,7 +756,6 @@ A new `--compression` flag on each Tcl test driver starts the server under test 
 --compression-lfu-threshold 255
 --compression-min-idle-seconds 0
 --compression-min-savings-ratio 0
---compression-retry-interval 0
 --compression-dict-first-training-keys-count 10
 --compression-threads 1
 --compression-sweep-max-cpu-pct 100

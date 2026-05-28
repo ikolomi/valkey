@@ -2410,7 +2410,6 @@ struct valkeyServer {
     int compression_sweep_max_cpu_pct;              /* Sweep pacing (1..100). Default: 25. */
     char *compression_cpulist;                      /* CPU affinity list for workers. Default: "". */
     int compression_min_savings_ratio;              /* Post-compression net-savings guard (percent). Default: 10. */
-    int compression_retry_interval;                 /* Fallback retry period (seconds). Default: 3600. */
     int compression_lfu_threshold;                  /* LFU skip-hot-key additional guard. Default: 5. */
     int compression_min_idle_seconds;               /* LRU/noeviction read-recency skip; inactive in LFU mode. Default: 60. */
     int compression_dict_first_training_keys_count; /* First-training trigger. Default: 10000. */

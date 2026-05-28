@@ -83,18 +83,11 @@ robj *objectGetUncompressedView(robj *o, sds *scratch) {
  *
  * Returns 1 iff the value is a candidate for background compression.
  * Cheap by construction — every check is a bitfield read, a config
- * comparison, or a `robj->lru` decode; no allocations, no hash lookups
- * in this revision. Callable from the write path (dbAdd / dbSetValue /
- * dbOverwrite) and from the sweep cron tick.
- *
- * The `key` parameter is reserved for S2.3 (incompressible-keys
- * hashtable lookup); the dict-ID-scoped retry guard described in R2.4 /
- * Thread #20 will be wired in here once `compressionRetryEligible(key)`
- * lands. For S2.2 every key is treated as "always retry-eligible."
+ * comparison, or a `robj->lru` decode; no allocations, no hash lookups.
+ * Callable from the write path (dbAdd / dbSetValue / dbOverwrite) and
+ * from the sweep cron tick.
  */
-int compressionIsEligible(robj *o, const sds key) {
-    UNUSED(key); /* Reserved for S2.3 incompressible-keys lookup. */
-
+int compressionIsEligible(robj *o) {
     /* 1. Master switch. Zero overhead when disabled. */
     if (!server.compression_enabled) return 0;
 
@@ -172,10 +165,25 @@ int compressionIsEligible(robj *o, const sds key) {
         if (idle_secs < (uint32_t)server.compression_min_idle_seconds) return 0;
     }
 
-    /* 6. Incompressible-keys retry guard (R2.4 post-compression / Q6 /
-     * Thread #20). For S2.2 this branch is stubbed as "always retry-
-     * eligible." S2.3 lands the real side hashtable and wires the
-     * `compressionRetryEligible(key)` lookup here. */
+    /* 6. Post-compression net-savings guard.
+     *
+     * Per R2.4: when the worker returns a result that fails the
+     * net-savings ratio check, the main thread discards the compressed
+     * form, leaves the value uncompressed, and increments
+     * `compression_skipped_incompressible`. v1 does NOT track per-key
+     * rejection state — the rejection rate is part of the drift signal
+     * (see S1.4 / R2.3.5 extension). The eligibility predicate
+     * therefore has no per-key "don't retry" branch; each sweep tick
+     * re-attempts compression of every eligible value.
+     *
+     * Rationale (see PR #10 design discussion): under a fixed dict,
+     * the same value's compression result is deterministic — retrying
+     * the same value under the same dict cannot change the outcome.
+     * The legitimate trigger for "the rejection might now compress" is
+     * **dict change**, which is handled by the drift mechanism: a
+     * sustained high rejection rate flags the active dict as a poor
+     * fit for the workload and triggers retraining. After promotion,
+     * the next sweep tick re-attempts under the new dict naturally. */
 
     return 1;
 }

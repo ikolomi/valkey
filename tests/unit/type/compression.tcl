@@ -79,11 +79,10 @@ start_server {tags {"compression"}} {
         assert_equal [lindex [r config get compression-min-value-size] 1] "256"
         assert_equal [lindex [r config get compression-max-value-size] 1] "131072"
         assert_equal [lindex [r config get compression-dict-size] 1] "102400"
-        # Advanced (10)
+        # Advanced (9)
         assert_equal [lindex [r config get compression-sweep-max-cpu-pct] 1] "25"
         assert_equal [lindex [r config get compression-cpulist] 1] ""
         assert_equal [lindex [r config get compression-min-savings-ratio] 1] "10"
-        assert_equal [lindex [r config get compression-retry-interval] 1] "3600"
         assert_equal [lindex [r config get compression-lfu-threshold] 1] "5"
         assert_equal [lindex [r config get compression-min-idle-seconds] 1] "60"
         assert_equal [lindex [r config get compression-dict-first-training-keys-count] 1] "10000"

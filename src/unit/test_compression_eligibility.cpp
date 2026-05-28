@@ -118,14 +118,14 @@ TEST_F(CompressionEligibilityTest, MasterSwitchOff) {
     server.compression_enabled = 0;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 600); /* very cold */
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
 TEST_F(CompressionEligibilityTest, AllGatesPassWhenColdAndRaw) {
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -137,7 +137,7 @@ TEST_F(CompressionEligibilityTest, RejectsNonStringType) {
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 600);
     o->type = OBJ_LIST; /* artificially mislabel — tests the gate */
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     o->type = OBJ_STRING; /* restore for clean free */
     decrRefCount(o);
 }
@@ -148,7 +148,7 @@ TEST_F(CompressionEligibilityTest, RejectsIntEncoding) {
     robj *o = createStringObjectFromLongLong(12345);
     ASSERT_EQ((unsigned)OBJ_ENCODING_INT, o->encoding);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -157,7 +157,7 @@ TEST_F(CompressionEligibilityTest, RejectsEmbstrEncoding) {
     robj *o = createStringObject("short", 5);
     ASSERT_EQ((unsigned)OBJ_ENCODING_EMBSTR, o->encoding);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -166,7 +166,7 @@ TEST_F(CompressionEligibilityTest, RejectsAlreadyCompressedEncoding) {
     robj *o = makeRawString(1024);
     o->encoding = OBJ_ENCODING_COMPRESSED;
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     o->encoding = OBJ_ENCODING_RAW; /* restore for clean free */
     decrRefCount(o);
 }
@@ -180,7 +180,7 @@ TEST_F(CompressionEligibilityTest, RejectsSharedRefcount) {
     int saved_refcount = o->refcount;
     o->refcount = OBJ_SHARED_REFCOUNT;
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     o->refcount = saved_refcount; /* restore so decrRefCount frees normally */
     decrRefCount(o);
 }
@@ -193,7 +193,7 @@ TEST_F(CompressionEligibilityTest, RejectsBelowMinSize) {
     server.compression_min_value_size = 256;
     robj *o = makeRawString(255);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -201,7 +201,7 @@ TEST_F(CompressionEligibilityTest, AcceptsAtMinSize) {
     server.compression_min_value_size = 256;
     robj *o = makeRawString(256);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -209,7 +209,7 @@ TEST_F(CompressionEligibilityTest, RejectsAboveMaxSize) {
     server.compression_max_value_size = 1024;
     robj *o = makeRawString(1025);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -217,7 +217,7 @@ TEST_F(CompressionEligibilityTest, AcceptsAtMaxSize) {
     server.compression_max_value_size = 1024;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -225,7 +225,7 @@ TEST_F(CompressionEligibilityTest, MaxSizeZeroDisablesUpperBound) {
     server.compression_max_value_size = 0;
     robj *o = makeRawString(1 << 20); /* 1 MiB */
     setLruIdleSecs(o, 600);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -238,7 +238,7 @@ TEST_F(CompressionEligibilityTest, LruRejectsRecentTouch) {
     server.compression_min_idle_seconds = 60;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 30);
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -246,7 +246,7 @@ TEST_F(CompressionEligibilityTest, LruAcceptsBeyondThreshold) {
     server.compression_min_idle_seconds = 60;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 120);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -255,7 +255,7 @@ TEST_F(CompressionEligibilityTest, LruAtThresholdAcceptsBoundary) {
     server.compression_min_idle_seconds = 60;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 60);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -263,7 +263,7 @@ TEST_F(CompressionEligibilityTest, LruZeroThresholdAcceptsImmediately) {
     server.compression_min_idle_seconds = 0;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 0);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -282,10 +282,10 @@ TEST_F(CompressionEligibilityTest, NoevictionUsesLruTimeBasedCheck) {
 
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 30); /* still hot */
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
 
     setLruIdleSecs(o, 120); /* cold */
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
 
     decrRefCount(o);
 }
@@ -299,12 +299,12 @@ TEST_F(CompressionEligibilityTest, LfuRejectsAtOrAboveThreshold) {
     server.compression_lfu_threshold = 5;
     robj *o = makeRawString(1024);
     setLfuFreq(o, 5); /* exactly threshold */
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 
     o = makeRawString(1024);
     setLfuFreq(o, 10); /* above threshold */
-    EXPECT_EQ(0, compressionIsEligible(o, NULL));
+    EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -313,7 +313,7 @@ TEST_F(CompressionEligibilityTest, LfuAcceptsBelowThreshold) {
     server.compression_lfu_threshold = 5;
     robj *o = makeRawString(1024);
     setLfuFreq(o, 4);
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }
 
@@ -327,6 +327,6 @@ TEST_F(CompressionEligibilityTest, LfuTimeKnobIsInactive) {
     robj *o = makeRawString(1024);
     setLfuFreq(o, 0); /* well below freq threshold */
     /* Despite min_idle being INT_MAX, the LFU branch ignores it. */
-    EXPECT_EQ(1, compressionIsEligible(o, NULL));
+    EXPECT_EQ(1, compressionIsEligible(o));
     decrRefCount(o);
 }

@@ -91,7 +91,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch);
  * pattern (see objectGetIdleness in src/object.c). For LRU/noeviction
  * modes there is no mutation.
  */
-int compressionIsEligible(robj *o, const sds key);
+int compressionIsEligible(robj *o);
 void compressionEnqueueCandidate(const sds key, robj *o);
 
 /* ========================================================================

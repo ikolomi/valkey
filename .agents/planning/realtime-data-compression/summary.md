@@ -19,7 +19,7 @@ When enabled, Valkey keeps a small set of ZSTD compression dictionaries trained 
 |---|---|---|
 | Algorithm | ZSTD with trained dictionary | Best ratio-per-CPU for small values; the dictionary is the unique value add. See Appendix A. |
 | Activation | Opt-in via `compression-enabled yes`; feature-off is the default and zero-cost | Safe rollout; operators pick when to turn it on. |
-| Eligibility | STRING only; size 256 B – 128 KiB; not EMBSTR; policy-aware hot-key skip (`lru_idle_secs` in LRU/noeviction, `lfu_freq` in LFU); per-dict incompressible-keys guard | Narrow window where the dictionary pays off and compression cost is amortized over reads. |
+| Eligibility | STRING only; size 256 B – 128 KiB; not EMBSTR; policy-aware hot-key skip (`lru_idle_secs` in LRU/noeviction, `lfu_freq` in LFU); post-compression net-savings guard | Narrow window where the dictionary pays off and compression cost is amortized over reads. |
 | Hot path (reads) | Sync decompression on main thread, ~1 µs/KB budget | Simple, predictable; async is v2. |
 | Hot path (writes) | Async compression on dedicated worker pool; main thread never compresses | Zero client-visible write latency added. |
 | Dictionary training | On `bio` thread using a contiguous sample buffer copied by main thread; main thread never blocks on training | Avoids robj/kvstore thread-safety concerns; satisfies `ZDICT_trainFromBuffer` API. |
@@ -60,6 +60,7 @@ The 2026-05-10 PR review walkthrough addressed all 31 review threads (22 self-re
 - **Hotness signals decoupled from `maxmemory-policy`:** universal `write_age` + `idle_seconds` gates in every mode; LFU-freq only when LFU is active; knob renamed `compression-lru-idle-seconds` → `compression-min-idle-seconds`
   - **Refined again during S2.2:** the time-based and freq-based checks are policy-conditional (the lru field encodes seconds in LRU/noeviction but freq in LFU; the time check can't be applied universally). `compression-settle-seconds` dropped — both knobs compared to the same metric in v1, so the dual surface added no expressive power.
 - **Retry-guard scoped by dict ID** via new `incompressibleKeys{}` side hashtable
+  - **Refined again during S2.3 implementation review:** the side hashtable was dropped entirely. Per-key rejection state is functionless under a fixed dict (ZSTD is deterministic — same input + same dict = same output, so retries can't change outcome) and the dict-change retry signal is better expressed at the system level. R2.3.5 drift trigger extended to fold rejected attempts into `compression_live_ratio_10m` (each rejection contributes its actual measured ratio, typically in `[0.9, 1.05]`); a sustained high rejection rate naturally trips the existing drift threshold. No new knob; one knob removed (`compression-retry-interval`). S2.3 sub-task removed from the plan; the drift-signal extension absorbed into S1.4.
 - **Training flow corrected:** main thread iterates + copies samples into a contiguous buffer; bio runs `ZDICT_trainFromBuffer`. Bio never touches `robj`, `kvstore`, or refcounts. Dropped incorrect "zero copies" claim
 - **Appendix §C.7 added:** io-threads explicitly rejected for decompression in v1
 

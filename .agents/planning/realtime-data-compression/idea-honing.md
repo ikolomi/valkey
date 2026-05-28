@@ -191,7 +191,7 @@ Within `OBJ_STRING`, not every value is a good compression candidate. We need a 
 
       _Earlier drafts of this doc exposed two knobs in this branch — `compression-settle-seconds` ("recent-write protection") and `compression-min-idle-seconds` ("recent-access protection"). Both compared to the same `lru_idle_secs(obj)` metric, so the effective behavior was always `idle >= max(settle, min_idle)` — the second knob added no expressive power v1 could deliver, only a footgun (operators tuning them differently expecting different effects). Per YAGNI and Valkey's preference for minimal operator surfaces (PR #1 Thread #3, the 5+11 → 5+10 split), v1 ships only the single knob. v2 can reintroduce a write-time-specific knob non-breakingly when per-object write-time tracking lands._
   - **LFU mode** (`robj->lru` encodes a freq counter, no per-second timestamp): apply the freq threshold instead — skip if `lfu_freq(obj) >= compression-lfu-threshold` (default `5`, on the 0–255 log scale). The time-based knob is inactive in this mode; the freq counter IS the access-recency signal.
-- **Skip post-compression if we don't actually save.** After the worker compresses, on the main thread we compare `compressed_size + header >= uncompressed_size * (1 - compression-min-savings-ratio)` (default `10%`). If true: discard the compressed form, leave the value uncompressed, and **mark the key as incompressible-under-this-dict** — record `(key, failed_dict_id, timestamp)` in a side hashtable so sweepers skip the key. The key becomes retry-eligible when **either** (primary) the active dictID differs from `failed_dict_id` (new dict was promoted → incompressibility may have changed), **or** (fallback) `age(timestamp) >= compression-retry-interval` (default `1 h`, handles edge cases like content changes that alter compressibility while the dict stays stable). This honors the semantic that incompressibility is dict-scoped, not time-scoped (Q6b, PR-review T-3188785185).
+- **Skip post-compression if we don't actually save.** After the worker compresses, on the main thread we compare `compressed_size + header >= uncompressed_size * (1 - compression-min-savings-ratio)` (default `10%`). If true: discard the compressed form, leave the value uncompressed, and increment `compression_skipped_incompressible`. v1 does **not** track per-key rejection state. Under a fixed dict and a fixed workload, the probability that any given write at key K produces compressible bytes is constant — time-based throttling between retries doesn't shift this probability, it only spaces attempts. CPU bounding is already provided at the sweep level (`compression-sweep-max-cpu-pct`); per-key throttling would be redundant and would add correctness burden (stale entries on overwrite or in-place mutation). The "rejection might now compress" trigger is **dict change**, which is handled at the system level: rejections contribute their actual measured ratio to `compression_live_ratio_10m` — typically in `[0.9, 1.05]` since the net-savings guard rejected them for being too close to 1.0 — so sustained high rejection rate naturally trips the drift threshold and triggers retraining (R2.3.5).
 
 **Open sub-questions for you:**
 
@@ -208,7 +208,7 @@ Within `OBJ_STRING`, not every value is a good compression candidate. We need a 
 **Answer:** All three sub-decisions go with the recommendation.
 
 - **(Q6a)** *Superseded by review (see PR threads T-3167775681 / T-3167859080), then refined again during S2.2 implementation review: the eligibility model is **policy-aware**, not policy-uniform.* In **LRU and `noeviction` modes**, a single threshold (`compression-min-idle-seconds`) applies to `lru_idle_secs(obj)` — Valkey's 24-bit `robj->lru` field is seconds-based in these modes and is touched on every read AND write, so this single signal covers both write-recency and read-recency intent. In **LFU mode**, `robj->lru` encodes a freq counter (not a timestamp), so the time-based threshold does not apply meaningfully; the LFU branch (`lfu_freq(obj) < compression-lfu-threshold`) filters by frequency instead. (See `src/lrulfu.h` for the encoding details. The earlier dual-knob surface — `compression-settle-seconds` + `compression-min-idle-seconds` — was dropped per YAGNI: both compared to the same metric in v1, so the second knob added no expressive power, only a footgun. v2 may reintroduce a write-time-specific knob non-breakingly when per-object write-time tracking lands.)
-- **(Q6b)** Include the **dict-scoped retry guard** in v1. When the post-compression savings check fails, record `(key, failed_dict_id, timestamp)` in a side hashtable `incompressibleKeys{}`; sweepers skip keys present in this table. Retry-eligibility is `failed_dict_id != current_active_dict_id` (primary signal: new dict promoted) **or** `age(timestamp) >= compression-retry-interval` (fallback: handles content changes under a stable dict, default `1 h`). Entries are evicted from the table on successful compression or on explicit `DEL` of the key. Counter tracked in `INFO compression` (`compression_skipped_incompressible`).
+- **(Q6b)** v1 does **not** include a per-key retry guard. *Superseded by review during S2.3 implementation (PR #10): the originally proposed dict-scoped side hashtable was dropped before merge.* Under a fixed dict and a fixed workload, the probability that any given write at key K produces compressible bytes is constant — time-based throttling between retries doesn't shift this probability, only spaces attempts. CPU bounding is already provided at the sweep level (`compression-sweep-max-cpu-pct`); per-key throttling would be redundant with that, while adding correctness burden (every mutating code path — `dbOverwrite`, APPEND, SETRANGE, BITOP, BITFIELD, module DMA writes — would need a `Clear` integration point to avoid suppressing compression of legitimately-changed values). The right trigger for "the rejection might now compress" is **dict change**, which is handled at the system level: rejected attempts contribute their actual measured ratio to `compression_live_ratio_10m`, so a sustained high rejection rate naturally trips the drift threshold and triggers retraining (R2.3.5). After dict promotion, every previously-rejected eligible key is naturally retried on the next sweep tick. Counter tracked in `INFO compression` (`compression_skipped_incompressible`).
 - **(Q6c)** **v1 scope is STRING only** (`type == OBJ_STRING`, eligible encoding `RAW`; `EMBSTR` ≤ 44 B and `INT` are skipped — see eligibility filter). HASH/SET/ZSET/LIST/STREAM are explicit v2+ work. The encoding-tag approach remains structurally extensible so future types can piggyback on the same infrastructure.
 
 **Consolidated eligibility predicate (for the design doc):**
@@ -220,7 +220,6 @@ eligible(obj) ⇔
  && obj->refcount != OBJ_SHARED_REFCOUNT
  && sdslen(val) >= compression-min-value-size
  && (compression-max-value-size == 0 || sdslen(val) <= compression-max-value-size)
- && retry_eligible(obj)                                       // see post-compression guard below
  && hot_key_check(obj)                                        // see below — policy-aware
 
 where hot_key_check(obj) is:
@@ -230,19 +229,12 @@ where hot_key_check(obj) is:
         lru_idle_secs(obj) >= compression-min-idle-seconds
 ```
 
-Where, for `entry = incompressibleKeys[key_hash]`:
-```
-retry_eligible(obj) ⇔
-    entry is null                                   // never failed → eligible
- || entry.failed_dict_id != active_dict_id          // dict changed → retry (primary signal)
- || age(entry.timestamp) >= compression-retry-interval  // fallback: retry after long quiet period
-```
-
 **Post-compression net-savings guard (main thread, after worker returns):**
 
 ```
 compressed_size + header_size >= uncompressed_size * (1 - compression-min-savings-ratio)
-  → discard compressed form, mark key with retry cooldown.
+  → discard compressed form, leave value uncompressed, increment
+    compression_skipped_incompressible.
 ```
 
 Associated configs (all MODIFIABLE_CONFIG):
@@ -253,7 +245,6 @@ Associated configs (all MODIFIABLE_CONFIG):
 | `compression-lfu-threshold` | `5` |
 | `compression-min-idle-seconds` | `60` |
 | `compression-min-savings-ratio` | `10%` |
-| `compression-retry-interval` | `3600` seconds |
 
 ---
 
@@ -572,7 +563,6 @@ A new test-harness flag, `--compression`, starts each test server with an **aggr
 --compression-lfu-threshold 255
 --compression-min-idle-seconds 0
 --compression-min-savings-ratio 0
---compression-retry-interval 0
 --compression-dict-first-training-keys-count 10
 --compression-threads 1
 --compression-sweep-max-cpu-pct 100

@@ -31,7 +31,7 @@ Each subsystem is owned end-to-end — code + unit tests ship in the same PR. De
 | # | Subsystem | Files (from §4.1) | R-refs | Owner | Effort |
 |---|---|---|---|---|---|
 | **S1** | Dictionary lifecycle (registry, training, promotion, retirement, drift-retrain, main-thread iteration + sample copy, bio train job) | `src/compression_registry.c`, `src/compression_train.c` | R2.3.1–R2.3.12, R2.11.4 | @GilboaAWS | L |
-| **S2** | Compression hot path (eligibility predicate, worker pool, encoder, decoder, write/read hooks, incompressible-keys hashtable, sweep pacing) | `src/compression.c`/`.h`, `src/compression_workers.c`, `src/compression_header.c` + `db.c` hook points | R2.1, R2.2, R2.4, R2.5, R2.11 | @ikolomi | L |
+| **S2** | Compression hot path (eligibility predicate, worker pool, encoder, decoder, write/read hooks, sweep pacing) | `src/compression.c`/`.h`, `src/compression_workers.c`, `src/compression_header.c` + `db.c` hook points | R2.1, R2.2, R2.4, R2.5, R2.11 | @ikolomi | L |
 | **S3** | Persistence — RDB format extension + AOF behavior + full-sync RDB uncompressed | `src/rdb.c`, `src/aof.c`, `src/replication.c` (full-sync flag) | R2.6.1–R2.6.9, R2.7 | @GilboaAWS | M |
 | **S4** | Observability & admin (`INFO compression`, `COMPRESSION` command family, latency monitor, telemetry) | `src/compression.c` (`infoCompression`), `src/commands/compression-*.json` | R2.8, R2.9, R2.10 | @GilboaAWS | S |
 | **S5** | Benchmark suite + perf validation (extend `valkey-benchmark`, canonical scenarios, perf dashboard, regression harness) | `src/valkey-benchmark.c` extensions, `tests/perf/` | §7.3, §7.5 | @ikolomi | L |
@@ -161,8 +161,8 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 #### @ikolomi track (S2/S5)
 
 - [x] **S2.1 — Header encode/decode** (`compression_header.c`): round-trip tests, malformed-header rejection (R2.5.3). Allocation helpers for `OBJ_ENCODING_COMPRESSED` robjs.
-- [x] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), policy-aware hot-key skip (`lru_idle_secs` >= `compression-min-idle-seconds` in LRU/noeviction, `lfu_freq` < `compression-lfu-threshold` in LFU), incompressible-keys hashtable check.
-- [ ] **S2.3 — Incompressible-keys hashtable**: dict-ID scoped primary + time fallback. Implements Thread #20 resolution.
+- [x] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), policy-aware hot-key skip (`lru_idle_secs` >= `compression-min-idle-seconds` in LRU/noeviction, `lfu_freq` < `compression-lfu-threshold` in LFU).
+- [ ] **S2.3 — ~~Incompressible-keys hashtable~~ (REMOVED).** Originally planned as a dict-ID-scoped side hashtable per Thread #20; dropped during S2.3 implementation review (PR #10 design discussion). Per-key rejection state is functionless under a fixed dict (ZSTD is deterministic), and the dict-change retry signal is better expressed at the system level via the rejection-rate drift trigger added to S1.4. No code change tracked under S2.3 anymore — kept here for traceability.
 - [ ] **S2.4 — Worker pool** (`compression_workers.c`): thread startup/shutdown per `compression-threads`, SPMC inbox, MPSC outbox. Workers never touch `robj` (R2.11.4).
 - [ ] **S2.5 — Encoder path**: main thread enqueues candidate with `incrRefCount`; worker reads sds bytes, compresses via `ZSTD_compress_usingCDict`, enqueues result.
 - [ ] **S2.6 — Decoder path**: `objectGetUncompressedView` on main thread, sync decompression (R2.5.1), ~1 µs/KB budget. Handles dict-ID lookup + dict-not-found error (R2.6.5 parallel).
@@ -179,7 +179,7 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S1.1 — Dictionary registry** (`compression_registry.c`): add/lookup/promote/retire, refcounting, cap enforcement. Unit tests covering every branch of R2.3.9 promotion + R2.3.10 retirement. Owns `compression-max-dict-cap` behavior.
 - [ ] **S1.2 — Training sampler (main thread)**: kvstore shard iteration + contiguous-buffer sample copy, spliced across `serverCron` ticks. Implements R2.3.6 corrected flow (per Thread #29). `LOOKUP_NOTOUCH` semantics.
 - [ ] **S1.3 — Bio train job (`BIO_COMPRESSION_TRAIN`)**: accepts `(buffer, sizes[], count)`, calls `ZDICT_trainFromBuffer`, signals completion via event fd. Never touches `robj`/`kvstore`/refcounts.
-- [ ] **S1.4 — Train completion + promotion on main thread**: creates `ZSTD_CDict`/`ZSTD_DDict`, inserts into registry, atomic promotion. Implements R2.3.5 drift-retrain trigger detection.
+- [ ] **S1.4 — Train completion + promotion on main thread**: creates `ZSTD_CDict`/`ZSTD_DDict`, inserts into registry, atomic promotion. Implements R2.3.5 drift-retrain trigger detection: `compression_live_ratio_10m > post_training_ratio / drift_ratio` where the rolling ratio includes both successful compressions AND rejections (each rejection contributes its actual measured ratio, typically in `[0.9, 1.05]` since the net-savings guard rejected it for being too close to 1.0). The single combined signal captures both workload-content drift among compressible values and dict-fit drift (rejection rate climbing); see PR #10 design discussion for the rationale.
 - [ ] **S4.1 — `INFO compression` section**: all fields per R2.10 + §5.6. Unit tests for schema stability.
 - [ ] **S4.2 — `COMPRESSION` command tree full implementation**: `STATUS`, `DICT LIST`, `DICT DROP`, `SWEEP`, `DEBUG`. Reply-schema tests per §7.4.
 - [ ] **S4.3 — Latency monitor events** per R2.10 (train start/finish, worker stall, etc.)
