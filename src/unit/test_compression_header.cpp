@@ -33,6 +33,7 @@
 
 extern "C" {
 #include "compression_header.h"
+#include "compression_registry.h"
 #include "server.h"
 #include "zmalloc.h"
 }
@@ -49,7 +50,19 @@ extern "C" {
  * changes from 0, this file must update with it. */
 static constexpr uint32_t kNoDictId = 0u;
 
-class CompressionHeaderTest : public ::testing::Test {};
+class CompressionHeaderTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        server.compression_dict_max_versions = 4;
+        server.compression_threads = 1;
+        server.logfile = (char *)"";
+        server.verbosity = LL_WARNING;
+        compressionRegistryInit();
+    }
+    void TearDown() override {
+        compressionRegistryRelease();
+    }
+};
 
 /* ========================================================================
  * Encode / decode round-trip

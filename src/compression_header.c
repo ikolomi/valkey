@@ -107,7 +107,7 @@ robj *createCompressedObject(int type, void *buffer, size_t buffer_len) {
      * metadata; we deliberately gate the IncRef on the algorithm. */
     if (h.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
         h.alg_meta != COMPRESSION_DICT_ID_NONE) {
-        compressionRegistryIncRef(h.alg_meta);
+        compressionDictIncrFrameRef(h.alg_meta);
     }
 
     return o;
@@ -127,7 +127,7 @@ void freeCompressedObject(robj *o) {
 
     if (h.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
         h.alg_meta != COMPRESSION_DICT_ID_NONE) {
-        compressionRegistryDecRef(h.alg_meta);
+        compressionDictDecrFrameRef(h.alg_meta);
     }
 
     zfree(buffer);
