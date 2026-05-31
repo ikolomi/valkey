@@ -24,12 +24,15 @@ static compressionDictPair *makeFakeDictPair(void) {
 }
 
 class CompressionRegistryTest : public ::testing::Test {
-protected:
+  protected:
     void SetUp() override {
         server.compression_dict_max_versions = 4;
         server.compression_threads = 2;
         server.logfile = (char *)"";
-        server.verbosity = LL_WARNING;
+        /* Suppress all logging — serverLog accesses server fields that
+         * aren't fully initialized in the unit test context, which
+         * triggers ASAN false positives. */
+        server.verbosity = LL_NOTHING;
         compressionRegistryInit();
     }
     void TearDown() override {
@@ -188,6 +191,6 @@ TEST_F(CompressionRegistryTest, EndToEndLifecycle) {
     ASSERT_NE(compressionRegistryLookup(id), nullptr); /* frame_refs=2 */
     compressionRegistryDecRef(id);
     ASSERT_NE(compressionRegistryLookup(id), nullptr); /* frame_refs=1 */
-    compressionRegistryDecRef(id); /* triggers GC, freed */
+    compressionRegistryDecRef(id);                     /* triggers GC, freed */
     ASSERT_EQ(compressionRegistryLookup(id), nullptr);
 }

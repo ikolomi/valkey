@@ -51,12 +51,15 @@ extern "C" {
 static constexpr uint32_t kNoDictId = 0u;
 
 class CompressionHeaderTest : public ::testing::Test {
-protected:
+  protected:
     void SetUp() override {
         server.compression_dict_max_versions = 4;
         server.compression_threads = 1;
         server.logfile = (char *)"";
-        server.verbosity = LL_WARNING;
+        /* Suppress all logging — serverLog accesses server fields that
+         * aren't fully initialized in the unit test context, which
+         * triggers ASAN false positives. */
+        server.verbosity = LL_NOTHING;
         compressionRegistryInit();
     }
     void TearDown() override {
