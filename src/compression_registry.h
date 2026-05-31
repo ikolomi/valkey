@@ -60,21 +60,21 @@ typedef enum compressionDictState {
  *
  */
 typedef struct compressionDictPair {
-    uint32_t dict_id;           /* monotonic ID, never reused; 0 = no-dict. Stored in compressed frame headers
-                                   so decompression can find the correct DDict. */
-    unsigned char *bytes;       /* raw dictionary bytes from training. Persisted to RDB AUX entries and used
-                                   to recreate CDict/DDict on RDB load. */
-    size_t bytes_len;           /* length of raw dictionary bytes */
-    ZSTD_CDict *cdict;         /* digested dictionary for compression. Immutable after creation — workers
-                                   read it concurrently without locks. */
-    ZSTD_DDict *ddict;         /* digested dictionary for decompression. Used by the main thread to
-                                   decompress frames that reference this dict. */
-    size_t frame_refs;          /* number of installed compressed robjs referencing this dict. Main-thread
-                                   only. Dict cannot be freed while frame_refs > 0. */
-    compressionDictState state; /* lifecycle state: ACTIVE (used for new compressions), RETIRING
-                                   (decompress-only, pending GC), or RETIRED (safe to free). */
-    mstime_t promoted_at_ms;   /* timestamp when this dict became active. Used for INFO reporting
-                                   (dict age) and drift-retrain trigger. */
+    uint32_t dict_id;               /* monotonic ID, never reused; 0 = no-dict. Stored in compressed frame headers
+                                       so decompression can find the correct DDict. */
+    unsigned char *bytes;           /* raw dictionary bytes from training. Persisted to RDB AUX entries and used
+                                       to recreate CDict/DDict on RDB load. */
+    size_t bytes_len;               /* length of raw dictionary bytes */
+    ZSTD_CDict *cdict;              /* digested dictionary for compression. Immutable after creation — workers
+                                        read it concurrently without locks. */
+    ZSTD_DDict *ddict;              /* digested dictionary for decompression. Used by the main thread to
+                                        decompress frames that reference this dict. */
+    size_t frame_refs;              /* number of installed compressed robjs referencing this dict. Main-thread
+                                       only. Dict cannot be freed while frame_refs > 0. */
+    compressionDictState state;     /* lifecycle state: ACTIVE (used for new compressions), RETIRING
+                                       (decompress-only, pending GC), or RETIRED (safe to free). */
+    mstime_t promoted_at_ms;        /* timestamp when this dict became active. Used for INFO reporting
+                                        (dict age) and drift-retrain trigger. */
     uint64_t retire_worker_gen[16]; /* per-worker quiescent-gen snapshot taken at retirement time.
                                        Dict is safe to free only after all workers have advanced past
                                        their snapshotted value.
