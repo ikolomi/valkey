@@ -72,8 +72,12 @@ TEST_F(CompressionRegistryTest, CapEnforcementRejectsWhenFull) {
     for (int i = 0; i < 4; i++) {
         ASSERT_NE(compressionRegistryAdd(makeFakeDictPair(), 1), (uint32_t)COMPRESSION_DICT_ID_NONE);
     }
-    uint32_t id = compressionRegistryAdd(makeFakeDictPair(), 1);
+    compressionDictPair *rejected = makeFakeDictPair();
+    uint32_t id = compressionRegistryAdd(rejected, 1);
     ASSERT_EQ(id, (uint32_t)COMPRESSION_DICT_ID_NONE);
+    /* Caller still owns on rejection — free it. */
+    zfree(rejected->bytes);
+    zfree(rejected);
 }
 
 TEST_F(CompressionRegistryTest, StartRetirementSnapshotsWorkerGens) {
