@@ -428,7 +428,6 @@ typedef struct compressionRegistry {
     compressionDict *dicts[COMPRESSION_DICT_MAX];  /* sized by compression-dict-max-versions */
     int              n_dicts;
     _Atomic(compressionDict *) active;  /* published via atomic store; workers load atomically */
-    compressionDict *retiring_list;     /* singly-linked list of dicts pending GC */
     /* counters, error totals, etc. */
 } compressionRegistry;
 ```
@@ -446,7 +445,7 @@ The registry uses a grace-period reclamation model inspired by the Linux kernel'
 
 **How it works:**
 
-1. **Promotion:** Main thread creates a new `compressionDict`, atomically stores it as `registry->active`. The previous active dict moves to the retiring list via `compressionDictStartRetirement()`.
+1. **Promotion:** Main thread creates a new `compressionDict`, atomically stores it as `registry->active`. The previous active dict is retired via `compressionDictStartRetirement()` (state set to RETIRING, worker generations snapshotted).
 
 2. **Worker usage:** A worker atomically loads `registry->active` to get the current dict pointer. The `compressionDict` and its `CDict*` are immutable after publication — safe to read without locks. The worker uses the `CDict*` for compression, then reports a quiescent state.
 
@@ -458,7 +457,7 @@ The registry uses a grace-period reclamation model inspired by the Linux kernel'
 
 6. **Grace barriers (wake-all via cond_broadcast):** If a worker is idle (blocked on the SPMC inbox cond var waiting for work), it may never advance its generation. The main thread forces progress by issuing a wake-all on the inbox (see §4.6 "wake-all primitive"). Every blocked consumer wakes simultaneously via `pthread_cond_broadcast`, advances its generation if a barrier signal is set, then either resumes consuming or re-blocks. Enqueueing barrier jobs into the SPMC inbox is *not* sufficient — under work-stealing semantics a single worker could drain all barriers while siblings stay asleep on the cond var.
 
-7. **Bounding the retiring list (cap interaction with R2.3.3):** The retiring list is a subset of `dicts[]`, which is capped at `compression-dict-max-versions` (R2.3.3, default 4). Each retiring dict occupies a slot until step 5 reclaims it. Under normal load the grace-barrier mechanism (step 6) keeps reclamation latency bounded and the cap is not hit. If draining cannot keep up — e.g. workers are starved, or `frame_refs` stays > 0 on retiring dicts because old frames are not being rewritten/expired — the cap is reached and **both training and promotion are refused** per R2.3.3: a `LL_WARNING` log entry is emitted, `compression_dict_cap_reached` is set to `1` in `INFO`, and the operator must intervene (raise the cap, or run `COMPRESSION SWEEP` to force-rewrite frames referencing the oldest retiring dict so it can drain).
+7. **Bounding retiring dicts (cap interaction with R2.3.3):** Retiring dicts remain in `dicts[]`, which is capped at `compression-dict-max-versions` (R2.3.3, default 4). Each retiring dict occupies a slot until step 5 reclaims it. Under normal load the grace-barrier mechanism (step 6) keeps reclamation latency bounded and the cap is not hit. If draining cannot keep up — e.g. workers are starved, or `frame_refs` stays > 0 on retiring dicts because old frames are not being rewritten/expired — the cap is reached and **both training and promotion are refused** per R2.3.3: a `LL_WARNING` log entry is emitted, `compression_dict_cap_reached` is set to `1` in `INFO`, and the operator must intervene (raise the cap, or run `COMPRESSION SWEEP` to force-rewrite frames referencing the oldest retiring dict so it can drain). No separate retiring list is maintained — GC scans `dicts[]` directly (max 16 entries).
 
 **Why QSBR over per-job refcounting:**
 

@@ -16,7 +16,6 @@
 
 #include "server.h"
 #include "compression_registry.h"
-#include "adlist.h"
 
 #ifdef USE_ZSTD
 #include <zstd.h>
@@ -27,14 +26,14 @@
  * ======================================================================== */
 
 static struct {
-    compressionDictPair *dicts[COMPRESSION_DICT_MAX];
-    int count;
-    _Atomic(compressionDictPair *) active;
-    list *retiring;
-    uint32_t next_id;
+    compressionDictPair *dicts[COMPRESSION_DICT_MAX]; /* all known dicts (active + retiring) */
+    int count;                                        /* number of valid entries in dicts[] */
+    _Atomic(compressionDictPair *) active;            /* current dict for new compressions; atomic for worker reads */
+    uint32_t next_id;                                 /* next dict_id to assign (monotonic, starts at 1) */
 } registry;
 
-static _Atomic(uint64_t) worker_quiescent_gen[COMPRESSION_DICT_MAX];
+/* TODO: replace 16 with a shared COMPRESSION_WORKERS_MAX constant in a follow-up PR. */
+static _Atomic(uint64_t) worker_quiescent_gen[16];
 
 /* ========================================================================
  * Internal helpers
@@ -43,11 +42,7 @@ static _Atomic(uint64_t) worker_quiescent_gen[COMPRESSION_DICT_MAX];
 static void removeFromDicts(compressionDictPair *dict) {
     for (int i = 0; i < registry.count; i++) {
         if (registry.dicts[i] == dict) {
-            int remaining = registry.count - 1 - i;
-            if (remaining > 0) {
-                memmove(&registry.dicts[i], &registry.dicts[i + 1],
-                        (size_t)remaining * sizeof(compressionDictPair *));
-            }
+            registry.dicts[i] = registry.dicts[registry.count - 1];
             registry.dicts[registry.count - 1] = NULL;
             registry.count--;
             return;
@@ -81,7 +76,6 @@ static void startRetirement(compressionDictPair *dict) {
     for (int i = 0; i < server.compression_threads; i++) {
         dict->retire_worker_gen[i] = atomic_load(&worker_quiescent_gen[i]);
     }
-    listAddNodeTail(registry.retiring, dict);
 }
 
 /* ========================================================================
@@ -92,7 +86,6 @@ void compressionRegistryInit(void) {
     memset(&registry, 0, sizeof(registry));
     registry.next_id = 1;
     atomic_store(&registry.active, NULL);
-    registry.retiring = listCreate();
     memset(worker_quiescent_gen, 0, sizeof(worker_quiescent_gen));
 }
 
@@ -104,8 +97,6 @@ void compressionRegistryRelease(void) {
     }
     registry.count = 0;
     atomic_store(&registry.active, NULL);
-    listRelease(registry.retiring);
-    registry.retiring = NULL;
 }
 
 compressionDictPair *compressionRegistryActive(void) {
@@ -123,7 +114,9 @@ compressionDictPair *compressionRegistryLookup(uint32_t dict_id) {
 uint32_t compressionRegistryAdd(compressionDictPair *p, int promote) {
     serverAssert(p != NULL);
 
-    /* Cap check (R2.3.3): try GC first to make room. */
+    /* Cap check (R2.3.3): the dicts[] array holds both active and retiring
+     * entries. When full, both training and promotion are refused — this
+     * implicitly bounds the retiring population (design §4.4 step 7). */
     if (registry.count >= server.compression_dict_max_versions) {
         compressionRegistryTryGc();
     }
@@ -146,7 +139,6 @@ uint32_t compressionRegistryAdd(compressionDictPair *p, int promote) {
         atomic_store(&registry.active, p);
     } else {
         p->state = COMPRESSION_DICT_STATE_RETIRING;
-        listAddNodeTail(registry.retiring, p);
     }
 
     registry.dicts[registry.count++] = p;
@@ -200,17 +192,10 @@ void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *),
  * ======================================================================== */
 
 void compressionRegistryTryGc(void) {
-    if (!registry.retiring || listLength(registry.retiring) == 0) return;
-
-    listIter li;
-    listNode *ln;
-    listRewind(registry.retiring, &li);
-
-    while ((ln = listNext(&li)) != NULL) {
-        compressionDictPair *dict = listNodeValue(ln);
+    for (int i = registry.count - 1; i >= 0; i--) {
+        compressionDictPair *dict = registry.dicts[i];
         if (canFree(dict)) {
             dict->state = COMPRESSION_DICT_STATE_RETIRED;
-            listDelNode(registry.retiring, ln);
             removeFromDicts(dict);
             dictPairFree(dict);
         }
@@ -222,9 +207,17 @@ void compressionRegistryTryGc(void) {
  * ======================================================================== */
 
 void compressionWorkerReportQuiescent(int worker_id) {
+    /* Bounded by compression-threads config (max 16).
+     * TODO: Replace 16 with static var.
+     */
+    serverAssert(worker_id >= 0 && worker_id < 16);
     atomic_fetch_add(&worker_quiescent_gen[worker_id], 1);
 }
 
 uint64_t compressionWorkerGetGen(int worker_id) {
+    /* Bounded by compression-threads config (max 16).
+     * TODO: Replace 16 with static var.
+     */
+    serverAssert(worker_id >= 0 && worker_id < 16);
     return atomic_load(&worker_quiescent_gen[worker_id]);
 }
