@@ -156,6 +156,13 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 - **R2.5.3** The helper **must not** call `signalModifiedKey`. (Q11)
 - **R2.5.4** `compression-max-value-size` (default `131072` bytes = 128 KiB, `0` = no bound) excludes values large enough that their main-thread decompression cost is not worth the memory win, keeping per-read decompression latency within the event-loop budget. (Q7)
 - **R2.5.5** **Per-read decompression cost is proportional to value size** (~1 µs/KB at ZSTD level 3 with dictionary). **Multi-key commands pay the sum of per-value costs**, with no per-command cap — by design: a per-command cap would either break transparency (error mid-command) or defeat its own purpose (block). v1 is tuned for the small/moderate-value sweet spot (256 B – 8 KB). Workloads that routinely read many compressed values per command (wide `MGET`, long `SORT`, scripts touching many keys, heavy pipelines over large values) should benchmark before enabling; their remedies are (a) raise `compression-min-value-size` or lower `compression-max-value-size` to exclude the large values, or (b) wait for v2 async decompression. (Q7)
+- **R2.5.6** **Compression decisions are not reconsidered post-compression in v1.** Once a value is compressed, it remains compressed for its lifetime, regardless of subsequent access pattern. The eligibility filter (R2.2) skips recently-accessed values at compression-attempt time, but provides no inverse path: a key that was cold when compressed and later becomes read-hot will pay sustained sync decompression CPU on the main thread for every read.
+
+    Natural pressure-relief exists for keys that get **written** after compression: `dbOverwrite` installs a fresh uncompressed robj, and partial-write commands (`APPEND`, `SETRANGE`, bit operations, module DMA-write per R2.7.6) decompress in place before mutating (the COW-invariant audit list in R2.4.5 enumerates the call sites). Read-only-hot keys have no equivalent demotion trigger.
+
+    Worst-case per-read cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can run `COMPRESSION SWEEP direction=decompress` to drop all compressed frames and restart eligibility evaluation.
+
+    Auto-demotion of read-hot compressed values is explicit v2 scope (Appendix D — "Read-hot compressed value auto-demotion"). The v1 ship gate is that the cost is **bounded** (R2.5.4) and **observable** (R2.10.2); operator action remains the only demotion path.
 
 ### 2.6 Persistence
 
@@ -1002,6 +1009,7 @@ Deferred to **v2** as a targeted optimization: speculative pre-decompression for
 | Async decompression | Yes | Planned as opt-in `compression-async-decompress-threshold` (default `0` = disabled). |
 | Decompressed-view coexistence cache | Yes | Planned as orthogonal extension. |
 | Adaptive kill-switch | Yes | Planned as opt-in `compression-kill-switch` (default `no`). |
+| Read-hot compressed value auto-demotion | Yes | Planned — sweeper-based demotion mirroring the compress eligibility filter, with hysteresis. Adds `compression-promote-min-freq` (LFU mode) / `compression-promote-max-idle-seconds` (LRU/noeviction) configs. Closes the R2.5.6 gap (read-only-hot keys keep paying decompression CPU until operator intervention). |
 | Compressed-in-place cluster `MIGRATE` | Yes | Planned — ship dict prelude inside the RDB chunk. |
 | Cluster-wide dictionary gossip | Yes | Conditional — only if operational pain surfaces. Preshared import (R2.3.10) covers the deterministic-fleet use case today. |
 | Advanced trainer parameters (`fastCover` tuning) | Yes | Planned — expose via new configs if measurement justifies. |
