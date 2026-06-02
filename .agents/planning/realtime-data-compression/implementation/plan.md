@@ -163,20 +163,28 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [x] **S2.1 — Header encode/decode** (`compression_header.c`): round-trip tests, malformed-header rejection (R2.5.3). Allocation helpers for `OBJ_ENCODING_COMPRESSED` robjs.
 - [x] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), policy-aware hot-key skip (`lru_idle_secs` >= `compression-min-idle-seconds` in LRU/noeviction, `lfu_freq` < `compression-lfu-threshold` in LFU).
 - [ ] **S2.3 — ~~Incompressible-keys hashtable~~ (REMOVED).** Originally planned as a dict-ID-scoped side hashtable per Thread #20; dropped during S2.3 implementation review (PR #10 design discussion). Per-key rejection state is functionless under a fixed dict (ZSTD is deterministic), and the dict-change retry signal is better expressed at the system level via the rejection-rate drift trigger added to S1.4. No code change tracked under S2.3 anymore — kept here for traceability.
-- [ ] **S2.4 — Worker pool** (`compression_workers.c`): thread startup/shutdown per `compression-threads`, SPMC inbox, MPSC outbox. Workers never touch `robj` (R2.11.4).
+- [x] **S2.4 — Worker pool** (`compression_workers.c`):
+  - thread startup/shutdown per `compression-threads`; mutexQueue inbox + mpsc outbox; runtime resize via Stop+Start
+  - QSBR worker contract: workers atomically load the active dict, never touch `robj` or registry; report quiescent generation per job (R2.11.4 + §4.4)
+  - mutexqueue infrastructure (`src/mutexqueue.{c,h}`): added `mutexQueueWakeAll` for QSBR grace barriers; added new `mutexQueuePopWakable` variant for wake-aware consumers. The original `mutexQueuePop`/`PopAll` keep their "never NULL on blocking" contract; bio is unchanged.
+  - sentinel-based race-free shutdown: `kShutdownSentinel` (data-in-queue) is distinct from grace-barrier wake-all. Wake-all races are benign for barriers but would deadlock `pthread_join` on shutdown.
+  - resize-aware `canFree`: `compressionDictPair.retire_n_workers` field bounds the gen check to `min(snapshot, current)`. Handles resize-up/down correctly without violating QSBR purity.
+  - `compressionWorkersGetThreadCount()` test/introspection accessor.
+  - design doc §4.4 + §4.6 updated to match. (PR #13)
 - [ ] **S2.5 — Encoder path**: main thread enqueues candidate with `incrRefCount`; worker reads sds bytes, compresses via `ZSTD_compress_usingCDict`, enqueues result.
 - [ ] **S2.6 — Decoder path**: `objectGetUncompressedView` on main thread, sync decompression (R2.5.1), ~1 µs/KB budget. Handles dict-ID lookup + dict-not-found error (R2.6.5 parallel).
 - [ ] **S2.7 — Write-path hook**: `dbAddInternal`/`dbSetValue`/`dbOverwrite` call `compressionEnqueueCandidate` when eligible. Respects refcount-2 → COW invariant (R2.4.4–R2.4.6).
 - [ ] **S2.8 — Read-path hook**: `lookupKey*` helper returns uncompressed view. Touches all command handlers that read bytes.
 - [ ] **S2.9 — Master switch + sweep**: `COMPRESSION SWEEP [ASYNC]` triggers; runtime toggle drains safely (pattern from Thread #11).
 - [ ] **S2.10 — Cron integration**: `compressionCron` called from `serverCron`; sweep pacing; dict drift-ratio evaluation.
+- [ ] **S2.11 — Bounded inbox + per-caller back-pressure counters** (`compression_workers.c`, `compression.c`): bounded inbox capacity (sized as `max(256, 128 * compression-threads)` per design §4.6), drop policy per §2.10 R2.10.4, `INFO` counters `compression_candidates_dropped_total`, `compression_sweep_backpressure_total`, `compression_outbox_backpressure_total`, `compression_sweep_pacing_sleeps_total`. **Required before S2.7 (write-path hook) ships** — the unbounded inbox is fine for placeholder traffic but not for production write rates.
 - [ ] **S5.1 — `valkey-benchmark` extensions**: `--value-size-distribution`, `--value-data`, `--key-distribution` flags per §7.5.
 - [ ] **S5.2 — Canonical scenarios harness**: the six scenarios in §7.5 (uniform large, skewed JSON, time-series, etc.) as reproducible runs.
 - [ ] **S5.3 — Perf dashboard**: extend Valkey performance dashboard or add a feature-scoped one showing baseline-vs-compressed per scenario. Publish to `perf-dashboard.valkey.io` infrastructure.
 
 #### @GilboaAWS track (S1/S3/S4/S6/S7)
 
-- [ ] **S1.1 — Dictionary registry** (`compression_registry.c`): add/lookup/promote/retire, refcounting, cap enforcement. Unit tests covering every branch of R2.3.9 promotion + R2.3.10 retirement. Owns `compression-max-dict-cap` behavior.
+- [x] **S1.1 — Dictionary registry** (`compression_registry.c`): add/lookup/promote/retire, refcounting, cap enforcement. Unit tests covering every branch of R2.3.9 promotion + R2.3.10 retirement. Owns `compression-max-dict-cap` behavior. **Merged in PR #12.** Follow-up in PR #13 (S2.4) extended `compressionDictPair` with `retire_n_workers` for resize-aware QSBR and switched the registry to use `COMPRESSION_WORKERS_MAX` from `compression_workers.h`.
 - [ ] **S1.2 — Training sampler (main thread)**: kvstore shard iteration + contiguous-buffer sample copy, spliced across `serverCron` ticks. Implements R2.3.6 corrected flow (per Thread #29). `LOOKUP_NOTOUCH` semantics.
 - [ ] **S1.3 — Bio train job (`BIO_COMPRESSION_TRAIN`)**: accepts `(buffer, sizes[], count)`, calls `ZDICT_trainFromBuffer`, signals completion via event fd. Never touches `robj`/`kvstore`/refcounts.
 - [ ] **S1.4 — Train completion + promotion on main thread**: creates `ZSTD_CDict`/`ZSTD_DDict`, inserts into registry, atomic promotion. Implements R2.3.5 drift-retrain trigger detection: `compression_live_ratio_10m > post_training_ratio / drift_ratio` where the rolling ratio includes both successful compressions AND rejections (each rejection contributes its actual measured ratio, typically in `[0.9, 1.05]` since the net-savings guard rejected it for being too close to 1.0). The single combined signal captures both workload-content drift among compressible values and dict-fit drift (rejection rate climbing); see PR #10 design discussion for the rationale.
