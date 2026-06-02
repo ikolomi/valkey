@@ -197,4 +197,40 @@ int compressionWorkersGetThreadCount(void);
  */
 int compressionWorkersDrainOutbox(int budget);
 
+/* ========================================================================
+ * Test-only accessors (NOT a stable API)
+ * ========================================================================
+ *
+ * The S2.5 encoder-path tests need to inspect the worker's compressed
+ * output before the production drain handler frees it. The accessors
+ * below extract a job pointer from the outbox without freeing, expose
+ * its fields by value, and let the test reclaim the job.
+ *
+ * compressionJob is intentionally file-private to compression_workers.c
+ * (only the public Enqueue API is part of the worker-pool contract);
+ * these accessors are the only way a test can peek at the worker's
+ * intermediate state. They MUST NOT be called from production code.
+ *
+ * Real production callers (S2.7 write-path hook) consume jobs via the
+ * regular compressionWorkersDrainOutbox path, which installs the
+ * buffer into a robj via createCompressedObject and frees the job.
+ */
+
+/* Pop up to `budget` completed jobs into `jobs_out` without freeing
+ * them. Caller takes ownership and MUST free each job via
+ * compressionWorkersFreeJobForTesting. */
+int compressionWorkersDrainOutboxForTesting(void **jobs_out, int budget);
+
+/* Free a job + its dst buffer, mirroring what the production drain
+ * handler would do after install. */
+void compressionWorkersFreeJobForTesting(void *job_ptr);
+
+/* Field accessors for compressionJob. Tests verify the worker's output
+ * by reading these. */
+void       *compressionWorkersJobDstForTesting(void *job_ptr);
+size_t      compressionWorkersJobDstLenForTesting(void *job_ptr);
+uint32_t    compressionWorkersJobDictIdForTesting(void *job_ptr);
+int         compressionWorkersJobErrForTesting(void *job_ptr);
+const char *compressionWorkersJobSrcForTesting(void *job_ptr);
+
 #endif /* __COMPRESSION_WORKERS_H */

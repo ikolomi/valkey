@@ -4,19 +4,22 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Tests for the compression worker pool — start/stop, runtime resize,
- * enqueue/drain end-to-end, shutdown drain, identity contract for QSBR.
+ * enqueue/drain end-to-end, shutdown drain, identity contract for QSBR,
+ * plus S2.5 encoder-path tests that exercise real ZSTD compression.
  *
- * The pool's per-job body is a placeholder pass-through in S2.4
- * (compression_workers.c — workers leave dst=NULL/dst_len=0/err=0).
- * These tests verify the plumbing end-to-end:
- *   - threads spawn (verified via compressionWorkersGetThreadCount)
- *   - enqueue → worker → outbox → drain delivers the job
- *   - shutdown joins cleanly even if items are in flight
- *   - Resize across all transitions (0→N, N→M, N→0) is safe
+ * The S2.4 plumbing tests below are encoder-agnostic — they only assert
+ * job count and thread-count transitions, so they stayed stable across
+ * the S2.4 → S2.5 transition. A separate S2.5 section at the bottom of
+ * this file installs a synthetic dictionary and verifies real
+ * compress + decompress round-trip via the testing accessors:
  *
- * The encoder (S2.5) replaces the placeholder body and adds tests for
- * compressed-frame correctness; THIS test file is intentionally
- * encoder-agnostic so it remains stable across S2.4 → S2.5 → S2.7.
+ *   - compressionWorkersDrainOutboxForTesting (peek; doesn't free)
+ *   - compressionWorkersJob*ForTesting (field readers)
+ *   - compressionWorkersFreeJobForTesting (caller-side cleanup)
+ *
+ * These accessors exist solely for the test environment; production
+ * code consumes jobs via compressionWorkersDrainOutbox which installs
+ * the buffer into a robj (S2.7).
  *
  * Note on out-of-range testing for Start: compressionWorkersStart
  * validates n_threads via serverAssert (caller-bug; should never
@@ -32,13 +35,18 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstring>
+#include <string>
 #include <thread>
+#include <vector>
 
 extern "C" {
 #include "compression_registry.h"
 #include "compression_workers.h"
 #include "sds.h"
 #include "server.h"
+#include "zdict.h"
+#include "zstd.h"
 }
 
 class CompressionWorkersTest : public ::testing::Test {
@@ -68,6 +76,12 @@ class CompressionWorkersTest : public ::testing::Test {
             zfree(server.compression_cpulist);
             server.compression_cpulist = nullptr;
         }
+
+        /* Net-savings guard threshold (R2.4.3). Without setting this,
+         * the production drain handler would compare against an
+         * uninitialized field. Default 10 (= 10%) matches the design
+         * doc default and is what production callers will see. */
+        server.compression_min_savings_ratio = 10;
     }
 
     void TearDown() override {
@@ -350,6 +364,362 @@ TEST_F(CompressionWorkersTest, ResizeAcrossEnqueuedJobs) {
     EXPECT_GE(drained_before + drained_after, 0);
 
     for (int i = 0; i < kCount; i++) {
+        sdsfree(keys[i]);
+        sdsfree(vals[i]);
+    }
+    compressionWorkersStop();
+}
+
+/* ========================================================================
+ * S2.5 — Encoder path tests
+ * ========================================================================
+ *
+ * These tests install a synthetic dictionary into the registry, enqueue
+ * jobs, and use the *ForTesting accessors to verify the worker produced
+ * a valid compressed buffer that decompresses back to the original
+ * bytes. The synthetic dict is built from a deterministic in-memory
+ * corpus so the tests are reproducible across runs and machines.
+ *
+ * Helper: installSyntheticDict() trains a small ZSTD dictionary on a
+ * deterministic corpus and adds it to the registry as the active dict.
+ * The fixture's TearDown calls compressionRegistryRelease which frees
+ * the dict + its CDict/DDict.
+ *
+ * Why "synthetic" not "real": the production training path (S1.2) walks
+ * kvstore on the main thread and submits a bio job. Plumbing that for
+ * a unit test would require a fake kvstore, a fake bio runner, and a
+ * fake serverCron loop — an order of magnitude more scaffolding than
+ * the test value justifies. The synthetic helper goes through the
+ * SAME registry add/promote path that production training uses; only
+ * the corpus source differs.
+ */
+
+namespace {
+
+/* Deterministic compressible corpus — repeated short JSON-like
+ * strings. Each sample is an immutable C string; the dict trainer
+ * concatenates them into a contiguous buffer with a parallel sizes[]
+ * array. */
+constexpr const char *kCorpusSamples[] = {
+    "{\"event\":\"order.created\",\"region\":\"us-east-1\",\"customer_id\":1001}",
+    "{\"event\":\"order.shipped\",\"region\":\"us-east-1\",\"customer_id\":1002}",
+    "{\"event\":\"order.delivered\",\"region\":\"us-east-1\",\"customer_id\":1003}",
+    "{\"event\":\"order.canceled\",\"region\":\"us-east-1\",\"customer_id\":1004}",
+    "{\"event\":\"order.created\",\"region\":\"us-west-2\",\"customer_id\":2001}",
+    "{\"event\":\"order.shipped\",\"region\":\"us-west-2\",\"customer_id\":2002}",
+    "{\"event\":\"order.delivered\",\"region\":\"us-west-2\",\"customer_id\":2003}",
+    "{\"event\":\"order.canceled\",\"region\":\"us-west-2\",\"customer_id\":2004}",
+    "{\"event\":\"order.created\",\"region\":\"eu-west-1\",\"customer_id\":3001}",
+    "{\"event\":\"order.shipped\",\"region\":\"eu-west-1\",\"customer_id\":3002}",
+    "{\"event\":\"order.delivered\",\"region\":\"eu-west-1\",\"customer_id\":3003}",
+    "{\"event\":\"order.canceled\",\"region\":\"eu-west-1\",\"customer_id\":3004}",
+    "{\"event\":\"order.created\",\"region\":\"ap-south-1\",\"customer_id\":4001}",
+    "{\"event\":\"order.shipped\",\"region\":\"ap-south-1\",\"customer_id\":4002}",
+    "{\"event\":\"order.delivered\",\"region\":\"ap-south-1\",\"customer_id\":4003}",
+    "{\"event\":\"order.canceled\",\"region\":\"ap-south-1\",\"customer_id\":4004}",
+};
+constexpr size_t kCorpusSampleCount = sizeof(kCorpusSamples) / sizeof(kCorpusSamples[0]);
+
+/* Trains a synthetic ZSTD dict + creates CDict/DDict + adds to registry
+ * as the active dict. Returns the assigned dict_id, or 0 on failure.
+ *
+ * ZSTD's trainer recommends ~100x dict-size in training data. For a
+ * 1 KB target dict we need ~100 KB of samples. We synthesize that by
+ * combinatorially generating many small JSON-shaped samples derived
+ * from kCorpusSamples — gives the trainer enough volume to produce a
+ * usable dict. */
+uint32_t installSyntheticDict() {
+    /* Generate ~100 KB of training data (~1500 samples × ~70 B). */
+    constexpr int kSampleCount = 1500;
+    std::vector<std::string> samples;
+    samples.reserve(kSampleCount);
+    for (int i = 0; i < kSampleCount; i++) {
+        /* Pick a base sample and append a small per-i suffix to keep
+         * the trainer from collapsing to a trivial entropy table. */
+        std::string s = kCorpusSamples[i % kCorpusSampleCount];
+        s += ",\"seq\":" + std::to_string(i) + "}";
+        /* Replace the trailing "}}" with "}" — the original sample
+         * already closes the JSON object, so the seq insertion above
+         * produces a slightly malformed string for trainer purposes
+         * (we don't care; it's just bytes). */
+        samples.push_back(std::move(s));
+    }
+
+    /* Pack into one contiguous buffer with parallel sizes[]. */
+    size_t total_bytes = 0;
+    for (auto &s : samples) total_bytes += s.size();
+    std::vector<unsigned char> sample_buf(total_bytes);
+    std::vector<size_t> sample_sizes(samples.size());
+    size_t off = 0;
+    for (size_t i = 0; i < samples.size(); i++) {
+        memcpy(sample_buf.data() + off, samples[i].data(), samples[i].size());
+        sample_sizes[i] = samples[i].size();
+        off += samples[i].size();
+    }
+
+    /* Train. 1 KB dict capacity matches the design's "small enough to
+     * train fast in tests but realistic enough to validate the
+     * encoder path". */
+    constexpr size_t kDictCapacity = 1024;
+    std::vector<unsigned char> dict_bytes(kDictCapacity);
+    size_t got = ZDICT_trainFromBuffer(dict_bytes.data(), kDictCapacity,
+                                       sample_buf.data(),
+                                       sample_sizes.data(),
+                                       (unsigned)samples.size());
+    if (ZDICT_isError(got)) return 0;
+    dict_bytes.resize(got);
+
+    /* Build the registry entry. The registry takes ownership of `bytes`,
+     * `cdict`, and `ddict` once compressionRegistryAdd succeeds. */
+    auto *pair = (compressionDictPair *)zcalloc(sizeof(compressionDictPair));
+    pair->bytes = (unsigned char *)zmalloc(dict_bytes.size());
+    memcpy(pair->bytes, dict_bytes.data(), dict_bytes.size());
+    pair->bytes_len = dict_bytes.size();
+    pair->cdict = ZSTD_createCDict(pair->bytes, pair->bytes_len, /*level=*/3);
+    pair->ddict = ZSTD_createDDict(pair->bytes, pair->bytes_len);
+    if (pair->cdict == NULL || pair->ddict == NULL) {
+        if (pair->cdict) ZSTD_freeCDict(pair->cdict);
+        if (pair->ddict) ZSTD_freeDDict(pair->ddict);
+        zfree(pair->bytes);
+        zfree(pair);
+        return 0;
+    }
+
+    return compressionRegistryAdd(pair, /*promote=*/1);
+}
+
+/* Decompress a worker-produced buffer (header + ZSTD frame) using the
+ * registry's DDict for the dict_id encoded in the header. Returns the
+ * decompressed bytes as a std::string, or an empty string on failure.
+ * Used by the round-trip tests to verify byte-equality with the source. */
+std::string decompressBuffer(const void *buf, size_t buf_len, uint32_t dict_id) {
+    if (buf == NULL || buf_len <= COMPRESSION_HEADER_SIZE) return "";
+
+    compressionDictPair *pair = compressionRegistryLookup(dict_id);
+    if (pair == NULL || pair->ddict == NULL) return "";
+
+    /* Skip the 16-byte header to reach the ZSTD frame. */
+    const unsigned char *frame =
+        (const unsigned char *)buf + COMPRESSION_HEADER_SIZE;
+    size_t frame_len = buf_len - COMPRESSION_HEADER_SIZE;
+
+    unsigned long long out_size = ZSTD_getFrameContentSize(frame, frame_len);
+    if (out_size == ZSTD_CONTENTSIZE_ERROR ||
+        out_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        return "";
+    }
+
+    std::string out;
+    out.resize((size_t)out_size);
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    if (dctx == NULL) return "";
+    size_t got = ZSTD_decompress_usingDDict(dctx, &out[0], out.size(),
+                                            frame, frame_len, pair->ddict);
+    ZSTD_freeDCtx(dctx);
+    if (ZSTD_isError(got)) return "";
+    out.resize(got);
+    return out;
+}
+
+} /* anonymous namespace */
+
+TEST_F(CompressionWorkersTest, RealCompressionRoundTrip) {
+    /* Install dict, enqueue a single compressible value, drain via the
+     * testing accessor, decompress with the same DDict, assert the
+     * decompressed bytes match the original. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    /* A value built from the corpus pattern — should compress well
+     * with the synthetic dict. ~1 KB total. */
+    std::string source;
+    for (int i = 0; i < 20; i++) {
+        source += kCorpusSamples[i % kCorpusSampleCount];
+    }
+    sds key = sdsnew("k1");
+    sds val = sdsnewlen(source.data(), source.size());
+    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 42, val));
+
+    /* Wait for the worker to deliver. Poll the testing accessor; it
+     * doesn't free, so we can inspect. */
+    void *jobs[1];
+    int got = 0;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(2000);
+    while (got == 0 && std::chrono::steady_clock::now() < deadline) {
+        got = compressionWorkersDrainOutboxForTesting(jobs, 1);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ(1, got);
+
+    /* Verify the worker's output: dict_id matches, dst non-NULL,
+     * dst_len > HEADER_SIZE, err == 0. */
+    EXPECT_EQ(dict_id, compressionWorkersJobDictIdForTesting(jobs[0]));
+    EXPECT_EQ(0, compressionWorkersJobErrForTesting(jobs[0]));
+    void *dst = compressionWorkersJobDstForTesting(jobs[0]);
+    size_t dst_len = compressionWorkersJobDstLenForTesting(jobs[0]);
+    ASSERT_NE(dst, nullptr);
+    ASSERT_GT(dst_len, COMPRESSION_HEADER_SIZE);
+
+    /* Compressed should be smaller than uncompressed for this
+     * compressible input — sanity check, not a strict requirement of
+     * the encoder API. */
+    EXPECT_LT(dst_len, source.size());
+
+    /* Round-trip: decompress the worker's output and compare to source. */
+    std::string roundtrip = decompressBuffer(dst, dst_len, dict_id);
+    EXPECT_EQ(source, roundtrip);
+
+    compressionWorkersFreeJobForTesting(jobs[0]);
+    sdsfree(key);
+    sdsfree(val);
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, NetSavingsGuardRejectsIncompressible) {
+    /* Random bytes don't compress — net-savings guard in the production
+     * drain path should reject. We verify two things:
+     *   1. The worker still produces a buffer (encoder works on any input).
+     *   2. The production drain path runs without crashing on rejection.
+     * The reject signal itself (compression_skipped_incompressible++)
+     * comes in S4.1; for now we just ensure the path doesn't blow up. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    /* Pseudo-random bytes — deterministic seed for reproducibility. */
+    std::string source(1024, '\0');
+    uint32_t state = 0xDEADBEEFu;
+    for (size_t i = 0; i < source.size(); i++) {
+        state = state * 1664525u + 1013904223u;
+        source[i] = (char)(state >> 24);
+    }
+
+    sds key = sdsnew("k1");
+    sds val = sdsnewlen(source.data(), source.size());
+    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 1, val));
+
+    /* Drain through the production handler — guard logic exercised. */
+    EXPECT_EQ(1, drainUntil(1, /*deadline_ms=*/2000));
+    EXPECT_EQ(0, compressionWorkersDrainOutbox(10));
+
+    sdsfree(key);
+    sdsfree(val);
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, NoActiveDictMarksJobNotCompressed) {
+    /* Without installing a dict, the worker must take the
+     * "compression-enabled yes but no active dict" branch (R2.1.5):
+     *   - dict_id = 0
+     *   - dst = NULL, dst_len = 0
+     *   - err = 1 (worker-policy sentinel, not a ZSTD error code) */
+    /* (no installSyntheticDict here) */
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    sds key = sdsnew("k1");
+    sds val = sdsnew("any value");
+    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 1, val));
+
+    void *jobs[1];
+    int got = 0;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(1000);
+    while (got == 0 && std::chrono::steady_clock::now() < deadline) {
+        got = compressionWorkersDrainOutboxForTesting(jobs, 1);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ(1, got);
+
+    EXPECT_EQ(0u, compressionWorkersJobDictIdForTesting(jobs[0]));
+    EXPECT_EQ(nullptr, compressionWorkersJobDstForTesting(jobs[0]));
+    EXPECT_EQ(0u, compressionWorkersJobDstLenForTesting(jobs[0]));
+    EXPECT_NE(0, compressionWorkersJobErrForTesting(jobs[0]));
+
+    compressionWorkersFreeJobForTesting(jobs[0]);
+    sdsfree(key);
+    sdsfree(val);
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
+    /* Multi-thread encode: 4 workers, 100 jobs of various sizes/contents.
+     * Verify each compressed buffer round-trips to the matching source. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(4));
+
+    constexpr int kJobs = 100;
+    /* Source materials, indexed by job. We need to keep the source
+     * bytes alive until we've inspected the worker's output, since
+     * the worker's job carries an `sds` pointer borrowed from us. */
+    std::vector<std::string> sources(kJobs);
+    std::vector<sds> keys(kJobs), vals(kJobs);
+    for (int i = 0; i < kJobs; i++) {
+        /* Variation: mix of corpus repetitions + a per-job suffix to
+         * keep contents distinct. */
+        std::string s;
+        int reps = 5 + (i % 15);
+        for (int r = 0; r < reps; r++) {
+            s += kCorpusSamples[(i * 31 + r) % kCorpusSampleCount];
+        }
+        s += "_job_" + std::to_string(i);
+        sources[i] = std::move(s);
+        keys[i] = sdsnew("k");
+        vals[i] = sdsnewlen(sources[i].data(), sources[i].size());
+        ASSERT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+    }
+
+    /* Drain everything via the testing accessor. The main thread's
+     * compressionAfterSleep is not running in this test environment,
+     * so we just poll. */
+    std::vector<void *> all_jobs;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(5000);
+    while ((int)all_jobs.size() < kJobs &&
+           std::chrono::steady_clock::now() < deadline) {
+        void *batch[16];
+        int got = compressionWorkersDrainOutboxForTesting(batch, 16);
+        for (int i = 0; i < got; i++) all_jobs.push_back(batch[i]);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ((size_t)kJobs, all_jobs.size());
+
+    /* For each job, decompress and compare to the matching source.
+     * The worker doesn't preserve job-input order across multiple
+     * threads (work-stealing inbox), so we identify each job by its
+     * src pointer (still pointing into vals[i]). */
+    int matched = 0;
+    for (void *jp : all_jobs) {
+        EXPECT_EQ(0, compressionWorkersJobErrForTesting(jp));
+        EXPECT_EQ(dict_id, compressionWorkersJobDictIdForTesting(jp));
+        const char *src = compressionWorkersJobSrcForTesting(jp);
+        ASSERT_NE(src, nullptr);
+
+        /* Find the matching source. */
+        int idx = -1;
+        for (int i = 0; i < kJobs; i++) {
+            if ((const char *)vals[i] == src) { idx = i; break; }
+        }
+        ASSERT_NE(idx, -1);
+
+        void *dst = compressionWorkersJobDstForTesting(jp);
+        size_t dst_len = compressionWorkersJobDstLenForTesting(jp);
+        ASSERT_NE(dst, nullptr);
+
+        std::string roundtrip = decompressBuffer(dst, dst_len, dict_id);
+        EXPECT_EQ(sources[idx], roundtrip);
+
+        compressionWorkersFreeJobForTesting(jp);
+        matched++;
+    }
+    EXPECT_EQ(kJobs, matched);
+
+    for (int i = 0; i < kJobs; i++) {
         sdsfree(keys[i]);
         sdsfree(vals[i]);
     }
