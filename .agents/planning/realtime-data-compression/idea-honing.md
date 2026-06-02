@@ -358,6 +358,8 @@ C. **Global per-thread quota.** Every compression thread capped at some CPU perc
 
 ## Q9. Dictionary training — trigger, sampling, and algorithm
 
+> **Superseded during implementation (PR #14):** the trigger and sampling model below describes the **original walkthrough decision** — a single `compression-dict-first-training-keys-count` knob that both triggered training and bounded sample collection. PR #14 replaced this with a three-knob model (`compression-dict-min-training-keys` floor + `compression-dict-max-training-keys` cap + `compression-training-buffer-size` memory cap) and changed the trigger semantic from "eligible-keys counter on the write path" to "DB total-keys count check". The text below is preserved as-is for the historical record. The current authoritative description is in `design/detailed-design.md` R2.3.5 (triggers), R2.3.6 (sampling), and §2.12 (config table).
+
 **Trigger:**
 - **First training** fires once the server has seen `compression-dict-first-training-keys-count` eligible `OBJ_STRING` keys (default `10000`). Counted on the write path via a cheap counter; no per-key copy.
 - **Steady-state retraining** fires on **drift**: when the live compression ratio regresses to less than `compression-dict-drift-ratio` × `post_training_ratio` (default drift ratio `70%`). Live ratio is maintained as a rolling average in `INFO compression`.

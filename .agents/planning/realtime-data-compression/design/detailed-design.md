@@ -238,7 +238,7 @@ All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is do
 | `compression-max-value-size` | bytes | `131072` | upper size bound (0 = unbounded; default 128 KiB bounds worst-case sync decompression latency) |
 | `compression-dict-size` | bytes | `102400` | zstd trainer target dict size |
 
-#### Advanced knobs (12)
+#### Advanced knobs (11)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
@@ -776,7 +776,7 @@ A new `--compression` flag on each Tcl test driver starts the server under test 
 --compression-lfu-threshold 255
 --compression-min-idle-seconds 0
 --compression-min-savings-ratio 0
---compression-dict-first-training-keys-count 10
+--compression-dict-min-training-keys 10
 --compression-threads 1
 --compression-sweep-max-cpu-pct 100
 ```

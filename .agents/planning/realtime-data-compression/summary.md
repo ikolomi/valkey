@@ -66,6 +66,16 @@ The 2026-05-10 PR review walkthrough addressed all 31 review threads (22 self-re
 
 Per-thread rationale: [`DESIGN_TODO.md`](DESIGN_TODO.md). GitHub PR with posted resolutions: https://github.com/ikolomi/valkey/pull/1.
 
+## What changed during implementation
+
+Three follow-on design refinements landed after Phase 0 once implementation surfaced new information:
+
+- **Training trigger + sampling rewritten** (PR #14, R2.3.5/R2.3.6): the original single `compression-dict-first-training-keys-count` knob (default 10000) was replaced by a three-knob model — `compression-dict-min-training-keys` (default 1000, both the trigger and a sample-count floor), `compression-dict-max-training-keys` (default 10000, sample-count cap), and `compression-training-buffer-size` (default 16 MiB, memory cap). The trigger semantic also changed from "eligible-keys counter incremented on the write path" to "DB total-keys count check" via cheap `kvstoreSize` polling. `idea-honing.md` Q9 retains the original walkthrough wording with a "superseded" annotation; the design doc reflects current behaviour.
+
+- **Read-hot compressed-value gap explicit** (PR #15, R2.5.6): post-compression decisions are not reconsidered in v1. A key compressed when cold and later read-hot pays sustained sync decompression CPU. v1 mitigations are bounded per-read cost (R2.5.4: `compression-max-value-size` defaults to 128 KiB), latency-monitor observability (R2.10.2: `LATENCY HISTORY decompress-sync`), and operator-driven recovery (`COMPRESSION SWEEP direction=decompress`). Auto-demotion (sweeper-based, with hysteresis) is explicit v2 scope — see Appendix D.
+
+- **Worker-pool QSBR plumbing** (PR #13, §4.4 + §4.6): the worker pool's correctness required additional infrastructure not anticipated in the original design — a dual mutexqueue API (`mutexQueuePop`/`PopAll` keep their original "never NULL on blocking" contract; new `mutexQueuePopWakable` for wake-aware consumers + `mutexQueueWakeAll` broadcast), sentinel-based race-free shutdown (`kShutdownSentinel`), and a `retire_n_workers` field on `compressionDictPair` for resize-aware `canFree`. Mostly internal to the implementation; design doc §4.4 + §4.6 capture the contract for future readers.
+
 ## Implementation plan summary
 
 See [`implementation/plan.md`](implementation/plan.md) for the full sequenced plan. Top-level shape:
