@@ -117,6 +117,12 @@ class CompressionWorkersTest : public ::testing::Test {
          * uninitialized field. Default 10 (= 10%) matches the design
          * doc default and is what production callers will see. */
         server.compression_min_savings_ratio = 10;
+
+        /* Dictionary registry cap (R2.3.3). Without setting this, the
+         * registry's default 0 cap rejects every promotion attempt
+         * (including the synthetic dict the S2.5 round-trip tests
+         * install). Match the design-doc default of 4. */
+        server.compression_dict_max_versions = 4;
     }
 
     void TearDown() override {
