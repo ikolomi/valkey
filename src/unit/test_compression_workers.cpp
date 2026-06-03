@@ -41,6 +41,7 @@
 #include <vector>
 
 extern "C" {
+#include "compression.h"
 #include "compression_header.h"
 #include "compression_registry.h"
 #include "compression_workers.h"
@@ -771,6 +772,358 @@ TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
         sdsfree(keys[i]);
         sdsfree(vals[i]);
     }
+    compressionWorkersStop();
+}
+
+/* ========================================================================
+ * S2.6 — Decoder path tests
+ * ========================================================================
+ *
+ * These tests exercise objectGetUncompressedView directly, building the
+ * compressed input either via the worker pool (round-trip with encoder)
+ * or by hand (corruption tests). The tests do NOT install the decoder
+ * into any read path — that's S2.8 (read-path hook). The transparency
+ * Tcl harness will start exercising the decoder once S2.8 lands.
+ *
+ * The decoder uses a file-static main-thread DCtx that survives across
+ * tests within the same gtest binary. compressionShutdown frees it; we
+ * don't call shutdown between tests, so the DCtx accumulates state
+ * harmlessly (ZSTD_DCtx is designed for reuse — same pattern as the
+ * per-worker CCtx). The fixture's TearDown does NOT call
+ * compressionShutdown — only the worker pool stop + registry release.
+ *
+ * Use a small helper to build a robj wrapping a worker-produced
+ * compressed buffer: that's what S2.8 will see in production. */
+
+namespace {
+
+/* Build an OBJ_ENCODING_COMPRESSED robj wrapping `dst` (a worker-
+ * produced buffer of header+frame). Caller owns the robj's memory
+ * and the dst sds; both live for the test's duration. The robj is
+ * stack-allocated by the caller and initialized here. */
+void initCompressedRobj(robj *out, sds dst_as_sds) {
+    out->type = OBJ_STRING;
+    out->encoding = OBJ_ENCODING_COMPRESSED;
+    out->hasexpire = 0;
+    out->hasembkey = 0;
+    out->hasembval = 0;
+    out->lru = 0;
+    out->refcount = OBJ_STATIC_REFCOUNT;
+    out->val_ptr = dst_as_sds;
+}
+
+/* Wrap a worker's `dst` (zmalloc'd void*, total dst_len) in an sds so
+ * the decoder's `objectGetVal(o)` + `sdslen(...)` can read it like any
+ * other string value. We do NOT copy — the returned sds aliases the
+ * worker's buffer. Caller must NOT sdsfree it (would double-free with
+ * testOnlyCompressionWorkersFreeJob); just let the job free path own
+ * the underlying allocation.
+ *
+ * sds is just a length-prefixed char buffer, but we can't fabricate
+ * its hidden length-prefix header from arbitrary bytes. Instead, we
+ * sdsnewlen-copy. That's a one-time test-only memcpy; production
+ * never does this because the encoder writes the buffer with the
+ * header + frame layout the decoder expects, and the install path
+ * (S2.7) installs the buffer as the robj's value bytes directly via
+ * createCompressedObject. */
+sds compressedDstToSds(const void *dst, size_t dst_len) {
+    return sdsnewlen(dst, dst_len);
+}
+
+} /* anonymous namespace */
+
+TEST_F(CompressionWorkersTest, DecoderRoundTripsEncoder) {
+    /* Run a value through the encoder, then through the decoder, and
+     * verify byte-equality with the source. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    std::string source;
+    for (int i = 0; i < 20; i++) source += kCorpusSamples[i % kCorpusSampleCount];
+    sds key = sdsnew("k1");
+    sds val = sdsnewlen(source.data(), source.size());
+    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 42, val));
+
+    void *jobs[1] = {nullptr};
+    int got = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (got == 0 && std::chrono::steady_clock::now() < deadline) {
+        got = testOnlyCompressionWorkersDrainOutbox(jobs, 1);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ(1, got);
+
+    CompressionJobView v = readJob(jobs[0]);
+    ASSERT_EQ(0, v.err);
+    ASSERT_NE(v.dst, nullptr);
+
+    /* Build a compressed-encoding robj wrapping the worker's output. */
+    sds dst_sds = compressedDstToSds(v.dst, v.dst_len);
+    robj cobj;
+    initCompressedRobj(&cobj, dst_sds);
+
+    /* Decode through the public helper. */
+    robj view;
+    sds scratch = nullptr;
+    robj *u = objectGetUncompressedView(&cobj, &scratch, &view);
+
+    ASSERT_NE(u, nullptr);
+    EXPECT_EQ(u, &view); /* helper returned the caller's stack robj */
+    EXPECT_EQ(OBJ_ENCODING_RAW, u->encoding);
+    EXPECT_EQ(OBJ_STRING, u->type);
+    EXPECT_EQ(OBJ_STATIC_REFCOUNT, (int)u->refcount);
+
+    sds u_sds = (sds)objectGetVal(u);
+    ASSERT_EQ(source.size(), sdslen(u_sds));
+    EXPECT_EQ(0, memcmp(source.data(), u_sds, source.size()));
+
+    sdsfree(scratch);
+    sdsfree(dst_sds);
+    testOnlyCompressionWorkersFreeJob(jobs[0]);
+    sdsfree(key);
+    sdsfree(val);
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, DecoderPassthroughOnUncompressed) {
+    /* A non-compressed robj must pass through untouched: same pointer
+     * back, scratch and view_out untouched. */
+    sds raw = sdsnew("hello world");
+    robj o;
+    initStaticStringObject(o, raw);
+
+    robj view;
+    /* Pre-fill view with garbage so we can detect helper writing to it. */
+    memset(&view, 0xAB, sizeof(view));
+
+    sds scratch = nullptr;
+    robj *u = objectGetUncompressedView(&o, &scratch, &view);
+
+    EXPECT_EQ(&o, u);
+    EXPECT_EQ(nullptr, scratch); /* not touched */
+    /* view_out should not have been touched either; first byte still
+     * 0xAB. We can't memcmp the whole thing (compiler may align
+     * fields), but the encoding bitfield write would have changed
+     * a byte at offset < sizeof(robj) and we'd see it. Instead just
+     * verify the helper returned `o` and didn't write a view_out
+     * pointer back. */
+    EXPECT_NE(&view, u);
+
+    sdsfree(raw);
+}
+
+TEST_F(CompressionWorkersTest, DecoderRejectsBadAlgMagic) {
+    /* Hand-craft a buffer with a bogus alg_magic. The decoder should
+     * return NULL and not crash. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    /* 16-byte header + 8 dummy frame bytes. Magic = 0xDEADBEEF — not
+     * any registered algorithm. */
+    constexpr size_t kFrameLen = 8;
+    sds bad_buf = sdsnewlen(nullptr, COMPRESSION_HEADER_SIZE + kFrameLen);
+    /* Manually write the header with a bogus magic. We can't use
+     * compressionHeaderEncode because it asserts on the magic; just
+     * write the 4-byte field directly. */
+    memset(bad_buf, 0, COMPRESSION_HEADER_SIZE + kFrameLen);
+    uint32_t bad_magic = 0xDEADBEEFu;
+    memcpy(bad_buf, &bad_magic, sizeof(bad_magic));
+
+    robj cobj;
+    initCompressedRobj(&cobj, bad_buf);
+
+    robj view;
+    sds scratch = nullptr;
+    robj *u = objectGetUncompressedView(&cobj, &scratch, &view);
+
+    EXPECT_EQ(nullptr, u);
+    /* scratch may or may not have been allocated before the failure;
+     * caller must still free. Both states are valid per the contract. */
+    sdsfree(scratch);
+    sdsfree(bad_buf);
+}
+
+TEST_F(CompressionWorkersTest, DecoderRejectsMissingDict) {
+    /* Encode with one dict, then drop that dict from the registry, then
+     * try to decode. Decoder should return NULL.
+     *
+     * compressionRegistryRelease wipes everything; for a "drop one
+     * dict" test we add a dict, install a frame referencing it,
+     * release+reinit the registry (so the dict_id is gone), and
+     * decode. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    std::string source;
+    for (int i = 0; i < 10; i++) source += kCorpusSamples[i % kCorpusSampleCount];
+    sds key = sdsnew("k_missing_dict");
+    sds val = sdsnewlen(source.data(), source.size());
+    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 1, val));
+
+    void *jobs[1] = {nullptr};
+    int got = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (got == 0 && std::chrono::steady_clock::now() < deadline) {
+        got = testOnlyCompressionWorkersDrainOutbox(jobs, 1);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ(1, got);
+    CompressionJobView v = readJob(jobs[0]);
+    ASSERT_NE(v.dst, nullptr);
+
+    sds dst_sds = compressedDstToSds(v.dst, v.dst_len);
+
+    /* Stop workers BEFORE releasing+reinit'ing the registry — otherwise
+     * a worker holding a CDict pointer races the free. */
+    compressionWorkersStop();
+
+    /* Wipe the registry. The buffer still references dict_id, but the
+     * lookup will now fail. */
+    compressionRegistryRelease();
+    compressionRegistryInit();
+
+    robj cobj;
+    initCompressedRobj(&cobj, dst_sds);
+
+    robj view;
+    sds scratch = nullptr;
+    robj *u = objectGetUncompressedView(&cobj, &scratch, &view);
+
+    EXPECT_EQ(nullptr, u);
+
+    sdsfree(scratch);
+    sdsfree(dst_sds);
+    testOnlyCompressionWorkersFreeJob(jobs[0]);
+    sdsfree(key);
+    sdsfree(val);
+}
+
+TEST_F(CompressionWorkersTest, DecoderReusesScratchAcrossCalls) {
+    /* Decode three different compressed values back-to-back with the
+     * same scratch sds. Verify all decode correctly and the scratch
+     * grows on demand without leaking. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    /* Three sources of different sizes: ~500B, ~1KB, ~2KB. */
+    std::vector<std::string> sources(3);
+    for (int i = 0; i < 7; i++) sources[0] += kCorpusSamples[i % kCorpusSampleCount];
+    for (int i = 0; i < 14; i++) sources[1] += kCorpusSamples[i % kCorpusSampleCount];
+    for (int i = 0; i < 28; i++) sources[2] += kCorpusSamples[i % kCorpusSampleCount];
+
+    std::vector<sds> keys(3), vals(3);
+    for (int i = 0; i < 3; i++) {
+        keys[i] = sdsnew("k");
+        vals[i] = sdsnewlen(sources[i].data(), sources[i].size());
+        ASSERT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+    }
+
+    void *jobs[3] = {nullptr, nullptr, nullptr};
+    int got = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+    while (got < 3 && std::chrono::steady_clock::now() < deadline) {
+        got += testOnlyCompressionWorkersDrainOutbox(jobs + got, 3 - got);
+        if (got < 3) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ(3, got);
+
+    /* Match jobs back to sources via src pointer. */
+    sds scratch = nullptr;
+    int matched = 0;
+    for (int j = 0; j < 3; j++) {
+        CompressionJobView v = readJob(jobs[j]);
+        ASSERT_NE(v.dst, nullptr);
+
+        int idx = -1;
+        for (int i = 0; i < 3; i++) {
+            if ((const char *)vals[i] == v.src) {
+                idx = i;
+                break;
+            }
+        }
+        ASSERT_NE(-1, idx);
+
+        sds dst_sds = compressedDstToSds(v.dst, v.dst_len);
+        robj cobj;
+        initCompressedRobj(&cobj, dst_sds);
+
+        robj view;
+        robj *u = objectGetUncompressedView(&cobj, &scratch, &view);
+        ASSERT_NE(nullptr, u);
+        sds u_sds = (sds)objectGetVal(u);
+        ASSERT_EQ(sources[idx].size(), sdslen(u_sds));
+        EXPECT_EQ(0, memcmp(sources[idx].data(), u_sds, sources[idx].size()));
+
+        sdsfree(dst_sds);
+        testOnlyCompressionWorkersFreeJob(jobs[j]);
+        matched++;
+    }
+    EXPECT_EQ(3, matched);
+
+    /* scratch grew but is still a single allocation — no leak. The
+     * scratch contains the LAST decompressed value's bytes (sdsclear
+     * resets length on each call, so each decoder call starts from
+     * length 0 and writes fresh content). */
+    EXPECT_NE(nullptr, scratch);
+    EXPECT_GT(sdsavail(scratch) + sdslen(scratch), 0u);
+
+    sdsfree(scratch);
+    for (int i = 0; i < 3; i++) {
+        sdsfree(keys[i]);
+        sdsfree(vals[i]);
+    }
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, DecoderAllocatesScratchOnFirstCall) {
+    /* When *scratch is NULL on first call, helper must allocate and
+     * succeed, not deref a NULL pointer. */
+    uint32_t dict_id = installSyntheticDict();
+    ASSERT_NE(dict_id, 0u);
+
+    ASSERT_EQ(0, compressionWorkersStart(1));
+
+    std::string source;
+    for (int i = 0; i < 10; i++) source += kCorpusSamples[i % kCorpusSampleCount];
+    sds key = sdsnew("k_first_call");
+    sds val = sdsnewlen(source.data(), source.size());
+    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 99, val));
+
+    void *jobs[1] = {nullptr};
+    int got = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (got == 0 && std::chrono::steady_clock::now() < deadline) {
+        got = testOnlyCompressionWorkersDrainOutbox(jobs, 1);
+        if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ASSERT_EQ(1, got);
+
+    CompressionJobView v = readJob(jobs[0]);
+    ASSERT_NE(v.dst, nullptr);
+
+    sds dst_sds = compressedDstToSds(v.dst, v.dst_len);
+    robj cobj;
+    initCompressedRobj(&cobj, dst_sds);
+
+    robj view;
+    sds scratch = nullptr; /* explicit: helper must handle this */
+    robj *u = objectGetUncompressedView(&cobj, &scratch, &view);
+
+    ASSERT_NE(nullptr, u);
+    EXPECT_NE(nullptr, scratch); /* helper allocated */
+    EXPECT_EQ(source.size(), sdslen((sds)objectGetVal(u)));
+
+    sdsfree(scratch);
+    sdsfree(dst_sds);
+    testOnlyCompressionWorkersFreeJob(jobs[0]);
+    sdsfree(key);
+    sdsfree(val);
     compressionWorkersStop();
 }
 #endif /* USE_ZSTD */

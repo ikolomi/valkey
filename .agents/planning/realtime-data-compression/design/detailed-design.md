@@ -150,9 +150,11 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 ### 2.5 Decompression path
 
 - **R2.5.1** All decompression is **synchronous on the main thread** in v1. No worker-side decompression path exists. (Q7)
-- **R2.5.2** A single helper function `robj *objectGetUncompressedView(robj *o, sds *scratch)` is the **only** entry point for getting uncompressed bytes from a value:
-  - If `o->encoding != OBJ_ENCODING_COMPRESSED`: returns `o` unchanged. Zero cost.
-  - Otherwise: looks up the dictID in the registry, calls `ZSTD_decompress_usingDDict` into the caller-provided scratch sds, and returns a temporary view `robj` (or equivalent) pointing at the scratch buffer.
+- **R2.5.2** A single helper function `robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out)` is the **only** entry point for getting uncompressed bytes from a value:
+  - If `o->encoding != OBJ_ENCODING_COMPRESSED`: returns `o` unchanged. `*scratch` and `*view_out` are NOT touched. Zero cost.
+  - Otherwise: looks up the dictID in the registry, calls `ZSTD_decompress_usingDDict` into the caller-provided `*scratch` sds (allocated/grown as needed), populates `*view_out` (caller-provided storage; typically stack-allocated, marked `OBJ_STATIC_REFCOUNT`) to wrap the decompressed bytes, and returns `view_out`.
+  - Returns `NULL` on any failure (corrupt header, missing dict, ZSTD error). Caller logs / increments `compression_errors_total` and translates to a client-visible error.
+  - Rationale for the `view_out` out-parameter (vs returning a heap robj): keeps every read of every compressed value off the allocator hot path. Stack-allocated `robj` + `OBJ_STATIC_REFCOUNT` matches the existing `initStaticStringObject` pattern in `server.h`.
 - **R2.5.3** The helper **must not** call `signalModifiedKey`. (Q11)
 - **R2.5.4** `compression-max-value-size` (default `131072` bytes = 128 KiB, `0` = no bound) excludes values large enough that their main-thread decompression cost is not worth the memory win, keeping per-read decompression latency within the event-loop budget. (Q7)
 - **R2.5.5** **Per-read decompression cost is proportional to value size** (~1 µs/KB at ZSTD level 3 with dictionary). **Multi-key commands pay the sum of per-value costs**, with no per-command cap — by design: a per-command cap would either break transparency (error mid-command) or defeat its own purpose (block). v1 is tuned for the small/moderate-value sweet spot (256 B – 8 KB). Workloads that routinely read many compressed values per command (wide `MGET`, long `SORT`, scripts touching many keys, heavy pipelines over large values) should benchmark before enabling; their remedies are (a) raise `compression-min-value-size` or lower `compression-max-value-size` to exclude the large values, or (b) wait for v2 async decompression. (Q7)
@@ -402,7 +404,7 @@ void compressionAfterSleep(void);       /* called from event-loop afterSleep */
 void compressionToggle(int enabled);    /* config hook */
 
 /* Read path (hot) */
-robj *objectGetUncompressedView(robj *o, sds *scratch);
+robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out);
 
 /* Write path (main thread) */
 int  compressionIsEligible(robj *o);

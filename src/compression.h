@@ -67,18 +67,44 @@ int compressionToggle(int enabled, sds *err);
  * (§2.5 R2.5.2). Always synchronous on the main thread (R2.5.1). Never
  * calls signalModifiedKey (§2.9 R2.9.2).
  *
- *   - If `o->encoding != OBJ_ENCODING_COMPRESSED`, returns `o` unchanged.
- *   - Otherwise decompresses into *scratch (caller-owned sds buffer; may
- *     be grown via sdsMakeRoomFor as needed) and returns a view robj
- *     pointing at the scratch bytes. The view's lifetime matches the
- *     scratch sds.
+ *   - If `o->encoding != OBJ_ENCODING_COMPRESSED`, returns `o` unchanged
+ *     and does not touch `*scratch` or `*view_out`. Zero cost — typical
+ *     uncompressed-value path pays only one branch.
  *
- * The scratch convention (rather than returning a new heap-owned robj)
- * keeps per-read allocation off the hot path when the caller can reuse a
- * thread-local buffer. Callers that do not need a view robj can instead
- * use the lower-level decode helpers in compression_header.h.
+ *   - Otherwise decompresses into `*scratch` (caller-owned sds buffer;
+ *     may be NULL on first call — the helper allocates and grows as
+ *     needed via sds APIs), populates `*view_out` to wrap the
+ *     decompressed bytes (refcount = OBJ_STATIC_REFCOUNT — caller MUST
+ *     NOT decrRefCount), and returns `view_out`.
+ *
+ *   - Returns NULL on any decompression failure (corrupt header, missing
+ *     dict, ZSTD error, OOM). Logs at LL_WARNING (rate-limited per §6.1)
+ *     and increments `compression_errors_total`. Caller is responsible
+ *     for translating NULL into a client-facing error reply (the helper
+ *     deliberately doesn't know about clients — see §6.2). Callers MUST
+ *     still sdsfree(*scratch) on the NULL path; it may have been grown.
+ *
+ * The view_out parameter (vs returning a heap-allocated robj) keeps every
+ * read of every compressed value off the allocator hot path. Typical use:
+ *
+ *     robj  view;
+ *     sds   scratch = NULL;
+ *     robj *u = objectGetUncompressedView(o, &scratch, &view);
+ *     if (u == NULL) { addReplyError(c, "..."); sdsfree(scratch); return; }
+ *     addReplyBulk(c, u);
+ *     if (u != o) sdsfree(scratch);
+ *
+ * Both `scratch` and `view_out` MUST be non-NULL pointers. Helper does
+ * not free either — caller's lifetime owns both. Stack-allocating
+ * `view_out` is the intended pattern; `OBJ_STATIC_REFCOUNT` matches the
+ * existing `initStaticStringObject` convention (see server.h).
+ *
+ * Concurrency: scratch and view_out are caller-owned, so concurrent
+ * callers (e.g. multiple commands in a pipeline burst) each pass their
+ * own. The helper itself uses a file-static main-thread DCtx; that is
+ * safe because v1 decompression is sync-on-main-thread (R2.5.1).
  */
-robj *objectGetUncompressedView(robj *o, sds *scratch);
+robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out);
 
 /* ========================================================================
  * Hot path — write / eligibility

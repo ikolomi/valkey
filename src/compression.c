@@ -23,10 +23,45 @@
 
 #include "server.h"
 #include "compression.h"
+#include "compression_header.h"
 #include "compression_registry.h"
 #include "compression_workers.h"
 #include "compression_train.h"
 #include "lrulfu.h"
+
+#ifdef USE_ZSTD
+#include "zstd.h"
+#endif
+
+/* ========================================================================
+ * Decompression — main-thread DCtx
+ * ========================================================================
+ *
+ * One ZSTD_DCtx for the whole server, lazily allocated on first
+ * decompression and freed in compressionShutdown. ZSTD_DCtx is not
+ * thread-safe, but v1 decompression is synchronous on the main thread
+ * (R2.5.1), so a single instance is sufficient. Reusing the DCtx
+ * across calls amortizes the (small) per-context setup cost — same
+ * pattern the per-worker CCtx uses on the encoder side.
+ *
+ * Lifecycle invariant for compressionShutdown ordering: the DCtx is
+ * freed before compressionRegistryRelease so any final decompression
+ * in shutdown sequence (none today, but future RDB save / DUMP paths
+ * may call) can still see a valid context.
+ */
+
+#ifdef USE_ZSTD
+static ZSTD_DCtx *server_dctx;
+
+/* Lazy accessor. Returns the singleton DCtx, allocating on first use.
+ * Returns NULL on allocation failure (rare; logged by caller). */
+static ZSTD_DCtx *compressionGetDCtx(void) {
+    if (server_dctx == NULL) {
+        server_dctx = ZSTD_createDCtx();
+    }
+    return server_dctx;
+}
+#endif
 
 /* ========================================================================
  * Lifecycle stubs
@@ -54,6 +89,12 @@ void compressionInit(void) {
 void compressionShutdown(void) {
     compressionWorkersStop();
     compressionRegistryRelease();
+#ifdef USE_ZSTD
+    if (server_dctx != NULL) {
+        ZSTD_freeDCtx(server_dctx);
+        server_dctx = NULL;
+    }
+#endif
 }
 
 void compressionCron(void) {
@@ -102,14 +143,164 @@ int compressionToggle(int enabled, sds *err) {
  * Hot path
  * ========================================================================
  *
- * Phase 1: objectGetUncompressedView is still a passthrough until S2.6
- * (decoder) lands. compressionIsEligible implements the R2.2 predicate.
+ * objectGetUncompressedView — sync main-thread decoder for compressed
+ * values. The encoder (S2.5) produces the buffers this function consumes.
+ * compressionIsEligible implements the R2.2 predicate.
+ *
+ * The decoder is not yet wired into any read path (`getCommand`, the
+ * replication feed, etc.) — that's S2.8. This PR delivers the helper
+ * and its gtest coverage so S2.8 can plumb it in without touching the
+ * decompression logic itself.
  */
 
-robj *objectGetUncompressedView(robj *o, sds *scratch) {
+robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
+    serverAssert(scratch != NULL);
+    serverAssert(view_out != NULL);
+
+    /* Hot path: uncompressed value. One branch, no allocation, no
+     * scratch growth. This is what every read on every NON-compressed
+     * key pays — even when the feature is enabled — so it's worth
+     * making cheap. */
+    if (o->encoding != OBJ_ENCODING_COMPRESSED) return o;
+
+#ifdef USE_ZSTD
+    /* Decode the per-value header. compressionHeaderDecode validates
+     * alg_magic; it does not validate that compressed_len matches the
+     * buffer length (caller — i.e. us — knows the buffer length from
+     * the robj). */
+    const unsigned char *buf = (const unsigned char *)objectGetVal(o);
+    size_t buf_len = sdslen((sds)objectGetVal(o));
+
+    if (buf_len <= COMPRESSION_HEADER_SIZE) {
+        /* Buffer too small to even contain a header — corruption. */
+        serverLog(LL_WARNING,
+                  "Compression: compressed value too short (%zu bytes; "
+                  "minimum %u for header alone)",
+                  buf_len, COMPRESSION_HEADER_SIZE);
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    compressedHeader hdr;
+    if (compressionHeaderDecode(buf, &hdr) != 0) {
+        serverLog(LL_WARNING,
+                  "Compression: compressed value has unknown algorithm "
+                  "magic (corrupt)");
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    /* Sanity-check the header's compressed_len against the buffer.
+     * Mismatch is corruption. The header carries compressed_len in the
+     * frame-only sense (excluding header bytes), so the expected total
+     * is HEADER + compressed_len. */
+    if ((size_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE != buf_len) {
+        serverLog(LL_WARNING,
+                  "Compression: header compressed_len %u + %u-byte header "
+                  "does not match buffer length %zu",
+                  hdr.compressed_len, COMPRESSION_HEADER_SIZE, buf_len);
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    /* For ZSTD, alg_meta is the dict_id. Look up the DDict in the
+     * registry. The dict may have been retired (refcount > 0 keeps
+     * the DDict alive per the QSBR contract; a missing lookup means
+     * the registry was force-cleared, which should not happen in a
+     * healthy server). */
+    compressionDictPair *pair = compressionRegistryLookup(hdr.alg_meta);
+    if (pair == NULL || pair->ddict == NULL) {
+        serverLog(LL_WARNING,
+                  "Compression: dict_id %u not found in registry (frame "
+                  "references retired or never-loaded dictionary)",
+                  hdr.alg_meta);
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    /* Lazy DCtx allocation. */
+    ZSTD_DCtx *dctx = compressionGetDCtx();
+    if (dctx == NULL) {
+        serverLog(LL_WARNING, "Compression: ZSTD_createDCtx() failed (OOM?)");
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    /* Grow the scratch sds to fit the decompressed bytes. We trust the
+     * header's uncompressed_len because (a) we wrote it ourselves on
+     * the encoder side from the actual value length, and (b) any
+     * mismatch would already have failed the alg_magic check or the
+     * compressed_len check above. ZSTD_decompress_usingDDict will
+     * also report an error if the actual decompressed size differs.
+     *
+     * sdsMakeRoomFor grows; sdsclear resets length to 0 so we can
+     * write fresh content. If *scratch is NULL on first call, we
+     * allocate a fresh empty sds first. */
+    if (*scratch == NULL) {
+        *scratch = sdsempty();
+    } else {
+        sdsclear(*scratch);
+    }
+    *scratch = sdsMakeRoomFor(*scratch, hdr.uncompressed_len);
+
+    const unsigned char *frame = buf + COMPRESSION_HEADER_SIZE;
+    size_t got = ZSTD_decompress_usingDDict(
+        dctx,
+        *scratch, sdsavail(*scratch) + sdslen(*scratch),
+        frame, (size_t)hdr.compressed_len,
+        pair->ddict);
+
+    if (ZSTD_isError(got)) {
+        serverLog(LL_WARNING,
+                  "Compression: ZSTD_decompress_usingDDict failed: %s",
+                  ZSTD_getErrorName(got));
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    if (got != hdr.uncompressed_len) {
+        /* Defensive: header said N bytes but ZSTD produced M.
+         * Indicates corruption since we wrote both numbers from the
+         * same source value. */
+        serverLog(LL_WARNING,
+                  "Compression: decompressed size %zu does not match "
+                  "header uncompressed_len %u",
+                  got, hdr.uncompressed_len);
+        /* TODO(S4.1): compression_errors_total++ */
+        return NULL;
+    }
+
+    sdsIncrLen(*scratch, (ssize_t)got);
+
+    /* Build the view robj. OBJ_STATIC_REFCOUNT marks it as stack-
+     * allocated so any accidental decrRefCount is a no-op (would be
+     * a use-after-free otherwise — caller's stack frame owns view_out).
+     * We use a custom init rather than initStaticStringObject because
+     * we want to preserve o->type (forward-compatible with v2 non-
+     * STRING types) and clear the LRU/expire fields explicitly. */
+    view_out->type = o->type;
+    view_out->encoding = OBJ_ENCODING_RAW;
+    view_out->hasexpire = 0;
+    view_out->hasembkey = 0;
+    view_out->hasembval = 0;
+    view_out->lru = 0;
+    view_out->refcount = OBJ_STATIC_REFCOUNT;
+    view_out->val_ptr = *scratch;
+
+    /* TODO(S4.1): compression_decompressions_per_sec++ rate update. */
+
+    return view_out;
+#else
+    /* USE_ZSTD not compiled in: no path produces OBJ_ENCODING_COMPRESSED
+     * robjs, so reaching this branch indicates either memory corruption
+     * or a buffer that survived a build-mode change (RDB load with
+     * USE_ZSTD off would already have decompressed inline per R2.6.3).
+     * Either way, panicking is the right answer — silently returning
+     * NULL would mask the inconsistency. */
     UNUSED(scratch);
-    /* Phase 1: feature disabled; passthrough until S2.6 wires decode. */
-    return o;
+    UNUSED(view_out);
+    serverPanic("OBJ_ENCODING_COMPRESSED encountered with USE_ZSTD disabled");
+#endif
 }
 
 /* Implements the R2.2 / Q6 eligibility predicate.
