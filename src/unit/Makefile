@@ -151,6 +151,19 @@ ifeq ($(MALLOC),libc)
 	JEMALLOC_LIB :=
 endif
 
+# Read USE_ZSTD setting from parent Makefile (parent's BUILD_ZSTD adds
+# `-DUSE_ZSTD=1 -I../deps/zstd` to PREV_FINAL_CFLAGS via .make-settings).
+# When the parent built without ZSTD, the gtest binary stays consistent
+# with the production library — the .a is not built, so we drop it
+# from LD_LIBS, and -DUSE_ZSTD is not defined so #ifdef USE_ZSTD test
+# code is excluded.
+ZSTD_CFLAGS :=
+ifneq (,$(findstring -DUSE_ZSTD,$(PREV_FINAL_CFLAGS)))
+	ZSTD_CFLAGS := -DUSE_ZSTD=1 -I../../deps/zstd
+else
+	ZSTD_LIB :=
+endif
+
 LD_LIBS := $(HIREDIS_LIB) \
 	$(JEMALLOC_LIB) \
 	$(GTEST_LIBS) \
@@ -176,7 +189,7 @@ endif
 # Compile C++ test files, recompile if generated_wrappers or compiler flags change
 %.o: %.cpp generated_wrappers.cpp .flags
 	$(CXX) -MD -MP -std=c++17 -faligned-new -Wno-write-strings -fpermissive $(GCC_FLAGS) $(OPT) $(DEBUG) $(TEST_CFLAGS) -Wall -Wno-deprecated-declarations -c \
-	-isystem .. -I ../../deps/lua/src/ -I ../../deps/hdr_histogram/ -I ../../deps/fpconv/ $(JEMALLOC_CFLAGS) \
+	-isystem .. -I ../../deps/lua/src/ -I ../../deps/hdr_histogram/ -I ../../deps/fpconv/ $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) \
 	$(GTEST_CFLAGS) $<
 
 $(ALL_OBJECTS): generated_wrappers.o

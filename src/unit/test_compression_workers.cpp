@@ -41,18 +41,21 @@
 #include <vector>
 
 extern "C" {
+#include "compression_header.h"
 #include "compression_registry.h"
 #include "compression_workers.h"
 #include "sds.h"
 #include "server.h"
+#ifdef USE_ZSTD
 #include "zdict.h"
 #include "zstd.h"
+#endif
 
 /* Test-only entry points defined in compression_workers.c. Declared
  * here locally rather than in compression_workers.h — the production
  * surface stays clean (matches the testOnly* convention used in
  * quicklist.c / intset.c). */
-int  testOnlyCompressionWorkersDrainOutbox(void **jobs_out, int budget);
+int testOnlyCompressionWorkersDrainOutbox(void **jobs_out, int budget);
 void testOnlyCompressionWorkersFreeJob(void *job_ptr);
 void testOnlyCompressionWorkersJobRead(void *job_ptr,
                                        const char **out_src,
@@ -402,6 +405,7 @@ TEST_F(CompressionWorkersTest, ResizeAcrossEnqueuedJobs) {
     compressionWorkersStop();
 }
 
+#ifdef USE_ZSTD
 /* ========================================================================
  * S2.5 — Encoder path tests
  * ========================================================================
@@ -740,7 +744,10 @@ TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
         /* Find the matching source. */
         int idx = -1;
         for (int i = 0; i < kJobs; i++) {
-            if ((const char *)vals[i] == v.src) { idx = i; break; }
+            if ((const char *)vals[i] == v.src) {
+                idx = i;
+                break;
+            }
         }
         ASSERT_NE(idx, -1);
 
@@ -760,3 +767,4 @@ TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
     }
     compressionWorkersStop();
 }
+#endif /* USE_ZSTD */

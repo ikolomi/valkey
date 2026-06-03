@@ -39,7 +39,9 @@
 #include "compression_registry.h"
 #include "mutexqueue.h"
 
+#ifdef USE_ZSTD
 #include <zstd.h>
+#endif
 #include "queues.h"
 
 #include <pthread.h>
@@ -143,7 +145,13 @@ static void *workerThreadMain(void *arg) {
      * worker owns its own. Allocated once, reused for every job —
      * keeps allocator pressure off the per-job hot path. Freed at
      * thread exit (along the same exit_thread label as the rest of
-     * the worker's owned state). */
+     * the worker's owned state).
+     *
+     * Only present when USE_ZSTD is compiled in. Without it, the
+     * encoder body below short-circuits to the "not compressed"
+     * branch identically to the no-active-dict case, and no CCtx is
+     * needed. */
+#ifdef USE_ZSTD
     ZSTD_CCtx *cctx = ZSTD_createCCtx();
     if (cctx == NULL) {
         serverLog(LL_WARNING,
@@ -153,6 +161,7 @@ static void *workerThreadMain(void *arg) {
                   worker_id);
         return NULL;
     }
+#endif
 
     while (!atomic_load(&pool.shutdown_requested)) {
         /* Block until a job arrives or someone calls
@@ -205,12 +214,18 @@ static void *workerThreadMain(void *arg) {
              * "worker chose not to compress"; ZSTD error codes are
              * always negative when wrapped in size_t (they fit in the
              * sign bit), so positive `err` values are reserved for
-             * worker-policy decisions like this. */
+             * worker-policy decisions like this.
+             *
+             * Same branch is taken when USE_ZSTD is not compiled in
+             * (the BUILD_ZSTD=no build mode): the registry is empty
+             * and the worker simply marks every job not-compressed. */
             job->dict_id = 0;
             job->dst = NULL;
             job->dst_len = 0;
             job->err = 1;
-        } else {
+        }
+#ifdef USE_ZSTD
+        else {
             size_t src_len = sdslen(job->src);
             size_t bound = ZSTD_compressBound(src_len);
             size_t alloc = COMPRESSION_HEADER_SIZE + bound;
@@ -222,9 +237,9 @@ static void *workerThreadMain(void *arg) {
             size_t got = ZSTD_compress_usingCDict(
                 cctx,
                 (char *)buf + COMPRESSION_HEADER_SIZE, /* dst */
-                bound,                                  /* dst capacity */
-                job->src, src_len,                      /* src + len */
-                active->cdict);                         /* dict */
+                bound,                                 /* dst capacity */
+                job->src, src_len,                     /* src + len */
+                active->cdict);                        /* dict */
 
             if (ZSTD_isError(got)) {
                 zfree(buf);
@@ -270,6 +285,7 @@ static void *workerThreadMain(void *arg) {
                 job->err = 0;
             }
         }
+#endif /* USE_ZSTD */
 
         /* Post the result. Outbox is bounded; on full, retry until it
          * drains (the main thread's compressionAfterSleep is
@@ -304,8 +320,13 @@ exit_thread:
     /* Free the per-worker CCtx allocated at thread start. ZSTD_freeCCtx
      * is documented as accepting NULL safely, but the cctx allocation
      * above bails out before reaching this label if it returned NULL,
-     * so the pointer is non-NULL whenever we get here. */
+     * so the pointer is non-NULL whenever we get here.
+     *
+     * Only present when USE_ZSTD is compiled in (matches the gating
+     * on the allocation site above). */
+#ifdef USE_ZSTD
     ZSTD_freeCCtx(cctx);
+#endif
     return NULL;
 }
 
