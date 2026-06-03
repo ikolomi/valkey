@@ -11,15 +11,15 @@
  * job count and thread-count transitions, so they stayed stable across
  * the S2.4 → S2.5 transition. A separate S2.5 section at the bottom of
  * this file installs a synthetic dictionary and verifies real
- * compress + decompress round-trip via the testing accessors:
+ * compress + decompress round-trip via test-only entry points defined
+ * in compression_workers.c (testOnlyCompressionWorkers* family).
  *
- *   - compressionWorkersDrainOutboxForTesting (peek; doesn't free)
- *   - compressionWorkersJob*ForTesting (field readers)
- *   - compressionWorkersFreeJobForTesting (caller-side cleanup)
- *
- * These accessors exist solely for the test environment; production
- * code consumes jobs via compressionWorkersDrainOutbox which installs
- * the buffer into a robj (S2.7).
+ * The test-only entry points follow the established Valkey convention
+ * (see quicklist.c / intset.c testOnly* functions): they are defined
+ * in the .c file but NOT declared in the public header — this test
+ * file declares what it needs locally below in its own extern "C"
+ * block, and the symbols simply don't appear in the production-callable
+ * surface.
  *
  * Note on out-of-range testing for Start: compressionWorkersStart
  * validates n_threads via serverAssert (caller-bug; should never
@@ -47,6 +47,38 @@ extern "C" {
 #include "server.h"
 #include "zdict.h"
 #include "zstd.h"
+
+/* Test-only entry points defined in compression_workers.c. Declared
+ * here locally rather than in compression_workers.h — the production
+ * surface stays clean (matches the testOnly* convention used in
+ * quicklist.c / intset.c). */
+int  testOnlyCompressionWorkersDrainOutbox(void **jobs_out, int budget);
+void testOnlyCompressionWorkersFreeJob(void *job_ptr);
+void testOnlyCompressionWorkersJobRead(void *job_ptr,
+                                       const char **out_src,
+                                       void **out_dst,
+                                       size_t *out_dst_len,
+                                       uint32_t *out_dict_id,
+                                       int *out_err);
+}
+
+/* Flat read-out of compressionJob (file-private to compression_workers.c).
+ * The test-only reader fills this struct, projecting the fields the
+ * tests actually need. Defined in this file so the production code
+ * carries no record of the projection layout. */
+struct CompressionJobView {
+    const char *src;
+    void *dst;
+    size_t dst_len;
+    uint32_t dict_id;
+    int err;
+};
+
+static CompressionJobView readJob(void *job_ptr) {
+    CompressionJobView v = {nullptr, nullptr, 0, 0, 0};
+    testOnlyCompressionWorkersJobRead(job_ptr, &v.src, &v.dst, &v.dst_len,
+                                      &v.dict_id, &v.err);
+    return v;
 }
 
 class CompressionWorkersTest : public ::testing::Test {
@@ -375,7 +407,8 @@ TEST_F(CompressionWorkersTest, ResizeAcrossEnqueuedJobs) {
  * ========================================================================
  *
  * These tests install a synthetic dictionary into the registry, enqueue
- * jobs, and use the *ForTesting accessors to verify the worker produced
+ * jobs, and use the testOnly* entry points (declared at the top of
+ * this file in its extern "C" block) to verify the worker produced
  * a valid compressed buffer that decompresses back to the original
  * bytes. The synthetic dict is built from a deterministic in-memory
  * corpus so the tests are reproducible across runs and machines.
@@ -549,30 +582,29 @@ TEST_F(CompressionWorkersTest, RealCompressionRoundTrip) {
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(2000);
     while (got == 0 && std::chrono::steady_clock::now() < deadline) {
-        got = compressionWorkersDrainOutboxForTesting(jobs, 1);
+        got = testOnlyCompressionWorkersDrainOutbox(jobs, 1);
         if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
     ASSERT_EQ(1, got);
 
     /* Verify the worker's output: dict_id matches, dst non-NULL,
      * dst_len > HEADER_SIZE, err == 0. */
-    EXPECT_EQ(dict_id, compressionWorkersJobDictIdForTesting(jobs[0]));
-    EXPECT_EQ(0, compressionWorkersJobErrForTesting(jobs[0]));
-    void *dst = compressionWorkersJobDstForTesting(jobs[0]);
-    size_t dst_len = compressionWorkersJobDstLenForTesting(jobs[0]);
-    ASSERT_NE(dst, nullptr);
-    ASSERT_GT(dst_len, COMPRESSION_HEADER_SIZE);
+    CompressionJobView v = readJob(jobs[0]);
+    EXPECT_EQ(dict_id, v.dict_id);
+    EXPECT_EQ(0, v.err);
+    ASSERT_NE(v.dst, nullptr);
+    ASSERT_GT(v.dst_len, COMPRESSION_HEADER_SIZE);
 
     /* Compressed should be smaller than uncompressed for this
      * compressible input — sanity check, not a strict requirement of
      * the encoder API. */
-    EXPECT_LT(dst_len, source.size());
+    EXPECT_LT(v.dst_len, source.size());
 
     /* Round-trip: decompress the worker's output and compare to source. */
-    std::string roundtrip = decompressBuffer(dst, dst_len, dict_id);
+    std::string roundtrip = decompressBuffer(v.dst, v.dst_len, dict_id);
     EXPECT_EQ(source, roundtrip);
 
-    compressionWorkersFreeJobForTesting(jobs[0]);
+    testOnlyCompressionWorkersFreeJob(jobs[0]);
     sdsfree(key);
     sdsfree(val);
     compressionWorkersStop();
@@ -583,8 +615,12 @@ TEST_F(CompressionWorkersTest, NetSavingsGuardRejectsIncompressible) {
      * drain path should reject. We verify two things:
      *   1. The worker still produces a buffer (encoder works on any input).
      *   2. The production drain path runs without crashing on rejection.
-     * The reject signal itself (compression_skipped_incompressible++)
-     * comes in S4.1; for now we just ensure the path doesn't blow up. */
+     *
+     * TODO(S4.1): when the rejection counter
+     * compression_skipped_incompressible++ lands in S4.1, extend
+     * this test to assert the counter increments by exactly 1 here
+     * (and that the live_ratio EMA records the rejection ratio per
+     * R2.3.5). For now we just ensure the path doesn't blow up. */
     uint32_t dict_id = installSyntheticDict();
     ASSERT_NE(dict_id, 0u);
 
@@ -629,17 +665,18 @@ TEST_F(CompressionWorkersTest, NoActiveDictMarksJobNotCompressed) {
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(1000);
     while (got == 0 && std::chrono::steady_clock::now() < deadline) {
-        got = compressionWorkersDrainOutboxForTesting(jobs, 1);
+        got = testOnlyCompressionWorkersDrainOutbox(jobs, 1);
         if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
     ASSERT_EQ(1, got);
 
-    EXPECT_EQ(0u, compressionWorkersJobDictIdForTesting(jobs[0]));
-    EXPECT_EQ(nullptr, compressionWorkersJobDstForTesting(jobs[0]));
-    EXPECT_EQ(0u, compressionWorkersJobDstLenForTesting(jobs[0]));
-    EXPECT_NE(0, compressionWorkersJobErrForTesting(jobs[0]));
+    CompressionJobView v = readJob(jobs[0]);
+    EXPECT_EQ(0u, v.dict_id);
+    EXPECT_EQ(nullptr, v.dst);
+    EXPECT_EQ(0u, v.dst_len);
+    EXPECT_NE(0, v.err);
 
-    compressionWorkersFreeJobForTesting(jobs[0]);
+    testOnlyCompressionWorkersFreeJob(jobs[0]);
     sdsfree(key);
     sdsfree(val);
     compressionWorkersStop();
@@ -683,7 +720,7 @@ TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
     while ((int)all_jobs.size() < kJobs &&
            std::chrono::steady_clock::now() < deadline) {
         void *batch[16];
-        int got = compressionWorkersDrainOutboxForTesting(batch, 16);
+        int got = testOnlyCompressionWorkersDrainOutbox(batch, 16);
         for (int i = 0; i < got; i++) all_jobs.push_back(batch[i]);
         if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
@@ -695,26 +732,24 @@ TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
      * src pointer (still pointing into vals[i]). */
     int matched = 0;
     for (void *jp : all_jobs) {
-        EXPECT_EQ(0, compressionWorkersJobErrForTesting(jp));
-        EXPECT_EQ(dict_id, compressionWorkersJobDictIdForTesting(jp));
-        const char *src = compressionWorkersJobSrcForTesting(jp);
-        ASSERT_NE(src, nullptr);
+        CompressionJobView v = readJob(jp);
+        EXPECT_EQ(0, v.err);
+        EXPECT_EQ(dict_id, v.dict_id);
+        ASSERT_NE(v.src, nullptr);
 
         /* Find the matching source. */
         int idx = -1;
         for (int i = 0; i < kJobs; i++) {
-            if ((const char *)vals[i] == src) { idx = i; break; }
+            if ((const char *)vals[i] == v.src) { idx = i; break; }
         }
         ASSERT_NE(idx, -1);
 
-        void *dst = compressionWorkersJobDstForTesting(jp);
-        size_t dst_len = compressionWorkersJobDstLenForTesting(jp);
-        ASSERT_NE(dst, nullptr);
+        ASSERT_NE(v.dst, nullptr);
 
-        std::string roundtrip = decompressBuffer(dst, dst_len, dict_id);
+        std::string roundtrip = decompressBuffer(v.dst, v.dst_len, dict_id);
         EXPECT_EQ(sources[idx], roundtrip);
 
-        compressionWorkersFreeJobForTesting(jp);
+        testOnlyCompressionWorkersFreeJob(jp);
         matched++;
     }
     EXPECT_EQ(kJobs, matched);

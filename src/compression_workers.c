@@ -492,13 +492,23 @@ int compressionWorkersDrainOutbox(int budget) {
              * runs end-to-end against test fixtures only, so we
              * exercise the encoder + guard but not the install. The
              * S2.5 round-trip tests use a peeking variant of drain
-             * (compressionWorkersDrainOutboxForTesting) that does NOT
+             * (testOnlyCompressionWorkersDrainOutbox) that does NOT
              * free the buffer, letting the test verify decompression. */
             if (job->err != 0 || job->dst == NULL) {
                 /* Worker chose not to compress (no active dict yet) or
-                 * ZSTD reported an error. Nothing to install or guard;
-                 * just dispose. INFO counter coverage for the no-dict
-                 * and error paths comes in S4.1 (compression_errors_total). */
+                 * ZSTD reported an error.
+                 *
+                 * TODO(S4.1): two distinct counter contributions feed
+                 * here in S4.1:
+                 *   - job->err > 0 (worker policy, e.g. no-dict): no
+                 *     INFO counter — this is a benign expected state
+                 *     (R2.1.5), tracked indirectly via
+                 *     compression_state == "active" || "idle".
+                 *   - job->err < 0 (real ZSTD error): increment
+                 *     compression_errors_total per R2.10.1 and emit a
+                 *     rate-limited LL_WARNING per R6.1.
+                 * No live_ratio contribution — no compression actually
+                 * ran, so there's no measured ratio to fold in. */
                 if (job->dst != NULL) zfree(job->dst);
             } else {
                 /* Net-savings guard (R2.4.3 / R2.2 second block):
@@ -517,16 +527,40 @@ int compressionWorkersDrainOutbox(int budget) {
 
                 if (job->dst_len >= threshold) {
                     /* No useful saving — discard the compressed form,
-                     * leave the value uncompressed. INFO counter
-                     * compression_skipped_incompressible++ comes in
-                     * S4.1; for S2.5 we just dispose. */
+                     * leave the value uncompressed.
+                     *
+                     * TODO(S4.1): two contributions here in S4.1:
+                     *   - compression_skipped_incompressible++ per
+                     *     R2.10.1.
+                     *   - Fold the actual measured ratio
+                     *     (job->dst_len / uncompressed_len) into the
+                     *     EMA compression_live_ratio_10m per R2.3.5
+                     *     ("rejections contribute their actual
+                     *     measured ratio, typically in [0.9, 1.05]").
+                     *     Sustained high rejection rate inflates the
+                     *     metric and naturally trips the drift
+                     *     threshold → drives retraining. */
                     zfree(job->dst);
                 }
-                /* else: install path is S2.7. Buffer leaks here in
-                 * the unit-test environment (no production caller
-                 * yet). Tests that need to inspect the compressed
-                 * buffer use compressionWorkersDrainOutboxForTesting
-                 * which extracts jobs before this handler runs. */
+                /* TODO(S2.7): install path — re-resolve robj by
+                 * (dbid, key, version), call
+                 * createCompressedObject(OBJ_STRING, job->dst,
+                 * job->dst_len), dbOverwrite, then
+                 * compressionRegistryIncRef(job->dict_id) and
+                 * decrRefCount on the caller's pin from
+                 * compressionWorkersEnqueue.
+                 *
+                 * TODO(S4.1): on successful install:
+                 *   - compression_compressions_per_sec rate update.
+                 *   - Fold the success ratio
+                 *     (job->dst_len / uncompressed_len) into the EMA
+                 *     compression_live_ratio_10m per R2.3.5.
+                 *
+                 * Until S2.7 lands the buffer leaks here in the
+                 * unit-test environment (no production caller yet).
+                 * Tests that need to inspect the compressed buffer
+                 * use testOnlyCompressionWorkersDrainOutbox which
+                 * extracts jobs before this handler runs. */
                 else {
                     zfree(job->dst); /* placeholder until S2.7 */
                 }
@@ -539,23 +573,30 @@ int compressionWorkersDrainOutbox(int budget) {
     return total;
 }
 
-/* Test-only variant of compressionWorkersDrainOutbox.
+/* ============================================================
+ * Test-only entry points (gtest)
+ * ============================================================
  *
- * Returns up to `budget` completed compressionJob pointers via
- * `jobs_out`, transferring ownership to the caller. Caller MUST free
- * each `job->dst` (if non-NULL) and the job struct itself via
- * `compressionWorkersFreeJobForTesting`. The S2.5 round-trip tests
- * use this to verify the worker's compressed output without losing
- * the buffer to the production drain handler.
+ * Convention follows quicklist.c / intset.c: define here, do NOT
+ * declare in compression_workers.h. The gtest unit test declares
+ * what it needs locally in its own extern "C" block. This keeps
+ * the production-callable surface (the public header) free of
+ * test-only symbols.
  *
- * Returns the number of jobs extracted (0..budget).
- *
- * This accessor is NOT a stable API and MUST NOT be called from
- * production code. The forward declaration lives in compression_workers.h
- * gated behind an explicit "test-only" comment; the symbol is exported
- * only because the gtest unit-test binary links against the same
- * compilation unit. */
-int compressionWorkersDrainOutboxForTesting(void **jobs_out, int budget) {
+ * The S2.5 encoder-path tests need to inspect the worker's
+ * compressed output before the production drain handler frees it.
+ * The peek-and-extract entry point below pulls completed jobs off
+ * the outbox without freeing; the read entry point projects the
+ * file-private compressionJob shape into a flat result struct
+ * (defined alongside the gtest test code that uses it) so the
+ * production code carries no record of the private job shape;
+ * the free entry point frees a job + its dst buffer.
+ */
+
+/* Pop up to `budget` completed jobs into `jobs_out` without freeing
+ * them. Caller takes ownership and MUST free each job via
+ * testOnlyCompressionWorkersFreeJob. */
+int testOnlyCompressionWorkersDrainOutbox(void **jobs_out, int budget) {
     if (!pool.initialized || jobs_out == NULL || budget <= 0) return 0;
 
     int total = 0;
@@ -571,36 +612,32 @@ int compressionWorkersDrainOutboxForTesting(void **jobs_out, int budget) {
     return total;
 }
 
-/* Companion helper for compressionWorkersDrainOutboxForTesting: frees
- * a compressionJob and its `dst` buffer. Kept as a function rather
- * than exposing the struct because compressionJob is file-private. */
-void compressionWorkersFreeJobForTesting(void *job_ptr) {
+/* Free a job + its dst buffer, mirroring what the production drain
+ * handler does after install. */
+void testOnlyCompressionWorkersFreeJob(void *job_ptr) {
     if (job_ptr == NULL) return;
     compressionJob *job = (compressionJob *)job_ptr;
     if (job->dst != NULL) zfree(job->dst);
     zfree(job);
 }
 
-/* Accessors for the testing path. Mirror the field names in
- * compressionJob. */
-void *compressionWorkersJobDstForTesting(void *job_ptr) {
-    return ((compressionJob *)job_ptr)->dst;
-}
-
-size_t compressionWorkersJobDstLenForTesting(void *job_ptr) {
-    return ((compressionJob *)job_ptr)->dst_len;
-}
-
-uint32_t compressionWorkersJobDictIdForTesting(void *job_ptr) {
-    return ((compressionJob *)job_ptr)->dict_id;
-}
-
-int compressionWorkersJobErrForTesting(void *job_ptr) {
-    return ((compressionJob *)job_ptr)->err;
-}
-
-const char *compressionWorkersJobSrcForTesting(void *job_ptr) {
-    return ((compressionJob *)job_ptr)->src;
+/* Project the file-private compressionJob into the caller-provided
+ * fields. The caller's struct shape is defined in the gtest test code;
+ * we pass field pointers individually here so this function does not
+ * have to know about that struct's layout. NULL-tolerant: any
+ * out-pointer may be NULL to skip projecting that field. */
+void testOnlyCompressionWorkersJobRead(void *job_ptr,
+                                       const char **out_src,
+                                       void **out_dst,
+                                       size_t *out_dst_len,
+                                       uint32_t *out_dict_id,
+                                       int *out_err) {
+    compressionJob *job = (compressionJob *)job_ptr;
+    if (out_src) *out_src = job->src;
+    if (out_dst) *out_dst = job->dst;
+    if (out_dst_len) *out_dst_len = job->dst_len;
+    if (out_dict_id) *out_dict_id = job->dict_id;
+    if (out_err) *out_err = job->err;
 }
 
 void compressionWorkersWakeAll(void) {
