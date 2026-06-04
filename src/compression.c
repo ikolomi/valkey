@@ -204,10 +204,27 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
     }
 
     /* For ZSTD, alg_meta is the dict_id. Look up the DDict in the
-     * registry. The dict may have been retired (refcount > 0 keeps
-     * the DDict alive per the QSBR contract; a missing lookup means
-     * the registry was force-cleared, which should not happen in a
-     * healthy server). */
+     * registry.
+     *
+     * Lifetime safety: compressionRegistryLookup returns a raw pointer
+     * without bumping any refcount. The pair remains valid here because
+     * (1) the registry's free path (compressionRegistryTryGc →
+     * dictPairFree) is itself main-thread-only, and (2) no code between
+     * this lookup and the ZSTD_decompress_usingDDict call below yields
+     * to the event loop. So no main-thread code that could free dicts
+     * can run in this window. This is the same single-threaded
+     * cooperative invariant that protects every lookupKey()-then-use
+     * sequence in Valkey.
+     *
+     * v2 async decompression (Appendix C.2) would need to revisit this
+     * — yielding back to the event loop between lookup and decompress
+     * requires real reference counting through the registry.
+     *
+     * NULL return is a legitimate failure case, not a server bug: a
+     * frame may reference a dict_id that has since been retired and
+     * reclaimed (e.g. an RDB-loaded value whose dict drained to
+     * frame_refs == 0 and was GC'd). The caller treats it as a
+     * corruption-class read failure (§6.2). */
     compressionDictPair *pair = compressionRegistryLookup(hdr.alg_meta);
     if (pair == NULL || pair->ddict == NULL) {
         serverLog(LL_WARNING,
