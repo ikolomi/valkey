@@ -72,20 +72,22 @@ start_server {tags {"compression"}} {
         assert_match "*compression_enabled:0*" $info
     }
 
-    test {All 16 compression config knobs are registered with documented defaults} {
+    test {All 18 compression config knobs are registered with documented defaults} {
         # Primary (5) — see design/detailed-design.md §2.12
         assert_equal [lindex [r config get compression-enabled] 1] "no"
         assert_equal [lindex [r config get compression-threads] 1] "1"
         assert_equal [lindex [r config get compression-min-value-size] 1] "256"
         assert_equal [lindex [r config get compression-max-value-size] 1] "131072"
         assert_equal [lindex [r config get compression-dict-size] 1] "102400"
-        # Advanced (9)
+        # Advanced (11)
         assert_equal [lindex [r config get compression-sweep-max-cpu-pct] 1] "25"
         assert_equal [lindex [r config get compression-cpulist] 1] ""
         assert_equal [lindex [r config get compression-min-savings-ratio] 1] "10"
         assert_equal [lindex [r config get compression-lfu-threshold] 1] "5"
         assert_equal [lindex [r config get compression-min-idle-seconds] 1] "60"
-        assert_equal [lindex [r config get compression-dict-first-training-keys-count] 1] "10000"
+        assert_equal [lindex [r config get compression-dict-min-training-keys] 1] "1000"
+        assert_equal [lindex [r config get compression-dict-max-training-keys] 1] "10000"
+        assert_equal [lindex [r config get compression-training-buffer-size] 1] "16777216"
         assert_equal [lindex [r config get compression-dict-drift-ratio] 1] "70"
         assert_equal [lindex [r config get compression-dict-refresh-interval] 1] "0"
         assert_equal [lindex [r config get compression-dict-max-versions] 1] "4"

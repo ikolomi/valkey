@@ -72,12 +72,14 @@ int compressionTrainMaybeTrigger(int reason);
  * Main-thread sample collection (spliced across cron ticks)
  * ========================================================================
  *
- * Called from compressionCron when a training is in the "collecting
- * samples" phase. Walks up to `budget` kvstore entries this tick; when
- * the target sample count is reached, hands the contiguous buffer off
- * to bio via bioSubmit. Returns the number of samples appended this
- * tick (0 when collection is complete or paused).
+ * Called from compressionCron. Evaluates triggers, advances scan
+ * (time-budgeted ~100µs per tick), polls for bio completion, and
+ * promotes trained dicts via the registry.
  */
+void compressionTrainCron(void);
+
+/* Legacy API — kept for interface compatibility. Scanning is now driven
+ * internally by compressionTrainCron. */
 int compressionTrainAdvanceSampling(int budget);
 
 /* ========================================================================

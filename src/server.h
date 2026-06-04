@@ -2407,15 +2407,17 @@ struct valkeyServer {
     size_t compression_max_value_size; /* Upper size bound (0 = unbounded). Default: 131072. */
     size_t compression_dict_size;      /* ZSTD trainer target dict size. Default: 102400. */
     /* Advanced (§2.12 — 11 knobs) */
-    int compression_sweep_max_cpu_pct;              /* Sweep pacing (1..100). Default: 25. */
-    char *compression_cpulist;                      /* CPU affinity list for workers. Default: "". */
-    int compression_min_savings_ratio;              /* Post-compression net-savings guard (percent). Default: 10. */
-    int compression_lfu_threshold;                  /* LFU skip-hot-key additional guard. Default: 5. */
-    int compression_min_idle_seconds;               /* LRU/noeviction read-recency skip; inactive in LFU mode. Default: 60. */
-    int compression_dict_first_training_keys_count; /* First-training trigger. Default: 10000. */
-    int compression_dict_drift_ratio;               /* Retrain drift trigger (percent). Default: 70. */
-    int compression_dict_refresh_interval;          /* Optional periodic retrain (seconds; 0 = disabled). Default: 0. */
-    int compression_dict_max_versions;              /* Registry cap (min 2). Default: 4. */
+    int compression_sweep_max_cpu_pct;       /* Sweep pacing (1..100). Default: 25. */
+    char *compression_cpulist;               /* CPU affinity list for workers. Default: "". */
+    int compression_min_savings_ratio;       /* Post-compression net-savings guard (percent). Default: 10. */
+    int compression_lfu_threshold;           /* LFU skip-hot-key additional guard. Default: 5. */
+    int compression_min_idle_seconds;        /* LRU/noeviction read-recency skip; inactive in LFU mode. Default: 60. */
+    int compression_dict_min_training_keys;  /* Trigger + min samples for training. Default: 1000. */
+    int compression_dict_max_training_keys;  /* Upper cap on samples per scan. Default: 10000. */
+    size_t compression_training_buffer_size; /* Upper cap on training buffer bytes. Default: 16 MiB. */
+    int compression_dict_drift_ratio;        /* Retrain drift trigger (percent). Default: 70. */
+    int compression_dict_refresh_interval;   /* Optional periodic retrain (seconds; 0 = disabled). Default: 0. */
+    int compression_dict_max_versions;       /* Registry cap (min 2). Default: 4. */
 };
 
 #define MAX_KEYS_BUFFER 256

@@ -43,16 +43,23 @@ void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache);
 void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...);
 void bioCreateSaveRDBToDiskJob(connection *conn, int is_dual_channel);
 void bioCreateTlsReloadJob(void);
+void bioCreateCompTrainJob(char *buffer, size_t *sizes, int sample_count, size_t buffer_used);
+
+/* Execute the compression training job synchronously (same thread).
+ * Used for testing — avoids needing bio threads. Ownership of buffer
+ * and sizes transfers to this function (freed after training). */
+void bioProcessCompTrainJobSync(char *buffer, size_t *sizes, int sample_count, size_t buffer_used);
 int inBioThread(void);
 
 /* Background job opcodes */
 enum {
-    BIO_CLOSE_FILE = 0, /* Deferred close(2) syscall. */
-    BIO_AOF_FSYNC,      /* Deferred AOF fsync. */
-    BIO_LAZY_FREE,      /* Deferred objects freeing. */
-    BIO_CLOSE_AOF,      /* Deferred close for AOF files. */
-    BIO_RDB_SAVE,       /* Deferred save RDB to disk on replica */
-    BIO_TLS_RELOAD,     /* Deferred TLS reload. */
+    BIO_CLOSE_FILE = 0,    /* Deferred close(2) syscall. */
+    BIO_AOF_FSYNC,         /* Deferred AOF fsync. */
+    BIO_LAZY_FREE,         /* Deferred objects freeing. */
+    BIO_CLOSE_AOF,         /* Deferred close for AOF files. */
+    BIO_RDB_SAVE,          /* Deferred save RDB to disk on replica */
+    BIO_TLS_RELOAD,        /* Deferred TLS reload. */
+    BIO_COMPRESSION_TRAIN, /* Dictionary training (ZDICT_trainFromBuffer + CDict/DDict). */
     BIO_NUM_OPS
 };
 

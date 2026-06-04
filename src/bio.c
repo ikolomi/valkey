@@ -71,7 +71,13 @@
 #include "bio.h"
 #include "mutexqueue.h"
 #include "tls.h"
+#include "compression_train.h"
+#include "compression_registry.h"
 #include <stdatomic.h>
+#ifdef USE_ZSTD
+#include <zstd.h>
+#include <zdict.h>
+#endif
 
 static unsigned int bio_job_to_worker[] = {
     [BIO_CLOSE_FILE] = 0,
@@ -80,6 +86,7 @@ static unsigned int bio_job_to_worker[] = {
     [BIO_LAZY_FREE] = 2,
     [BIO_RDB_SAVE] = 3,
     [BIO_TLS_RELOAD] = 4, /* only used when BUILD_TLS=yes */
+    [BIO_COMPRESSION_TRAIN] = 5,
 };
 
 typedef struct {
@@ -94,6 +101,7 @@ static bio_worker_data bio_workers[] = {
     {"bio_lazy_free"},
     {"bio_rdb_save"},
     {"bio_tls_reload"}, /* only used when BUILD_TLS=yes */
+    {"bio_comp_train"}, /* compression dictionary training */
 };
 static const bio_worker_data *const bio_worker_end = bio_workers + (sizeof bio_workers / sizeof *bio_workers);
 
@@ -140,6 +148,14 @@ typedef union bio_job {
     struct {
         int type;
     } tls_reload_args;
+
+    struct {
+        int type;
+        char *buffer;       /* Training sample buffer (owned). */
+        size_t *sizes;      /* Per-sample sizes array (owned). */
+        int sample_count;   /* Number of samples. */
+        size_t buffer_used; /* Bytes used in buffer. */
+    } comp_train_args;
 } bio_job;
 
 void *bioProcessBackgroundJobs(void *arg);
@@ -245,6 +261,93 @@ void bioCreateTlsReloadJob(void) {
     bioSubmitJob(BIO_TLS_RELOAD, job);
 }
 
+void bioCreateCompTrainJob(char *buffer, size_t *sizes, int sample_count, size_t buffer_used) {
+    bio_job *job = allocBioJob(0);
+    job->comp_train_args.type = BIO_COMPRESSION_TRAIN;
+    job->comp_train_args.buffer = buffer;
+    job->comp_train_args.sizes = sizes;
+    job->comp_train_args.sample_count = sample_count;
+    job->comp_train_args.buffer_used = buffer_used;
+    bioSubmitJob(BIO_COMPRESSION_TRAIN, job);
+}
+
+/* Process a BIO_COMPRESSION_TRAIN job: train dict, create CDict/DDict,
+ * signal main thread via compressionTrainCompleteFromBio. */
+static void bioProcessCompTrainJob(bio_job *job) {
+#ifdef USE_ZSTD
+    char *buffer = job->comp_train_args.buffer;
+    size_t *sizes = job->comp_train_args.sizes;
+    int sample_count = job->comp_train_args.sample_count;
+    size_t buffer_used = job->comp_train_args.buffer_used;
+    UNUSED(buffer_used);
+
+    size_t dict_capacity = server.compression_dict_size;
+    void *dict_bytes = zmalloc(dict_capacity);
+
+    size_t result = ZDICT_trainFromBuffer(dict_bytes, dict_capacity,
+                                          buffer, sizes,
+                                          (unsigned)sample_count);
+
+    /* Free training inputs — bio owns them. */
+    zfree(buffer);
+    zfree(sizes);
+
+    if (ZDICT_isError(result)) {
+        serverLog(LL_WARNING,
+                  "Compression bio: ZDICT_trainFromBuffer failed: %s",
+                  ZDICT_getErrorName(result));
+        zfree(dict_bytes);
+        sds err = sdsnew(ZDICT_getErrorName(result));
+        compressionTrainCompleteFromBio(NULL, err);
+        return;
+    }
+
+    size_t dict_size = result;
+
+    /* Create CDict and DDict from trained bytes. */
+    ZSTD_CDict *cdict = ZSTD_createCDict(dict_bytes, dict_size,
+                                         ZSTD_CLEVEL_DEFAULT);
+    ZSTD_DDict *ddict = ZSTD_createDDict(dict_bytes, dict_size);
+
+    if (!cdict || !ddict) {
+        serverLog(LL_WARNING,
+                  "Compression bio: failed to create CDict/DDict.");
+        if (cdict) ZSTD_freeCDict(cdict);
+        if (ddict) ZSTD_freeDDict(ddict);
+        zfree(dict_bytes);
+        sds err = sdsnew("CDict/DDict creation failed");
+        compressionTrainCompleteFromBio(NULL, err);
+        return;
+    }
+
+    /* Package result for main thread. */
+    compressionDictPair *pair = zcalloc(sizeof(*pair));
+    pair->cdict = cdict;
+    pair->ddict = ddict;
+    pair->bytes = dict_bytes;
+    pair->bytes_len = dict_size;
+
+    compressionTrainCompleteFromBio(pair, NULL);
+#else
+    /* No ZSTD — free inputs and signal failure. */
+    zfree(job->comp_train_args.buffer);
+    zfree(job->comp_train_args.sizes);
+    sds err = sdsnew("ZSTD not available (BUILD_ZSTD=no)");
+    compressionTrainCompleteFromBio(NULL, err);
+#endif
+}
+
+void bioProcessCompTrainJobSync(char *buffer, size_t *sizes, int sample_count, size_t buffer_used) {
+    bio_job *job = allocBioJob(0);
+    job->comp_train_args.type = BIO_COMPRESSION_TRAIN;
+    job->comp_train_args.buffer = buffer;
+    job->comp_train_args.sizes = sizes;
+    job->comp_train_args.sample_count = sample_count;
+    job->comp_train_args.buffer_used = buffer_used;
+    bioProcessCompTrainJob(job);
+    zfree(job);
+}
+
 void *bioProcessBackgroundJobs(void *arg) {
     bio_worker_data *const bwd = arg;
     sigset_t sigset;
@@ -314,6 +417,8 @@ void *bioProcessBackgroundJobs(void *arg) {
 #else
             serverPanic("BIO_TLS_RELOAD job type requires built-in TLS (BUILD_TLS=yes).");
 #endif
+        } else if (job_type == BIO_COMPRESSION_TRAIN) {
+            bioProcessCompTrainJob(job);
         } else {
             serverPanic("Wrong job type in bioProcessBackgroundJobs().");
         }

@@ -81,6 +81,7 @@ void compressionInit(void) {
                   "succeeds.");
     }
     /* TODO(S1.x): compressionTrainInit(); */
+    compressionTrainInit();
 }
 
 /* Called from finishShutdown in src/server.c. Must run BEFORE
@@ -98,8 +99,9 @@ void compressionShutdown(void) {
 }
 
 void compressionCron(void) {
-    /* Phase 0: no-op. */
-    /* TODO(Phase 1): sweep tick + drift-retrain + pacing. */
+    /* Training: trigger evaluation, scan advancement, completion polling. */
+    compressionTrainCron();
+    /* TODO(Phase 1): sweep tick + pacing. */
 }
 
 void compressionAfterSleep(void) {
