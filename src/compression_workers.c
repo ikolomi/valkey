@@ -56,22 +56,29 @@
  * ======================================================================== */
 
 typedef struct compressionJob {
-    /* Set by Enqueue (immutable for the rest of the job lifetime): */
-    sds key; /* key name; main thread re-resolves the robj on drain */
+    /* Set by Enqueue (immutable for the rest of the job lifetime).
+     *
+     * `value` is the robj the caller pinned via incrRefCount(value).
+     * NULL is permitted only via testOnlyCompressionWorkersEnqueueRaw
+     * — sentinel for "test mode; production drain skips install".
+     *
+     * `src` aliases objectGetVal(value) (when value != NULL) or the
+     * caller-supplied sds (test path). The worker reads `src` only;
+     * never the robj.
+     *
+     * `dbid` is captured for the drain-time kvstore lookup. */
+    robj *value;
+    sds src;
     int dbid;
-    uint64_t version; /* robj version counter; detects concurrent rewrites */
-    sds src;          /* value sds at enqueue time; pinned by caller's incrRefCount */
 
-    /* Filled by worker on the worker thread (S2.5 will populate the
-     * dst/dst_len/dict_id with real compressed output; S2.4 leaves
-     * them as zero-initialised below). The worker loads the active
-     * dict via compressionRegistryActive() at compress time per the
-     * QSBR contract (§4.6) — Enqueue does NOT capture the dict_id
-     * itself. The dict_id field exists on the job struct so the
-     * worker can carry the snapshot it actually used into the
-     * compressed-frame header on the outbox side. */
-    uint32_t dict_id; /* dict the worker actually used; 0 == none / placeholder */
-    void *dst;        /* zmalloc'd compressedHeader + frame; owned by main thread post-drain */
+    /* Filled by worker on the worker thread. The worker loads the
+     * active dict via compressionRegistryActive() at compress time per
+     * the QSBR contract (§4.6) — Enqueue does NOT capture the dict_id
+     * itself. The dict_id field exists on the job struct so the worker
+     * can carry the snapshot it actually used into the compressed-
+     * frame header on the outbox side. */
+    uint32_t dict_id; /* dict the worker actually used; 0 == none */
+    void *dst;        /* zmalloc'd compressedHeader + frame */
     size_t dst_len;   /* total bytes in dst */
     int err;          /* 0 = ok, !=0 = ZSTD error code */
 } compressionJob;
@@ -458,36 +465,106 @@ int compressionWorkersGetThreadCount(void) {
     return pool.initialized ? pool.n_threads : 0;
 }
 
-int compressionWorkersEnqueue(const sds key,
-                              int dbid,
-                              uint64_t version,
-                              sds src) {
+int compressionWorkersEnqueue(robj *value, int dbid) {
     if (!pool.initialized || pool.n_threads == 0) return -1;
+    serverAssert(value != NULL);
 
     compressionJob *job = zmalloc(sizeof(*job));
-    job->key = key;
+    job->value = value;
+    job->src = (sds)objectGetVal(value);
     job->dbid = dbid;
-    job->version = version;
-    job->src = src;
-    /* dict_id is NOT captured by Enqueue. It is filled by the worker
-     * after compression (S2.5), reflecting the dict the worker
-     * actually used. See §4.6 of the design doc. The placeholder
-     * worker leaves it zero-initialised. */
     job->dict_id = 0;
     job->dst = NULL;
     job->dst_len = 0;
     job->err = 0;
 
-    /* mutexQueueAdd is fire-and-forget on cond_broadcast; if the inbox
-     * has unbounded capacity we'd never drop. mutexQueue is unbounded
-     * (it's a fifo + mutex), so enqueue always succeeds. The bounded-
-     * inbox concern from §4.6 will be revisited in S2.x if operational
-     * experience shows we need an explicit cap. For v1 we accept the
-     * unbounded inbox as a simplification — the natural backpressure
-     * comes from the sweep-pacing config (§2.11 R2.11.2) which limits
-     * how fast the producer side can submit. */
     mutexQueueAdd(pool.inbox, job);
     return 0;
+}
+
+/* Test-only. Lets gtest enqueue a job from a raw sds without a real
+ * robj-owned value (no kvstore, no refcount).  job->value = NULL is
+ * the sentinel that tells the production drain to skip the install
+ * path; tests using this MUST extract the job via
+ * testOnlyCompressionWorkersDrainOutbox before the production
+ * compressionWorkersDrainOutbox runs (otherwise the drain's
+ * value!=NULL serverAssert would fire). */
+int testOnlyCompressionWorkersEnqueueRaw(sds src, int dbid) {
+    if (!pool.initialized || pool.n_threads == 0) return -1;
+
+    compressionJob *job = zmalloc(sizeof(*job));
+    job->value = NULL; /* test sentinel */
+    job->src = src;
+    job->dbid = dbid;
+    job->dict_id = 0;
+    job->dst = NULL;
+    job->dst_len = 0;
+    job->err = 0;
+
+    mutexQueueAdd(pool.inbox, job);
+    return 0;
+}
+
+/* Install a worker-produced compressed buffer into the kvstore on the
+ * main thread. Called from compressionWorkersDrainOutbox after the
+ * net-savings guard accepts the result.
+ *
+ * Lifetime / staleness:
+ *   - Caller holds the pin (incrRefCount(job->value)) from enqueue.
+ *     This both protects the bytes from in-place mutation (R2.4.4) and
+ *     reserves the robj address so the pointer-equality stale-check
+ *     below is ABA-safe.
+ *   - If the value at (dbid, key) was overwritten / expired between
+ *     enqueue and now, the kvstore slot points to a different robj
+ *     (or no robj at all). We detect via pointer equality and discard
+ *     the compression result.
+ *
+ * Notifications:
+ *   - dbReplaceValue → dbSetValue(..., overwrite=0, ...) does NOT call
+ *     signalModifiedKey, moduleNotifyKeyUnlink, or
+ *     signalDeletedKeyAsReady. Background compression is a
+ *     storage-only change (§2.9 R2.9.2).
+ *
+ * Returns 1 if installed, 0 if discarded due to staleness. Either way
+ * caller still owns the pin (decrRefCount happens in the drain loop). */
+static int compressionInstall(compressionJob *job) {
+    serverDb *db = &server.db[job->dbid];
+    sds key_sds = (sds)objectGetKey(job->value);
+    int dict_index = getKVStoreIndexForKey(key_sds);
+    void **slot = kvstoreHashtableFindRef(db->keys, dict_index, key_sds);
+
+    if (slot == NULL || *slot != job->value) {
+        /* Stale: overwrite, expire, or COW happened between enqueue
+         * and now. Discard the compressed buffer. */
+        zfree(job->dst);
+        return 0;
+    }
+
+    /* Build the compressed robj. createCompressedObject takes ownership
+     * of job->dst. */
+    robj *compressed = createCompressedObject(OBJ_STRING, job->dst, job->dst_len);
+
+    /* Replace via dbReplaceValue. We need a temporary key robj wrapping
+     * the sds — initStaticStringObject is the standard pattern. */
+    robj key_obj;
+    initStaticStringObject(key_obj, key_sds);
+
+    /* dbReplaceValue may reallocate `compressed` (objectSetKeyAndExpire
+     * embeds the key into the new robj). It also decrRefs the old value
+     * (job->value), dropping its kvstore reference; our pin still
+     * holds via the caller's refcount. */
+    dbReplaceValue(db, &key_obj, &compressed);
+
+    /* Bump the registry ref for the dict this frame is built with.
+     * Decrement happens when the compressed robj is freed (S2.x will
+     * wire freeStringObject → compressionRegistryDecRef). */
+    compressionRegistryIncRef(job->dict_id);
+
+    /* TODO(S4.1): compression_compressions_per_sec++ rate update; fold
+     * (dst_len / sdslen(src)) into compression_live_ratio_10m EMA per
+     * R2.3.5; compression_compressed_objects++. */
+
+    return 1;
 }
 
 int compressionWorkersDrainOutbox(int budget) {
@@ -563,29 +640,29 @@ int compressionWorkersDrainOutbox(int budget) {
                      *     threshold → drives retraining. */
                     zfree(job->dst);
                 }
-                /* TODO(S2.7): install path — re-resolve robj by
-                 * (dbid, key, version), call
-                 * createCompressedObject(OBJ_STRING, job->dst,
-                 * job->dst_len), dbOverwrite, then
-                 * compressionRegistryIncRef(job->dict_id) and
-                 * decrRefCount on the caller's pin from
-                 * compressionWorkersEnqueue.
-                 *
-                 * TODO(S4.1): on successful install:
-                 *   - compression_compressions_per_sec rate update.
-                 *   - Fold the success ratio
-                 *     (job->dst_len / uncompressed_len) into the EMA
-                 *     compression_live_ratio_10m per R2.3.5.
-                 *
-                 * Until S2.7 lands the buffer leaks here in the
-                 * unit-test environment (no production caller yet).
-                 * Tests that need to inspect the compressed buffer
-                 * use testOnlyCompressionWorkersDrainOutbox which
-                 * extracts jobs before this handler runs. */
-                else {
-                    zfree(job->dst); /* placeholder until S2.7 */
+                /* Net-savings guard accepted the compressed form. */
+                else if (job->value == NULL) {
+                    /* Test path (testOnlyCompressionWorkersEnqueueRaw):
+                     * no real kvstore install. Tests that need the
+                     * compressed buffer extract via
+                     * testOnlyCompressionWorkersDrainOutbox before the
+                     * production drain runs; if a job with value==NULL
+                     * reaches here it means the test forgot to extract
+                     * — dispose to avoid leaking, but the test is
+                     * structurally broken. */
+                    zfree(job->dst);
+                } else {
+                    /* Production install. compressionInstall handles
+                     * staleness check, dbReplaceValue, registry ref
+                     * bump. Always consumes job->dst (either installed
+                     * via createCompressedObject or zfree'd on stale). */
+                    compressionInstall(job);
                 }
             }
+
+            /* Release the caller's pin. For test-mode jobs (value==NULL)
+             * there's nothing to release. */
+            if (job->value != NULL) decrRefCount(job->value);
             zfree(job);
 
             total++;

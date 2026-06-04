@@ -132,25 +132,29 @@ void compressionWorkersWakeAll(void);
  * Enqueue a compression job for an already-eligible candidate.
  *
  * Ownership contract:
- *   - `key` (sds) and `src` (sds) are borrowed pointers. The pool
- *     reads them on the worker thread and the outbox drain on the
- *     main thread, but does NOT take ownership and does NOT free
- *     them. The caller MUST keep both pointers valid until the job
- *     surfaces on the outbox and the drain completes.
+ *   - `value` MUST be a pinned robj — the caller holds `incrRefCount(value)`
+ *     before calling. The drain handler releases the pin via
+ *     `decrRefCount(value)` after install (or discard).
  *
- *   - In the production path (S2.7 write-path hook), the caller will
- *     hold `incrRefCount(val)` on the value's owning robj before
- *     calling Enqueue. The drain handler (S2.5) will call
- *     decrRefCount(val) once it has either installed or discarded
- *     the compressed result. The bumped refcount also enforces the
- *     immutable-snapshot invariant (§2.4 R2.4.4): any concurrent
- *     mutating command sees refcount >= 2 and goes through
- *     `dbUnshareStringValue`, COW-ing rather than mutating in place.
+ *   - The bumped refcount also enforces the immutable-snapshot invariant
+ *     (§2.4 R2.4.4): any concurrent mutating command sees `refcount >= 2`
+ *     and goes through `dbUnshareStringValue`, COW-ing rather than
+ *     mutating in place. AND it reserves the robj's memory address so
+ *     the drain handler's pointer-equality check (`*kvstore_slot ==
+ *     job->value`) is ABA-safe — the allocator cannot reuse the
+ *     address for a different robj while the pin holds.
  *
- *   - In the S2.4 unit-test path the caller (test fixture) owns the
- *     sds pointers directly and frees them after the drain. There is
- *     no robj and no refcount to manage; the pool is exercised purely
- *     for its plumbing semantics.
+ *   - The worker reads `objectGetVal(value)` once at enqueue time
+ *     (captured into `job->src`) and never touches the robj
+ *     afterwards. R2.11.4 stays intact: workers consume flat byte
+ *     buffers, not robjs.
+ *
+ *   - For unit tests that don't have a real robj-owned value (no
+ *     server.db, no kvstore), use `testOnlyCompressionWorkersEnqueueRaw`
+ *     below — it stores `job->value = NULL` so the production drain's
+ *     install path is skipped. Tests that need raw enqueue extract
+ *     jobs via `testOnlyCompressionWorkersDrainOutbox` BEFORE the
+ *     production drain runs.
  *
  * Active dict: the worker loads `compressionRegistryActive()` at
  * compress time per the QSBR contract (§4.6: "the worker loads the
@@ -159,19 +163,11 @@ void compressionWorkersWakeAll(void);
  * the worker after compression, so it can be carried into the
  * compressed-frame header on the outbox side.
  *
- * `version` is the robj version counter at enqueue time. The drain
- * compares it with the current version to detect concurrent rewrites
- * — if mismatched, the compressed result is discarded.
- *
  * Returns 0 on success, -1 if the pool is uninitialized, has zero
- * workers, or the inbox is full. On -1 the caller retains ownership
- * of `key`/`src` (and any incrRefCount the caller did) — the pool
- * never partially-acquires.
+ * workers, or (future S2.11) the inbox is full. On -1 the caller
+ * retains the pin and is responsible for releasing it.
  */
-int compressionWorkersEnqueue(const sds key,
-                              int dbid,
-                              uint64_t version,
-                              sds src);
+int compressionWorkersEnqueue(robj *value, int dbid);
 
 /* Test-only / introspection accessor: returns the current pool size
  * (0 if uninitialized). Used by unit tests to verify Resize actually

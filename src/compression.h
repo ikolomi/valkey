@@ -124,7 +124,32 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out);
  * modes there is no mutation.
  */
 int compressionIsEligible(robj *o);
-void compressionEnqueueCandidate(const sds key, robj *o);
+
+/* Enqueue an eligible value for background compression. Called from the
+ * write-path seams in db.c (dbAddInternal, dbSetValue) AFTER the value
+ * has been installed in the kvstore (so it has its embedded key).
+ *
+ *   - `key` is advisory only (the embedded key in `value` is the
+ *     authoritative lookup key at drain time). Kept in the signature
+ *     for future v2 non-string types where embedded keys may not apply.
+ *   - `value` is the just-installed robj. Refcount is whatever the
+ *     installer left it at (typically 1: the kvstore's reference).
+ *   - `dbid` is the database index — captured so the drain handler can
+ *     re-resolve the kvstore slot.
+ *
+ * The function is a no-op when:
+ *   - The value is not eligible (R2.2 predicate).
+ *   - No active dictionary exists (R2.1.5 — encoder would skip anyway,
+ *     but checking here saves the allocator round-trip).
+ *
+ * On enqueue the function bumps `incrRefCount(value)` to pin the bytes
+ * (R2.4.4 immutable-snapshot invariant + ABA safety for the drain
+ * handler's pointer-equality stale check). The drain handler releases
+ * the pin via `decrRefCount` after install or discard.
+ *
+ * If the worker pool refuses the job (pool not started or, future,
+ * inbox full per S2.11), the pin is released immediately. */
+void compressionEnqueueCandidate(robj *key, robj *value, int dbid);
 
 /* ========================================================================
  * COMPRESSION command — subcommand dispatch

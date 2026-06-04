@@ -429,12 +429,35 @@ int compressionIsEligible(robj *o) {
     return 1;
 }
 
-void compressionEnqueueCandidate(const sds key, robj *o) {
-    UNUSED(key);
-    UNUSED(o);
-    /* Phase 1: candidate queue is still a no-op sink until S2.4 (worker
-     * pool) and S2.5 (encoder path) land. Wiring this up requires the
-     * SPMC inbox, which doesn't exist yet. */
+void compressionEnqueueCandidate(robj *key, robj *value, int dbid) {
+    UNUSED(key); /* embedded key in `value` is the authoritative lookup key */
+
+    /* Master switch + eligibility (R2.2). compressionIsEligible
+     * already short-circuits on !server.compression_enabled, so no
+     * separate switch check needed. */
+    if (!compressionIsEligible(value)) return;
+
+    /* No active dict yet (R2.1.5). The encoder's worker side would
+     * also handle this, but checking here avoids an allocator round-
+     * trip and a pin we'd immediately release. */
+    if (compressionRegistryActive() == NULL) return;
+
+    /* Pin the value: keeps the sds bytes immutable for the worker
+     * (R2.4.4) AND reserves the robj address so the drain handler's
+     * pointer-equality stale-check is ABA-safe. */
+    incrRefCount(value);
+
+    if (compressionWorkersEnqueue(value, dbid) != 0) {
+        /* Pool refused (not started, or future-S2.11 inbox full).
+         * Release the pin and drop the candidate; the next sweep
+         * (S2.10) will rediscover the value.
+         *
+         * TODO(S4.1): compression_candidates_dropped_total++ when
+         * the bounded inbox lands (S2.11). Pool-not-started today
+         * doesn't increment this counter — it's a configuration
+         * state, not back-pressure. */
+        decrRefCount(value);
+    }
 }
 
 /* ========================================================================

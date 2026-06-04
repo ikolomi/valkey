@@ -56,6 +56,7 @@ extern "C" {
  * here locally rather than in compression_workers.h — the production
  * surface stays clean (matches the testOnly* convention used in
  * quicklist.c / intset.c). */
+int testOnlyCompressionWorkersEnqueueRaw(sds src, int dbid);
 int testOnlyCompressionWorkersDrainOutbox(void **jobs_out, int budget);
 void testOnlyCompressionWorkersFreeJob(void *job_ptr);
 void testOnlyCompressionWorkersJobRead(void *job_ptr,
@@ -167,7 +168,7 @@ TEST_F(CompressionWorkersTest, StartZeroThreadsIsValid) {
     /* enqueue rejected: pool is initialized but n_threads == 0. */
     sds key = sdsnew("k1");
     sds val = sdsnew("v1");
-    EXPECT_EQ(-1, compressionWorkersEnqueue(key, 0, 1, val));
+    EXPECT_EQ(-1, testOnlyCompressionWorkersEnqueueRaw(val, 0));
     sdsfree(key);
     sdsfree(val);
     compressionWorkersStop();
@@ -210,7 +211,7 @@ TEST_F(CompressionWorkersTest, StopIsIdempotent) {
 TEST_F(CompressionWorkersTest, EnqueueRejectedBeforeStart) {
     sds key = sdsnew("k1");
     sds val = sdsnew("v1");
-    EXPECT_EQ(-1, compressionWorkersEnqueue(key, 0, 1, val));
+    EXPECT_EQ(-1, testOnlyCompressionWorkersEnqueueRaw(val, 0));
     sdsfree(key);
     sdsfree(val);
 }
@@ -229,7 +230,7 @@ TEST_F(CompressionWorkersTest, SingleJobRoundTrip) {
     sds key = sdsnew("mykey");
     sds val = sdsnew("a moderately compressible value goes here");
 
-    EXPECT_EQ(0, compressionWorkersEnqueue(key, 0, 42, val));
+    EXPECT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     /* The placeholder worker just passes through; we should see it
      * surface on the outbox very quickly. */
@@ -255,7 +256,7 @@ TEST_F(CompressionWorkersTest, BurstOf256JobsOneWorker) {
     for (int i = 0; i < kCount; i++) {
         keys[i] = sdsnew("k");
         vals[i] = sdsnew("v");
-        EXPECT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+        EXPECT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
     }
 
     EXPECT_EQ(kCount, drainUntil(kCount, /*deadline_ms=*/2000));
@@ -280,7 +281,7 @@ TEST_F(CompressionWorkersTest, BurstOf1024JobsFourWorkers) {
     for (int i = 0; i < kCount; i++) {
         keys[i] = sdsnew("k");
         vals[i] = sdsnew("v");
-        EXPECT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+        EXPECT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
     }
 
     EXPECT_EQ(kCount, drainUntil(kCount, /*deadline_ms=*/3000));
@@ -338,7 +339,7 @@ TEST_F(CompressionWorkersTest, ResizeToZeroDisablesPool) {
     /* Pool initialized but no workers — enqueue must reject. */
     sds key = sdsnew("k");
     sds val = sdsnew("v");
-    EXPECT_EQ(-1, compressionWorkersEnqueue(key, 0, 1, val));
+    EXPECT_EQ(-1, testOnlyCompressionWorkersEnqueueRaw(val, 0));
     sdsfree(key);
     sdsfree(val);
 
@@ -386,7 +387,7 @@ TEST_F(CompressionWorkersTest, ResizeAcrossEnqueuedJobs) {
     for (int i = 0; i < kCount; i++) {
         keys[i] = sdsnew("k");
         vals[i] = sdsnew("v");
-        EXPECT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+        EXPECT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
     }
 
     /* Some unknown number have surfaced by now. Drain them. */
@@ -584,7 +585,7 @@ TEST_F(CompressionWorkersTest, RealCompressionRoundTrip) {
     }
     sds key = sdsnew("k1");
     sds val = sdsnewlen(source.data(), source.size());
-    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 42, val));
+    ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     /* Wait for the worker to deliver. Poll the testing accessor; it
      * doesn't free, so we can inspect. */
@@ -647,7 +648,7 @@ TEST_F(CompressionWorkersTest, NetSavingsGuardRejectsIncompressible) {
 
     sds key = sdsnew("k1");
     sds val = sdsnewlen(source.data(), source.size());
-    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 1, val));
+    ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     /* Drain through the production handler — guard logic exercised. */
     EXPECT_EQ(1, drainUntil(1, /*deadline_ms=*/2000));
@@ -669,7 +670,7 @@ TEST_F(CompressionWorkersTest, NoActiveDictMarksJobNotCompressed) {
 
     sds key = sdsnew("k1");
     sds val = sdsnew("any value");
-    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 1, val));
+    ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     void *jobs[1];
     int got = 0;
@@ -719,7 +720,7 @@ TEST_F(CompressionWorkersTest, CompressionFromMultipleWorkersIsConsistent) {
         sources[i] = std::move(s);
         keys[i] = sdsnew("k");
         vals[i] = sdsnewlen(sources[i].data(), sources[i].size());
-        ASSERT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+        ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
     }
 
     /* Drain everything via the testing accessor. The main thread's
@@ -844,7 +845,7 @@ TEST_F(CompressionWorkersTest, DecoderRoundTripsEncoder) {
     for (int i = 0; i < 20; i++) source += kCorpusSamples[i % kCorpusSampleCount];
     sds key = sdsnew("k1");
     sds val = sdsnewlen(source.data(), source.size());
-    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 42, val));
+    ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     void *jobs[1] = {nullptr};
     int got = 0;
@@ -967,7 +968,7 @@ TEST_F(CompressionWorkersTest, DecoderRejectsMissingDict) {
     for (int i = 0; i < 10; i++) source += kCorpusSamples[i % kCorpusSampleCount];
     sds key = sdsnew("k_missing_dict");
     sds val = sdsnewlen(source.data(), source.size());
-    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 1, val));
+    ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     void *jobs[1] = {nullptr};
     int got = 0;
@@ -1026,7 +1027,7 @@ TEST_F(CompressionWorkersTest, DecoderReusesScratchAcrossCalls) {
     for (int i = 0; i < 3; i++) {
         keys[i] = sdsnew("k");
         vals[i] = sdsnewlen(sources[i].data(), sources[i].size());
-        ASSERT_EQ(0, compressionWorkersEnqueue(keys[i], 0, (uint64_t)i, vals[i]));
+        ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
     }
 
     void *jobs[3] = {nullptr, nullptr, nullptr};
@@ -1098,7 +1099,7 @@ TEST_F(CompressionWorkersTest, DecoderAllocatesScratchOnFirstCall) {
     for (int i = 0; i < 10; i++) source += kCorpusSamples[i % kCorpusSampleCount];
     sds key = sdsnew("k_first_call");
     sds val = sdsnewlen(source.data(), source.size());
-    ASSERT_EQ(0, compressionWorkersEnqueue(key, 0, 99, val));
+    ASSERT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(val, 0));
 
     void *jobs[1] = {nullptr};
     int got = 0;

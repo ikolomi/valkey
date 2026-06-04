@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "compression.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -222,6 +223,10 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     signalKeyAsReady(db, key, val->type);
     notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
     *valref = val;
+    /* S2.7 write-path hook: enqueue eligible STRING values for
+     * background compression. No-op when the feature is disabled,
+     * the value is not eligible, or no active dictionary exists. */
+    compressionEnqueueCandidate(key, val, db->id);
 }
 
 void dbAdd(serverDb *db, robj *key, robj **valref) {
@@ -390,6 +395,15 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         decrRefCount(old);
     }
     *valref = new;
+    /* S2.7 write-path hook: enqueue eligible STRING values for
+     * background compression. Same no-op semantics as in dbAddInternal:
+     * disabled feature, ineligible value, or no active dict → no-op.
+     * Also: the recursive case where the new value IS already
+     * compressed (compressionInstall just ran on the drain side and is
+     * itself the caller of dbReplaceValue) is handled by the encoding
+     * filter inside the eligibility predicate — OBJ_ENCODING_COMPRESSED
+     * is not OBJ_ENCODING_RAW, so re-enqueueing is naturally suppressed. */
+    compressionEnqueueCandidate(key, new, db->id);
 }
 
 /* Replace an existing key with a new value, we just replace value and don't
