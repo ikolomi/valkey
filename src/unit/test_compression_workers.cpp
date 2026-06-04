@@ -871,8 +871,13 @@ TEST_F(CompressionWorkersTest, DecoderRoundTripsEncoder) {
 
     ASSERT_NE(u, nullptr);
     EXPECT_EQ(u, &view); /* helper returned the caller's stack robj */
-    EXPECT_EQ(OBJ_ENCODING_RAW, u->encoding);
-    EXPECT_EQ(OBJ_STRING, u->type);
+    /* Casts to int for the bitfield reads: u->encoding, u->type, and
+     * u->refcount are unsigned bitfields (server.h §robj). The OBJ_*
+     * macros are signed int literals (e.g. OBJ_ENCODING_RAW == 0).
+     * gcc/clang -Wsign-compare with -Werror flags the mixed-sign
+     * comparison; the cast aligns both sides to int. */
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)u->encoding);
+    EXPECT_EQ(OBJ_STRING, (int)u->type);
     EXPECT_EQ(OBJ_STATIC_REFCOUNT, (int)u->refcount);
 
     sds u_sds = (sds)objectGetVal(u);
