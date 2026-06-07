@@ -528,7 +528,7 @@ int testOnlyCompressionWorkersEnqueueRaw(sds src, int dbid) {
  * Returns 1 if installed, 0 if discarded due to staleness. Either way
  * caller still owns the pin (decrRefCount happens in the drain loop). */
 static int compressionInstall(compressionJob *job) {
-    serverDb *db = &server.db[job->dbid];
+    serverDb *db = server.db[job->dbid];
     sds key_sds = (sds)objectGetKey(job->value);
     int dict_index = getKVStoreIndexForKey(key_sds);
     void **slot = kvstoreHashtableFindRef(db->keys, dict_index, key_sds);
