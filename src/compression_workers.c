@@ -581,17 +581,19 @@ int compressionWorkersDrainOutbox(int budget) {
         for (size_t i = 0; i < got; i++) {
             compressionJob *job = jobs_out[i];
 
-            /* S2.5 drain handler: post-compression net-savings guard,
-             * then dispose. Real install (createCompressedObject +
-             * dbOverwrite + compressionRegistryIncRef + decrRefCount on
-             * the caller's value pin) lands with the write-path hook
-             * in S2.7; that PR will introduce a real production caller
-             * (dbAdd / dbOverwrite). For now the worker-pool plumbing
-             * runs end-to-end against test fixtures only, so we
-             * exercise the encoder + guard but not the install. The
-             * S2.5 round-trip tests use a peeking variant of drain
-             * (testOnlyCompressionWorkersDrainOutbox) that does NOT
-             * free the buffer, letting the test verify decompression. */
+            /* Production drain invariant: every job here must have a
+             * pinned robj. Tests using testOnlyCompressionWorkersEnqueueRaw
+             * (job->value == NULL) MUST extract their jobs via
+             * testOnlyCompressionWorkersDrainOutbox before this drain
+             * runs; reaching here with value==NULL means the test is
+             * structurally broken. Asserting up-front lets every
+             * branch below assume value != NULL. */
+            serverAssert(job->value != NULL);
+
+            /* Drain handler: post-compression net-savings guard, then
+             * install or dispose. Real install (createCompressedObject
+             * + dbReplaceValue + compressionRegistryIncRef + decrRefCount
+             * on the caller's value pin) is in compressionInstall(). */
             if (job->err != 0 || job->dst == NULL) {
                 /* Worker chose not to compress (no active dict yet) or
                  * ZSTD reported an error.
@@ -640,29 +642,19 @@ int compressionWorkersDrainOutbox(int budget) {
                      *     threshold → drives retraining. */
                     zfree(job->dst);
                 }
-                /* Net-savings guard accepted the compressed form. */
-                else if (job->value == NULL) {
-                    /* Test path (testOnlyCompressionWorkersEnqueueRaw):
-                     * no real kvstore install. Tests that need the
-                     * compressed buffer extract via
-                     * testOnlyCompressionWorkersDrainOutbox before the
-                     * production drain runs; if a job with value==NULL
-                     * reaches here it means the test forgot to extract
-                     * — dispose to avoid leaking, but the test is
-                     * structurally broken. */
-                    zfree(job->dst);
-                } else {
-                    /* Production install. compressionInstall handles
-                     * staleness check, dbReplaceValue, registry ref
-                     * bump. Always consumes job->dst (either installed
-                     * via createCompressedObject or zfree'd on stale). */
+                /* Net-savings guard accepted: install. compressionInstall
+                 * handles the staleness check (pointer equality vs
+                 * job->value), dbReplaceValue, and the registry ref bump.
+                 * Always consumes job->dst (either via
+                 * createCompressedObject on success, or zfree on stale). */
+                else {
                     compressionInstall(job);
                 }
             }
 
-            /* Release the caller's pin. For test-mode jobs (value==NULL)
-             * there's nothing to release. */
-            if (job->value != NULL) decrRefCount(job->value);
+            /* Release the caller's pin. Production-enqueued jobs always
+             * have a real robj pin per the assert above. */
+            decrRefCount(job->value);
             zfree(job);
 
             total++;

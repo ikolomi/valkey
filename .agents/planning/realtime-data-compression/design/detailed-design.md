@@ -566,15 +566,15 @@ Job structure:
 
 ```c
 typedef struct compressionJob {
-    robj         *key;         /* key name, used to resolve robj later */
-    int           dbid;
-    uint64_t      version;     /* robj version counter; detects concurrent rewrites */
-    sds           src;         /* value sds at enqueue time (held via incrRefCount).
-                                  The worker reads sdslen(src) to get the length — no
-                                  separate src_len needed, and safe across threads
-                                  because the immutable-snapshot invariant (R2.4.4)
-                                  guarantees the sds metadata bytes are not mutated
-                                  while the worker holds the reference. */
+    /* Set by Enqueue. The value's address is captured here so the
+     * drain handler can do a pointer-equality stale check; this is
+     * ABA-safe because the caller's incrRefCount(value) reserves the
+     * robj address for the job's lifetime — see "Concurrency notes"
+     * below. */
+    robj         *value;       /* pinned via incrRefCount(value); main thread only */
+    sds           src;         /* aliases objectGetVal(value) at enqueue;
+                                  worker reads bytes here (R2.4.4) */
+    int           dbid;        /* main thread only — for kvstore lookup */
     /* filled by worker: */
     uint32_t      dict_id;     /* dict_id of the dict the worker used (loaded at
                                   compress time from the active pointer); carried into
@@ -592,7 +592,7 @@ typedef struct compressionJob {
 
 **Concurrency notes**:
 - Enqueue holds `incrRefCount(val)` so the sds pointer stays valid for the worker **and** the object has `refcount >= 2`, which forces any subsequent mutating command to COW instead of mutating in place (Valkey's `dbUnshareStringValue` discipline — see R2.4.4 and R2.4.5 for the invariant and its enforcement).
-- On the outbox side, the main thread re-fetches the current `robj` for the key; if it has changed (version counter moved), the compressed result is discarded.
+- On the outbox side, the main thread re-fetches the current `robj *` for the key (via `kvstoreHashtableFindRef`) and compares it by **pointer equality** with `job->value`. Different pointer ⇒ value was overwritten / expired / COW'd; discard. Same pointer ⇒ install. Pointer equality is **ABA-safe** here because the caller's `incrRefCount(value)` keeps the old robj alive (refcount stays ≥ 1 even when the kvstore reference is dropped), which means the allocator cannot return that address from a future `zmalloc` until our pin is released. So a "same pointer at the slot" outcome is decisive — it can only mean the value is unchanged.
 - `decrRefCount(val)` is called after the outbox handler finishes. This drops the refcount back to 1 and restores in-place-mutate eligibility for future commands.
 - The worker loads the active dict pointer atomically at compress time (not at enqueue time). The dict pointer is guaranteed valid by the QSBR grace-period model (§4.4) — the dict cannot be freed until all workers have reported a quiescent state after retirement.
 - After compression (regardless of success or error), the worker calls `compressionWorkerReportQuiescent()` to advance its generation counter. This is the single synchronization obligation of the worker.
