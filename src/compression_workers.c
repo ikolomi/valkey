@@ -711,6 +711,30 @@ void testOnlyCompressionWorkersFreeJob(void *job_ptr) {
     zfree(job);
 }
 
+/* Drain up to `budget` jobs from the outbox and dispose them — used
+ * by tests that don't care to inspect each job's buffer, only to
+ * verify "N jobs surfaced". Equivalent to the production drain's
+ * dispose-after-install path, but skips the install (test-mode jobs
+ * have job->value == NULL — the production drain asserts non-NULL,
+ * so tests must not call compressionWorkersDrainOutbox on
+ * test-enqueued jobs). Returns the number of jobs disposed. */
+int testOnlyCompressionWorkersDrainAndDispose(int budget) {
+    if (!pool.initialized || budget <= 0) return 0;
+    void *jobs[64];
+    int total = 0;
+    while (total < budget) {
+        int batch = budget - total;
+        if (batch > 64) batch = 64;
+        int got = testOnlyCompressionWorkersDrainOutbox(jobs, batch);
+        if (got == 0) break;
+        for (int i = 0; i < got; i++) {
+            testOnlyCompressionWorkersFreeJob(jobs[i]);
+        }
+        total += got;
+    }
+    return total;
+}
+
 /* Project the file-private compressionJob into the caller-provided
  * fields. The caller's struct shape is defined in the gtest test code;
  * we pass field pointers individually here so this function does not
