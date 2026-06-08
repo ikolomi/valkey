@@ -191,6 +191,8 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     **Memory bound.** Peak memory during an event-loop iteration that touches N compressed keys: sum of N uncompressed sizes (the temp sds allocations) plus the compressed buffers (still alive in the side-map). Both forms exist simultaneously. The bound: **at most the uncompressed dataset size — i.e., the same memory the dataset would use if compression were disabled.** No additional cap is needed; the feature cannot make memory worse than the no-compression baseline.
 
+    **Deferred-pointer-capture sites within the lookupKey-routed path.** A small number of code paths capture a pointer derived from `val_ptr` into a structure that persists across the event-loop boundary, most notably `_addBulkStrRefToBufferOrList` (the bulk-reply zero-copy path used by `tryAvoidBulkStrCopyToReply`). For these sites the transient-view model would otherwise produce a use-after-free at IO-thread write time. The fix is to force-copy on bulk replies when the robj is in the transient-view side-map: `isCopyAvoidPreferred` returns 0 via a `transientViewActive(obj)` predicate (O(1) hashtable lookup keyed by robj pointer). See Appendix E.7 for the full audit and resolution; the implementation lands with the side-map (PR 2 of the S2.8 split).
+
     **Sites that bypass `lookupKey*` and need explicit decompression.** Three out-of-process or special paths do not benefit from the lookupKey-level centralization:
     - AOF rewrite child (`rewriteAppendOnlyFileRio`) — iterates kvstore directly via `kvstoreIteratorNext`; fork-time snapshot. Calls `objectGetUncompressedView` explicitly.
     - RDB save for replication full-sync (R2.6.8) — same iteration pattern; explicit decompression.
@@ -1172,3 +1174,36 @@ That text was a placeholder that did not yet account for the codebase-sweep find
 3. Preserving all original requirements (R2.5.1, R2.5.2, R2.5.3, R2.5.6).
 
 The chosen model is therefore an **implementation-time refinement** of the original design intent, not a deviation from it.
+
+### E.7 Deferred-capture audit
+
+The Appendix E sweep enumerated **synchronous byte readers** — sites that match `sdslen(objectGetVal(o))` and consume bytes within the same command frame. The transient-view model is correct for those sites by construction (the temp sds is alive for the duration of the command).
+
+This sub-section documents an additional class of consumers: **deferred byte readers** — sites that capture a pointer derived from `val_ptr` into a structure that survives across event-loop boundaries. Such sites can dereference a freed temp sds after `compressionBeforeSleep()` restores the compressed view, unless explicitly handled.
+
+#### E.7.1 Deferred-capture sites in core Valkey
+
+| Site | Mechanism | Resolution under the transient view |
+|---|---|---|
+| `_addBulkStrRefToBufferOrList` (`networking.c`) | Stores `bulkStrRef = {.obj, .str = objectGetVal(obj)}` in `c->reply` for the IO thread to dereference at write time. Activated by `tryAvoidBulkStrCopyToReply` whenever `isCopyAvoidPreferred(c, obj)` returns true (large strings or IO threads enabled). | **Force-copy** when the value is in the transient-view side-map. `isCopyAvoidPreferred` is extended to call `transientViewActive(obj)` (O(1) side-map lookup keyed by robj pointer); if true, return 0 → fall back to the memcpy path. The bytes land in `c->reply` independent of `val_ptr`, so the temp sds can be safely freed at `beforeSleep`. Cost: one memcpy per bulk reply of a compressed value, bounded by `compression-max-value-size` (128 KiB → ~30 µs at memory bandwidth). |
+| Module API: `VM_StringPtrLen`, `VM_StringDMA`, `VM_RetainKey` | Returns/retains a pointer derived from `val_ptr`. Modules MAY hold this across event-loop yields. | **Pre-existing module API contract** — the doc-comments for these symbols document the lifetime as "valid until the next event-loop yield" or "until the robj is freed/decRef'd". Modules that respect the contract are compatible with the transient-view model (they re-fetch via a fresh `VM_StringDMA` after re-entry). The transient-view model does not introduce a new requirement; modules that violate the contract were already at risk pre-feature (e.g., a key deleted/expired between yields would free the bytes regardless of compression). |
+
+#### E.7.2 Deferred-capture sites investigated and confirmed safe
+
+| Site | Why it's safe |
+|---|---|
+| `feedReplicationBufferWithObject` → `feedReplicationBuffer` | `memcpy`s into replication backlog blocks. Bytes are copied. Additionally, only called with `argv[j]` and synthetic `selectcmd` robjs — never with kvstore values. |
+| `feedAppendOnlyFile` | Uses `sdscatlen` to append to `aof_buf`. Bytes are copied. Only called with `argv` — never with kvstore values. |
+| `addReplyBulkSds`, `addReplyBulkCBuffer`, `addReplyBulkCString`, all `_addReplyToBufferOrList` callers | Use `_addReplyToBuffer` which `memcpy`s into the reply buffer. Bytes are copied. |
+| `dumpCommand`, `migrateCommand` | Synchronously serialize the value into a `rio` buffer, then send via `addReplyBulkSds` (copy path). R2.6.7 already requires DUMP/MIGRATE to decompress before serializing, so the transient-view model's synchronous coverage is sufficient. |
+| AOF rewrite child / RDB save (replication full-sync) | Forked child process, iterates kvstore directly. Already requires explicit `objectGetUncompressedView` calls per E.2; the transient-view model does not apply (different process). |
+| Lazy free | Operates on a full robj that the kvstore has already dropped (refcount path). Doesn't capture a pointer-into-val_ptr. |
+
+#### E.7.3 Implementation summary for PR 2 (S2.8 activate)
+
+When PR 2 implements the side-map + lookupKey decompression, it MUST also:
+
+1. Define `transientViewActive(robj *obj)` — returns 1 iff `obj` is in the side-map. O(1) hashtable lookup keyed by robj pointer.
+2. Extend `isCopyAvoidPreferred(client *c, robj *obj)` to return 0 when `transientViewActive(obj)` is true.
+
+The skeleton CR (PR 1) does not need this — `compressionBeforeSleep()` is a no-op stub and no robj is ever in transient state.

@@ -141,6 +141,14 @@ void compressionBeforeSleep(void) {
      *     free saved compressed buffer, decRef the orphan).
      *   - Drop the pin in either case.
      *
+     * PR 2 must ALSO implement the deferred-capture fix per Appendix E.7:
+     *   - Define transientViewActive(robj *obj) — O(1) side-map presence check.
+     *   - Extend isCopyAvoidPreferred() in networking.c to return 0 when
+     *     transientViewActive(obj) is true. This forces the memcpy reply
+     *     path for transiently-decompressed values, avoiding a use-after-
+     *     free in the IO thread that would otherwise dereference a freed
+     *     temp sds via bulkStrRef.
+     *
      * For the skeleton (PR 1) the function is a no-op. The hook into
      * beforeSleep is established here so PR 2 can ship the lookupKey-side
      * decompression + side-map population without touching server.c again. */
