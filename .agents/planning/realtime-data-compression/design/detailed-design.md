@@ -19,6 +19,7 @@ _Source issue: [valkey-io/valkey #3423](https://github.com/valkey-io/valkey/issu
 9. [Appendix B — Research findings summary](#appendix-b--research-findings-summary)
 10. [Appendix C — Alternative approaches considered](#appendix-c--alternative-approaches-considered)
 11. [Appendix D — Explicit v1 non-goals and v2 roadmap](#appendix-d--explicit-v1-non-goals-and-v2-roadmap)
+12. [Appendix E — Read-path decompression: design exploration](#appendix-e--read-path-decompression-design-exploration)
 
 ---
 
@@ -150,21 +151,54 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 ### 2.5 Decompression path
 
 - **R2.5.1** All decompression is **synchronous on the main thread** in v1. No worker-side decompression path exists. (Q7)
-- **R2.5.2** A single helper function `robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out)` is the **only** entry point for getting uncompressed bytes from a value:
+- **R2.5.2** A single helper function `robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out)` is the **only** decoder primitive in v1:
   - If `o->encoding != OBJ_ENCODING_COMPRESSED`: returns `o` unchanged. `*scratch` and `*view_out` are NOT touched. Zero cost.
   - Otherwise: looks up the dictID in the registry, calls `ZSTD_decompress_usingDDict` into the caller-provided `*scratch` sds (allocated/grown as needed), populates `*view_out` (caller-provided storage; typically stack-allocated, marked `OBJ_STATIC_REFCOUNT`) to wrap the decompressed bytes, and returns `view_out`.
   - Returns `NULL` on any failure (corrupt header, missing dict, ZSTD error). Caller logs / increments `compression_errors_total` and translates to a client-visible error.
   - Rationale for the `view_out` out-parameter (vs returning a heap robj): keeps every read of every compressed value off the allocator hot path. Stack-allocated `robj` + `OBJ_STATIC_REFCOUNT` matches the existing `initStaticStringObject` pattern in `server.h`.
+
+  **In v1 the helper is called from inside `lookupKey*`** when the caller passes the `LOOKUP_READ_BYTES` flag; this implements the transient-view model (R2.5.7). A small set of paths that bypass lookupKey (AOF rewrite child, RDB save for replication full-sync, R2.6.8) call the helper directly. The helper itself is unchanged across these call sites — the centralization is in *who* calls it, not in *how* it works.
 - **R2.5.3** The helper **must not** call `signalModifiedKey`. (Q11)
 - **R2.5.4** `compression-max-value-size` (default `131072` bytes = 128 KiB, `0` = no bound) excludes values large enough that their main-thread decompression cost is not worth the memory win, keeping per-read decompression latency within the event-loop budget. (Q7)
 - **R2.5.5** **Per-read decompression cost is proportional to value size** (~1 µs/KB at ZSTD level 3 with dictionary). **Multi-key commands pay the sum of per-value costs**, with no per-command cap — by design: a per-command cap would either break transparency (error mid-command) or defeat its own purpose (block). v1 is tuned for the small/moderate-value sweet spot (256 B – 8 KB). Workloads that routinely read many compressed values per command (wide `MGET`, long `SORT`, scripts touching many keys, heavy pipelines over large values) should benchmark before enabling; their remedies are (a) raise `compression-min-value-size` or lower `compression-max-value-size` to exclude the large values, or (b) wait for v2 async decompression. (Q7)
-- **R2.5.6** **Compression decisions are not reconsidered post-compression in v1.** Once a value is compressed, it remains compressed for its lifetime, regardless of subsequent access pattern. The eligibility filter (R2.2) skips recently-accessed values at compression-attempt time, but provides no inverse path: a key that was cold when compressed and later becomes read-hot will pay sustained sync decompression CPU on the main thread for every read.
+- **R2.5.6** **Compression decisions are not reconsidered post-compression in v1.** Cold values remain compressed across read cycles — the transient-view model (R2.5.7) preserves this property by restoring the compressed form at every event-loop boundary via a free pointer-swap. The transient model also amortizes per-read CPU within an iteration: when a compressed key is read N times during a single event-loop iteration, only one decompression occurs (the first read flips encoding to RAW for the iteration; subsequent reads consume the same RAW view; restoration at `beforeSleep` reverts encoding via pointer-swap with no compression cost).
+
+    The eligibility filter (R2.2) skips recently-accessed values at compression-attempt time, but provides no inverse path: a key that was cold when compressed and later becomes read-hot will pay sustained per-iteration decompression CPU on the main thread for every iteration that touches it.
 
     Natural pressure-relief exists for keys that get **written** after compression: `dbOverwrite` installs a fresh uncompressed robj, and partial-write commands (`APPEND`, `SETRANGE`, bit operations, module DMA-write per R2.7.6) decompress in place before mutating (the COW-invariant audit list in R2.4.5 enumerates the call sites). Read-only-hot keys have no equivalent demotion trigger.
 
-    Worst-case per-read cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can run `COMPRESSION SWEEP direction=decompress` to drop all compressed frames and restart eligibility evaluation.
+    Worst-case per-iteration decompression cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can run `COMPRESSION SWEEP direction=decompress` to drop all compressed frames and restart eligibility evaluation.
 
     Auto-demotion of read-hot compressed values is explicit v2 scope (Appendix D — "Read-hot compressed value auto-demotion"). The v1 ship gate is that the cost is **bounded** (R2.5.4) and **observable** (R2.10.2); operator action remains the only demotion path.
+
+- **R2.5.7** **Transient decompression model.** Sub-section §2.5.1–§2.5.6 describes *what* decompression looks like to callers. R2.5.7 specifies *where* it is integrated into the read path. The single decoder helper (R2.5.2) is called from inside `lookupKey*` when the caller passes the new `LOOKUP_READ_BYTES` flag. The lookupKey path then:
+
+    1. Decompresses the value into a freshly-allocated **temp uncompressed sds**.
+    2. Saves the original compressed buffer pointer in a per-server **decompression side-map**, keyed by the robj address.
+    3. `incrRefCount(o)` to pin the robj for the duration of the transient state.
+    4. Replaces `o->val_ptr` with the temp sds and flips `o->encoding` from `OBJ_ENCODING_COMPRESSED` to `OBJ_ENCODING_RAW`.
+    5. Returns `o` — every caller downstream sees a normal RAW string robj, with no awareness of compression.
+
+    The compressed form is restored at the next event-loop boundary. The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map:
+
+    - For each entry, re-fetch the kvstore slot for the key.
+    - If `slot->value == o` (the pinned robj is still in the slot, unchanged), restore via pointer swap: free temp sds, restore compressed buffer to `val_ptr`, flip encoding back to `OBJ_ENCODING_COMPRESSED`. **This is O(1) per entry with no decompression or compression cost** — the compressed bytes never went away, we just had val_ptr point at the temp sds during the iteration.
+    - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, free the saved compressed buffer, decrement the pin (which may free the orphaned robj).
+
+    **Mutation-detection invariant.** The pin (`refcount = 2`) forces any subsequent mutating command to honor the `dbUnshareStringValue` discipline (R2.4.4), creating a fresh robj that replaces the kvstore slot. The original (transient) robj is left intact for restoration; the slot now points elsewhere — detected at restoration time via pointer comparison. **No mutation-time hook is needed in any byte-mutating site.** This is the same staleness mechanism used by the write-path drain handler (R2.4.3 / §4.6).
+
+    **ABA safety.** The pin keeps the original robj address reserved by the allocator for the duration of the transient state. A subsequent mutation creates a new robj at a different address. Pointer comparison at restoration time is therefore decisive (same property as the dict-lifetime invariant in §4.4 and the write-path stale check in §4.6).
+
+    **Memory bound.** Peak memory during an event-loop iteration that touches N compressed keys: sum of N uncompressed sizes (the temp sds allocations) plus the compressed buffers (still alive in the side-map). Both forms exist simultaneously. The bound: **at most the uncompressed dataset size — i.e., the same memory the dataset would use if compression were disabled.** No additional cap is needed; the feature cannot make memory worse than the no-compression baseline.
+
+    **Sites that bypass `lookupKey*` and need explicit decompression.** Three out-of-process or special paths do not benefit from the lookupKey-level centralization:
+    - AOF rewrite child (`rewriteAppendOnlyFileRio`) — iterates kvstore directly via `kvstoreIteratorNext`; fork-time snapshot. Calls `objectGetUncompressedView` explicitly.
+    - RDB save for replication full-sync (R2.6.8) — same iteration pattern; explicit decompression.
+    - Disk RDB write (R2.6.1) — emits compressed bytes + AUX dict directly; **no decompression needed**.
+
+    The replication feed (`feedReplicationBufferWithObject` in `src/replication.c`) operates on `argv` arguments and synthetic SELECT robjs — never on kvstore values. **No decompression needed.** AOF append (steady-state) likewise propagates command argv, not kvstore values.
+
+    **`LOOKUP_READ_BYTES` flag plumbing.** Most lookupKey* callers read value bytes; the few that don't (introspection: `OBJECT ENCODING`, `DEBUG OBJECT`; eviction sampler; active-expiry) explicitly opt out by omitting the flag. This preserves the operator-visible encoding (compressed values appear as `compressed` to introspection commands) and avoids unnecessary decompression CPU on metadata-only paths.
 
 ### 2.6 Persistence
 
@@ -327,7 +361,7 @@ graph TB
 
 All feature integration happens at a small, well-defined set of seams:
 
-- **Read path** (`lookupKey*` in `src/db.c`): every type-command handler already funnels through this. Handlers that read value bytes (`getCommand`, `appendCommand`, etc.) call `objectGetUncompressedView` to get a decompressed view.
+- **Read path** (`lookupKey*` in `src/db.c`): every type-command handler already funnels through this. Handlers that read value bytes pass `LOOKUP_READ_BYTES`; the lookup helper transparently decompresses (transient-view model — R2.5.7). `objectGetUncompressedView` remains the single decoder primitive (R2.5.2) but is invoked from inside the lookupKey path for centralized control. Three out-of-process paths bypass this hook (AOF rewrite child, RDB save for replication full-sync, worker threads) and call the helper explicitly.
 - **Write path** (`dbAddInternal`, `dbSetValue`, `dbOverwrite` in `src/db.c`): on insert/overwrite, check eligibility and enqueue on the candidate inbox. Compression itself happens later, off-thread.
 - **Replication feed** (`feedReplicationBufferWithObject` in `src/replication.c`): routes through `objectGetUncompressedView`.
 - **AOF writer**: routes through `objectGetUncompressedView`.
@@ -381,7 +415,7 @@ All new source files live under `src/`. Every `.c` is registered in **both** `sr
 | `src/server.c` | Call `compressionInit` at startup; wire `compressionCron` into `serverCron`; wire `compressionAfterSleep` into the event-loop `afterSleep` hook; add `infoCompression` to `genValkeyInfoString`. |
 | `src/object.c` | `createCompressedObject`; `freeStringObject` frees compressed buffers correctly; `OBJECT ENCODING` returns `"compressed"`. |
 | `src/config.c` | Register `compression-*` configs; register `compression_cpulist`. |
-| `src/db.c` | `lookupKey*` does not call the decompression helper itself — that is done by the type-command handlers. `dbAddInternal`, `dbSetValue`, `dbOverwrite` call `compressionEnqueueCandidate(obj)` after the new value is installed. |
+| `src/db.c` | `lookupKey*` accepts a new `LOOKUP_READ_BYTES` flag. When set on a compressed value, decompresses transparently into a temp sds and registers the robj in the per-server transient-view side-map (see §2.5.7). `dbAddInternal`, `dbSetValue`, `dbOverwrite` call `compressionEnqueueCandidate(obj)` after the new value is installed. |
 | `src/t_string.c` | `getCommand`, `appendCommand`, `strlenCommand`, `getrangeCommand`, `setrangeCommand` etc. route through `objectGetUncompressedView` for reads and decompress-in-place for writes on compressed values. |
 | `src/replication.c` | `feedReplicationBufferWithObject` routes through `objectGetUncompressedView`. |
 | `src/aof.c` | `feedAppendOnlyFile` path routes through `objectGetUncompressedView`. |
@@ -1022,3 +1056,119 @@ Deferred to **v2** as a targeted optimization: speculative pre-decompression for
 | Primary↔replica dictionary synchronization | Yes | Not planned — independent operation is the intended model. |
 
 **Headline scope statement:** v1 ships compression for `OBJ_STRING` values only, with synchronous decompression on the main thread, one active dictionary per server, self-trained by a keyspace-scan job on `bio`, with explicit operator controls (`COMPRESSION` subcommands + `compression-*` configs). All other value types, async decompression, adaptive behaviors, and cluster-level dictionary coordination are explicit v2 scope.
+
+
+---
+
+## Appendix E — Read-path decompression: design exploration
+
+When the read path was implemented (S2.8 in `implementation/plan.md`), three integration strategies for `objectGetUncompressedView` were systematically considered. This appendix records the analysis and rationale for the **transient view** model (R2.5.7). It is preserved for future readers and contributors who may revisit the trade-off.
+
+### E.1 The three approaches
+
+| | Description |
+|---|---|
+| **Approach 1 — per-site decompression** | Compressed values "leak" out of `lookupKey*`. Every site that reads value bytes inserts an explicit `objectGetUncompressedView` (or `objectDecompressInPlace` for write-then-modify) call. The design's original literal text in §3.2 corresponded to this approach. |
+| **Approach 2 — decompress in place forever** | `lookupKey*` decompresses on access and replaces the kvstore robj's `val_ptr` with the uncompressed sds, flipping encoding to RAW permanently. The compressed buffer is freed. The robj is permanently uncompressed until the sweep eventually re-compresses it. |
+| **Approach 3 — transient view (chosen)** | `lookupKey*` decompresses transiently for the duration of the event-loop iteration; restoration at `beforeSleep` via pointer swap (free of CPU cost). See R2.5.7. |
+
+### E.2 Codebase sweep findings
+
+A systematic sweep of `src/` was performed to quantify the surface for each approach.
+
+**Sites that read STRING bytes via `sdslen(objectGetVal())`:**
+
+| File | Sites |
+|---|---|
+| t_string.c | 4 |
+| bitops.c | 5 |
+| module.c | 18 |
+| sort.c | 2 |
+| hyperloglog.c | 7 |
+| db.c | 3 |
+| rdb.c | 3 |
+| aof.c | 3 |
+| replication.c | 5 |
+| debug.c | 4 |
+| object.c | 8 |
+| **total** | **~62** |
+
+This is the leakage surface for approach 1. Even one missed site creates silent corruption.
+
+**`addReplyBulk(c, robj*)` centralization candidate:** only 4 sites in t_string.c. Catches GET / MGET / GETEX / GETDEL / GETSET. **Does not catch:** `GETRANGE` (uses `addReplyBulkCBuffer` post-slice), `STRLEN` (uses `addReplyLongLong`), `LCS` (uses `addReplyBulkCBuffer`), all bitops, SORT, module API, debug introspection. Insufficient as a single seam — refutes the initial intuition that "addReplyBulk centralization covers most reads."
+
+**Mutation paths (`dbUnshareStringValue` callers):** 9 sites total, concentrated in t_string.c (2), bitops.c (1), hyperloglog.c (4), module.c (2). All are already in the R2.4.5 audit list — no new audit surface is introduced by the read path.
+
+**Paths that bypass `lookupKey*`:**
+
+- `feedReplicationBufferWithObject` (replication.c) — operates on `argv` arguments and synthetic SELECT robjs; **never reads kvstore values**. Eliminated from concern.
+- AOF rewrite child (`rewriteAppendOnlyFileRio`) — iterates kvstore directly via `kvstoreIteratorNext`. Fork-time snapshot. **Needs explicit decompression in child** under all 3 approaches.
+- RDB save for replication full-sync (R2.6.8) — same iteration pattern. **Needs explicit decompression** under all 3 approaches.
+- RDB save to disk (R2.6.1) — writes compressed bytes + AUX dict directly. **No decompression needed**.
+
+**Defrag interaction (option 3):** `defrag.c` walks robjs and relocates allocations reachable via `val_ptr`. Under the transient-view model, the temp uncompressed sds (currently val_ptr) is correctly relocated and the val_ptr update is automatic. The saved compressed buffer in the side-map is **not reachable from any robj's val_ptr** during the transient state, so defrag does not see it as a candidate for relocation — it stays put. Verified safe.
+
+**Module API contract (option 3):** `RM_StringDMA` is documented to return a pointer valid until the next event-loop yield. Modules that respect the contract are compatible with the transient model — the temp sds lives across the command, gets restored at beforeSleep. `RM_RetainKey` retains the robj reference; bytes must be re-fetched via a fresh `RM_StringDMA` after re-entry.
+
+### E.3 Trade-off matrix
+
+| Property | Approach 1 | Approach 2 | Approach 3 (chosen) |
+|---|---|---|---|
+| Sites changed | ~30 (5–10 lines each) | ~1 + 2 explicit | ~5 + ~30 flag annotations + 2 explicit |
+| Lines of code | 150–300 scattered | ~50 localized | ~250 in 3 files |
+| **Leak risk** | High (62 audit sites) | None | None for lookupKey paths |
+| **R2.5.6 preserved** | Yes | **No** — read-hot keys lose compression permanently | Yes |
+| Memory savings on read-hot keys | Yes | **Lost** | Yes |
+| `MEMORY USAGE` consistent | Yes | **No** — changes after first GET | Yes |
+| `OBJECT ENCODING` consistent | Yes | **No** — changes after first GET | Yes |
+| Sweep treadmill | No | **Yes** — read-hot keys cycle decompress→sweep→compress | No |
+| CPU per repeat-read in same loop iteration | N decompresses for N reads | 0 (after first) | 1 decompress + 1 free restore |
+| Memory peak during loop | Low | Low | Bounded by uncompressed-baseline |
+| Defrag impact | None | None | None (verified) |
+| Module API compat | Yes | Yes | Yes (with documented contract) |
+| Out-of-process work required | AOF rewrite, RDB-rep | AOF rewrite, RDB-rep | AOF rewrite, RDB-rep |
+
+The "out-of-process work" row is identical across all three approaches and not a differentiator.
+
+### E.4 Why approach 3 was chosen
+
+1. **Leak-proof by construction.** The lookupKey-level hook covers every command path, script, transaction, module DMA, debug surface, and replication propagation transparently. Only 2 well-defined out-of-process sites need explicit wiring. Approach 1's 62-site audit is a continuous correctness liability across future contributions.
+
+2. **Preserves R2.5.6 — memory savings on read-hot keys.** The transient model restores compressed form at every event-loop boundary via a pointer swap. Cold values stay compressed across reads. Only mutated values (which lose compressed form by definition under any approach) get permanently un-compressed.
+
+3. **Free restoration.** The "restore" is a pointer swap, not a re-compression: `o->val_ptr = saved_compressed_buffer; o->encoding = COMPRESSED; sdsfree(temp_sds)`. No `ZSTD_compress_usingCDict` call. The compressed bytes never went away — val_ptr just pointed at the temp sds during the iteration.
+
+4. **Bounded memory inflation.** Worst-case peak memory during an event-loop iteration = compressed buffers (still alive in side-map) + temp uncompressed sds for each touched key. The bound: **at most the uncompressed dataset size** — i.e., the same memory the dataset would use if compression were disabled. No arbitrary cap is needed; the feature cannot make memory worse than the no-compression baseline.
+
+5. **Reuses existing v1 invariants.** No new fundamental mechanism is introduced:
+   - **R2.4.4** (refcount > 1 → COW via `dbUnshareStringValue`): pre-existing invariant. The transient model's pin (`incrRefCount(o)`) makes it apply automatically — mutating commands COW into a fresh robj, leaving the transient robj intact for restoration. **Mutation detection is free** at beforeSleep via pointer comparison.
+   - **PR #19's pointer-equality stale check** (write-path drain): already a working primitive in `compressionInstall`. The same pattern detects "robj displaced from kvstore slot" at restoration time.
+   - **R2.5.2 single decoder helper** (`objectGetUncompressedView`): unchanged. The transient model just calls it from inside lookupKey instead of from each handler.
+
+6. **Operationally clean introspection.** `OBJECT ENCODING` and `DEBUG OBJECT` opt out of `LOOKUP_READ_BYTES` (they don't need bytes; they read encoding metadata) and continue to report the truthful "compressed" state. `MEMORY USAGE` is unchanged (returns compressed footprint via `zmalloc_size`). No operator-visible surprises.
+
+### E.5 Limitations and notes for future work
+
+- **Module API contract clarification.** `RM_StringDMA` returns a pointer valid until the next event-loop yield; modules retaining pointers across yields must re-fetch via a new DMA call. This is already the documented contract — the transient model just makes it strictly enforced rather than informally honored.
+
+- **Long Lua scripts and `MULTI`/`EXEC`.** Within a script or transaction, `beforeSleep` does not fire — the side-map accumulates for the duration of the script. Bounded by uncompressed-baseline (E.3 / R2.5.7). No special handling needed.
+
+- **AOF rewrite child** and **RDB save for replication full-sync** still require explicit `objectGetUncompressedView` calls in the iteration loop. These are S3.1/S3.3 work (persistence subsystem), not S2.8.
+
+- **Worker threads** (compression workers) never touch `robj` per R2.11.4 — they consume flat byte buffers via `job->src` aliasing. The transient model is irrelevant to them.
+
+- **Fork interaction** (BGSAVE/BGREWRITEAOF). If the child forks during an iteration where keys are temporarily uncompressed (mid-loop), the child's snapshot has uncompressed val_ptr for those specific keys. The child writes them in uncompressed form to its output (RDB or AOF rewrite). This is a correctness-preserving inefficiency — the bytes are valid; only the on-disk encoding for the affected keys is suboptimal. In practice the touched-set is a small fraction of the keyspace at any instant; not a measurable issue for typical workloads.
+
+- **Auto-demotion of read-hot keys** is explicit v2 scope (Appendix D). The transient model preserves the compressed form regardless of read frequency — cold keys stay compressed forever. Future work could add an opt-in "demote on heavy read" path that promotes the transient state to permanent decompression after a threshold; the side-map already has the data needed to make that decision.
+
+### E.6 Comparison with the original §3.2 design intent
+
+The original design text in §3.2 said: *"Handlers that read value bytes (`getCommand`, `appendCommand`, etc.) call `objectGetUncompressedView` to get a decompressed view."* This corresponded to approach 1.
+
+That text was a placeholder that did not yet account for the codebase-sweep findings. The transient model (approach 3) better serves the same design intent ("hide compression from higher layers") while:
+
+1. Reducing the byte-access surface from ~62 sites to a single seam.
+2. Eliminating the "future contributor adds a new byte access without a decompress call" failure mode.
+3. Preserving all original requirements (R2.5.1, R2.5.2, R2.5.3, R2.5.6).
+
+The chosen model is therefore an **implementation-time refinement** of the original design intent, not a deviation from it.
