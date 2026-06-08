@@ -3755,16 +3755,22 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);
 #define LOOKUP_NOSTATS (1 << 2)  /* Don't update keyspace hits/misses counters. */
 #define LOOKUP_WRITE (1 << 3)    /* Delete expired keys even in replicas. */
 #define LOOKUP_NOEXPIRE (1 << 4) /* Avoid deleting lazy expired keys. */
-/* Caller intends to read the value's bytes (not just check existence or read
- * encoding metadata). When the feature is enabled and the value is compressed,
- * the lookup helper transparently decompresses into a temp sds and registers
- * the robj in the per-server transient-view side-map; the original compressed
- * buffer is restored at the next event-loop boundary via
- * compressionBeforeSleep(). See design §2.5.7 + Appendix E. Callers that only
- * check existence or read encoding metadata (OBJECT ENCODING, DEBUG OBJECT,
- * eviction sampler) MUST omit this flag so the truthful "compressed" encoding
- * remains visible. */
-#define LOOKUP_READ_BYTES (1 << 5)
+/* Caller does NOT need to read the value's bytes — metadata-only check (TYPE,
+ * EXISTS, OBJECT ENCODING, TTL/PTTL, PERSIST, TOUCH, DEBUG, eviction sampler,
+ * active expiry). Lookups default to bytes-readable: when the compression
+ * feature is enabled and the value is compressed, the lookup helper
+ * transparently decompresses into a temp sds and registers the robj in the
+ * per-server transient-view side-map; the original compressed buffer is
+ * restored at the next event-loop boundary via compressionBeforeSleep().
+ * Callers that genuinely only need metadata MUST pass LOOKUP_NO_BYTES so
+ * (a) the truthful "compressed" encoding remains visible to introspection
+ * commands and (b) the decompression CPU is avoided on cold paths. The
+ * opt-out semantic is deliberate: the failure mode for "future caller forgets
+ * to opt out" is wasted decompression CPU (recoverable, observable via
+ * latency monitor) versus the opt-in alternative's "future caller forgets
+ * to opt in -> reads compressed bytes as garbage" silent corruption.
+ * See design §2.5.7 + Appendix E. */
+#define LOOKUP_NO_BYTES (1 << 5)
 #define LOOKUP_NOEFFECTS \
     (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE) /* Avoid any effects from fetching the key */
 

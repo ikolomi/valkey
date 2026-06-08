@@ -122,6 +122,41 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
+    /* Compression read-path integration (S2.8 / R2.5.7 + Appendix E).
+     * When the value is compressed and the caller will read its bytes
+     * (default — opt-out via LOOKUP_NO_BYTES), decompress it. The
+     * strategy depends on whether the caller is in a read or write
+     * context:
+     *
+     *   - LOOKUP_WRITE: caller will mutate. Permanently decompress
+     *     in place (no side-map entry, no pin). The post-mutation
+     *     value is re-enqueued for compression by signalModifiedKey()
+     *     at the end of the write command.
+     *
+     *   - default (read context): transient view. Decompress into a
+     *     temp sds, register the robj in the per-server side-map, pin.
+     *     Restored at the next beforeSleep boundary via
+     *     compressionBeforeSleep() — by free pointer-swap if the
+     *     kvstore slot still holds our pinned robj, by discard
+     *     otherwise.
+     *
+     * Failure (corruption, missing dict, OOM) is treated as a key-read
+     * error: return NULL so the caller path produces a key-missing
+     * response rather than handing back a compressed robj that would
+     * be read as garbage. The decoder logs at LL_WARNING and increments
+     * compression_errors_total before returning -1.
+     *
+     * TODO(R6.2): proper "-ERR compressed value corrupt" surfacing to
+     * the client. Today we degrade to "key not found", which is safe
+     * (no garbage bytes leaked) but not quite right per the design. */
+    if (val != NULL && !(flags & LOOKUP_NO_BYTES) &&
+        val->encoding == OBJ_ENCODING_COMPRESSED) {
+        int rc = (flags & LOOKUP_WRITE)
+                     ? compressionPermanentlyDecompress(val)
+                     : compressionMaterializeTransientView(val, db->id);
+        if (rc != 0) val = NULL;
+    }
+
     return val;
 }
 
@@ -223,10 +258,21 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     signalKeyAsReady(db, key, val->type);
     notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
     *valref = val;
-    /* S2.7 write-path hook: enqueue eligible STRING values for
-     * background compression. No-op when the feature is disabled,
-     * the value is not eligible, or no active dictionary exists. */
-    compressionEnqueueCandidate(key, val, db->id);
+    /* Note: compression-enqueue does NOT live here. It used to (PR #19),
+     * but PR #23-amend moved it to signalModifiedKey() instead. Reasons:
+     *   1. dbAddInternal/dbSetValue fire on worker-drain dbReplaceValue
+     *      too (which install compressed values) — wasted predicate
+     *      check. signalModifiedKey is NOT called from worker drain
+     *      (R2.9.2), so the redundant work is gone.
+     *   2. In-place mutations (APPEND, SETRANGE, BITOP) on a permanent-
+     *      decompressed value never go through dbReplaceValue, so the
+     *      old wiring missed them. signalModifiedKey IS called by the
+     *      command at end-of-mutation, so the new wiring catches them.
+     *   3. Empty/initial-state values created by lookup-or-create
+     *      helpers (hashTypeLookupWriteOrCreate etc.) get checked
+     *      eagerly under the old wiring. The empty value is never
+     *      eligible; the predicate check is wasted. signalModifiedKey
+     *      is called only after the type-command fills in real data. */
 }
 
 void dbAdd(serverDb *db, robj *key, robj **valref) {
@@ -395,15 +441,9 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         decrRefCount(old);
     }
     *valref = new;
-    /* S2.7 write-path hook: enqueue eligible STRING values for
-     * background compression. Same no-op semantics as in dbAddInternal:
-     * disabled feature, ineligible value, or no active dict → no-op.
-     * Also: the recursive case where the new value IS already
-     * compressed (compressionInstall just ran on the drain side and is
-     * itself the caller of dbReplaceValue) is handled by the encoding
-     * filter inside the eligibility predicate — OBJ_ENCODING_COMPRESSED
-     * is not OBJ_ENCODING_RAW, so re-enqueueing is naturally suppressed. */
-    compressionEnqueueCandidate(key, new, db->id);
+    /* Note: compression-enqueue does NOT live here either — moved to
+     * signalModifiedKey() in PR #23-amend. See dbAddInternal for the
+     * full rationale. */
 }
 
 /* Replace an existing key with a new value, we just replace value and don't
@@ -435,7 +475,9 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     else if (flags & SETKEY_ADD_OR_UPDATE)
         keyfound = -1;
     else if (!(flags & SETKEY_DOESNT_EXIST))
-        keyfound = (lookupKeyWrite(db, key) != NULL);
+        /* LOOKUP_NO_BYTES (S2.8): just an existence check; we don't
+         * need to decompress the value. */
+        keyfound = (lookupKeyWriteWithFlags(db, key, LOOKUP_NO_BYTES) != NULL);
 
     if (!keyfound) {
         dbAdd(db, key, valref);
@@ -767,6 +809,17 @@ long long dbTotalServerKeyCount(void) {
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
     touchWatchedKey(db, key);
     trackingInvalidateKey(c, key, 1);
+    /* Re-evaluate compression eligibility for the (now-modified) value.
+     * This is the canonical "logical value changed" hook in Valkey,
+     * called by every byte-mutating command path. By piggybacking the
+     * compression-enqueue here we replace the older PR #19 wiring at
+     * dbAddInternal/dbSetValue, which fired too eagerly (e.g. on
+     * worker-drain dbReplaceValue, where re-enqueueing a just-installed
+     * compressed value is a guaranteed no-op) AND missed in-place
+     * mutations like APPEND on a permanent-decompressed value (which
+     * never go through dbReplaceValue at all). See compression.h
+     * docstring + design Appendix E for the rationale. */
+    compressionEnqueueModified(db, key);
 }
 
 void signalFlushedDb(int dbid, int async) {
@@ -912,7 +965,9 @@ void existsCommand(client *c) {
     int j;
 
     for (j = 1; j < c->argc; j++) {
-        if (lookupKeyReadWithFlags(c->db, c->argv[j], LOOKUP_NOTOUCH)) count++;
+        /* LOOKUP_NO_BYTES (S2.8): EXISTS only checks key presence; no need
+         * to decompress the value via transient view. */
+        if (lookupKeyReadWithFlags(c->db, c->argv[j], LOOKUP_NOTOUCH | LOOKUP_NO_BYTES)) count++;
     }
     addReplyLongLong(c, count);
 }
@@ -1416,7 +1471,9 @@ void lastsaveCommand(client *c) {
 
 void typeCommand(client *c) {
     robj *o;
-    o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOTOUCH);
+    /* LOOKUP_NO_BYTES (S2.8): TYPE only inspects o->type; no need to
+     * decompress the value via transient view. */
+    o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOTOUCH | LOOKUP_NO_BYTES);
     addReplyStatus(c, getObjectTypeName(o));
 }
 

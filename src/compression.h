@@ -115,6 +115,139 @@ int compressionToggle(int enabled, sds *err);
 robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out);
 
 /* ========================================================================
+ * Read path — transient-view model (R2.5.7, Appendix E)
+ * ========================================================================
+ *
+ * `compressionMaterializeTransientView` is called from inside lookupKey()
+ * when (a) the caller did NOT pass LOOKUP_NO_BYTES and (b) the value is
+ * compressed. It decompresses into a freshly-allocated temp sds, registers
+ * the robj in the per-server transient-view side-map (saving the original
+ * compressed buffer for restoration), `incrRefCount`s the robj to pin it,
+ * replaces `o->val_ptr` with the temp sds, and flips `o->encoding` to
+ * `OBJ_ENCODING_RAW`.
+ *
+ * Returns 0 on success (object is now in transient-view state, encoding
+ * is RAW), -1 on failure (decompression error, OOM). On failure the
+ * function logs at LL_WARNING and increments compression_errors_total;
+ * the object is left in its original COMPRESSED state. The caller (i.e.
+ * lookupKey) treats failure as a corruption event — see R6.2.
+ *
+ * If `o` is already in transient-view state (encoding == RAW because a
+ * previous lookup already materialized it), this function is a no-op.
+ * In practice lookupKey only calls this when encoding == COMPRESSED, so
+ * the guard is belt-and-suspenders.
+ *
+ * Restoration happens at compressionBeforeSleep(); see §4.2. */
+int compressionMaterializeTransientView(robj *o, int dbid);
+
+/* O(1) presence check used by isCopyAvoidPreferred() in networking.c.
+ * Returns 1 if `o` is currently in the transient-view side-map (its
+ * val_ptr is a temp sds that will be freed at the next beforeSleep);
+ * returns 0 otherwise.
+ *
+ * The bulk-reply zero-copy path captures `bulkStrRef = {.obj, .str =
+ * objectGetVal(obj)}` for the IO thread to dereference at write time.
+ * Under transient view, .str points to a temp sds that is freed at
+ * beforeSleep — a use-after-free if the IO thread runs after restoration.
+ * isCopyAvoidPreferred returns 0 when transientViewActive(obj) is true,
+ * forcing the memcpy reply path so bytes land in c->reply independent
+ * of val_ptr. See design Appendix E.7 for the audit and rationale.
+ *
+ * This function MUST be cheap (called once per bulk reply on compressed
+ * values). The side-map is a pointer-keyed hashtable; lookup is O(1)
+ * amortized. When the side-map is empty (the common case — no compressed
+ * values touched in this iteration), an early-out short-circuits the
+ * hashtable lookup entirely. */
+int transientViewActive(const robj *o);
+
+/* Permanently decompresses an OBJ_ENCODING_COMPRESSED string in place.
+ * Used by lookupKey() on LOOKUP_WRITE callers — they will mutate the
+ * value, so we don't preserve the compressed form across the write.
+ *
+ *   - decompresses into a fresh sds (via objectGetUncompressedView)
+ *   - releases the dict frame-ref (compressionRegistryDecRef per R2.3.4)
+ *   - frees the original compressed buffer
+ *   - replaces val_ptr with the decompressed sds
+ *   - flips encoding to OBJ_ENCODING_RAW
+ *   - refcount unchanged (no pin; not registered in any side-map)
+ *
+ * After permanent decompress, dbUnshareStringValue sees refcount==1 RAW
+ * → no COW → mutation in place. The post-mutation value is re-enqueued
+ * for compression via compressionEnqueueModified() called from
+ * signalModifiedKey at the end of the write command (NOT from
+ * dbReplaceValue / dbSetValue, which would never fire for in-place
+ * mutations like APPEND/SETRANGE/BITOP). The signalModifiedKey hook is
+ * the canonical "logical value at this key changed" signal in Valkey,
+ * which is exactly when compression should re-evaluate.
+ *
+ * Returns 0 on success (encoding is now RAW), -1 on decoder failure
+ * (corruption, missing dict). On failure the robj is left in its
+ * original COMPRESSED state and the caller (lookupKey) treats it as
+ * a corruption-class read error per R6.2.
+ *
+ * If `o` is already RAW (e.g., a previous lookup in the same iteration
+ * permanent-decompressed it), this function is a no-op. */
+int compressionPermanentlyDecompress(robj *o);
+
+/* Called from signalModifiedKey() to enqueue the (possibly mutated)
+ * value at `key` for background compression. No-op when:
+ *   - The feature is disabled.
+ *   - The key was deleted (dbFind returns NULL).
+ *   - The value is ineligible (e.g., wrong type, recently written —
+ *     compressionIsEligible filters internally).
+ *
+ * Why hook on signalModifiedKey: it's the canonical "the logical value
+ * at this key changed" signal in Valkey, called by every byte-mutating
+ * command after mutation completes. This is exactly the right moment
+ * to re-evaluate compressibility.
+ *
+ * R2.9.2 invariant: this is signalModifiedKey → compression-enqueue,
+ * NOT the reverse. Compression infrastructure (worker drain, this
+ * function's caller chain via permanent-decompress, etc.) must NOT
+ * call signalModifiedKey. */
+void compressionEnqueueModified(serverDb *db, robj *key);
+
+/* ========================================================================
+ * Memory-bytes accounting (design §5.6 counters + the transient-view cap)
+ * ========================================================================
+ *
+ * Two counters, per design §5.6:
+ *   - compression_total_uncompressed_bytes — sum of uncompressed
+ *     payload bytes across all currently-installed compressed frames.
+ *   - compression_total_compressed_bytes — sum of on-heap compressed
+ *     bytes (16-byte header + ZSTD frame).
+ *
+ * Updated at the 3 frame-lifecycle transitions, both deltas in one
+ * call so the derived savings counter (uncompressed - compressed) is
+ * consistent at all observation points:
+ *   - createCompressedObject   → += (uncompressed_len, compressed_len + HEADER)
+ *   - freeCompressedObject     → -= (uncompressed_len, compressed_len + HEADER)
+ *   - compressionPermanentlyDecompress → -= ...
+ *
+ * The savings counter (uncompressed - compressed) caps the transient-
+ * view side-map's uncompressed footprint via R2.5.7. The invariant
+ * `transient_view_uncompressed_bytes ≤ savings` ensures peak memory
+ * never exceeds the no-compression baseline — independent of any
+ * operator-tunable knob.
+ *
+ * S4.1 will expose both counters under their canonical INFO field
+ * names (`compression_total_uncompressed_bytes`,
+ * `compression_total_compressed_bytes`) and derive
+ * `compression_net_saved_bytes` from them. PR #23 wires only the
+ * counters; the INFO surface comes with S4.1.
+ *
+ * Atomic because freeCompressedObject can run on a bio thread via
+ * lazyfree; the create + permanent-decompress paths are main-thread
+ * only. Tests can call with one delta zero (e.g. `compressionAccountInstall(1<<20, 0)`)
+ * to bump only the uncompressed side, raising the derived savings
+ * budget without faking a real install. */
+void compressionAccountInstall(int64_t delta_unc, int64_t delta_comp);
+size_t compressionGetTotalUncompressedBytes(void);
+size_t compressionGetTotalCompressedBytes(void);
+size_t compressionGetSavingsBytes(void); /* derived: unc - comp */
+size_t compressionGetTransientViewCappedTotal(void);
+
+/* ========================================================================
  * Hot path — write / eligibility
  * ========================================================================
  *

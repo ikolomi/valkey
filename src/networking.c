@@ -32,6 +32,7 @@
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "script.h"
+#include "compression.h"
 #include "intset.h"
 #include "sds.h"
 #include "fpconv_dtoa.h"
@@ -266,6 +267,17 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (obj) {
         if (obj->encoding != OBJ_ENCODING_RAW) return 0;
         if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
+        /* Deferred-capture fix (S2.8 / Appendix E.7): if the obj is in the
+         * transient-view side-map, its val_ptr is a temp sds that will be
+         * freed at the next beforeSleep boundary. The bulk-reply zero-copy
+         * path stashes a `bulkStrRef = {.obj, .str = objectGetVal(obj)}`
+         * for the IO thread to dereference at write time — a use-after-free
+         * if the IO thread runs after restoration. Force the memcpy reply
+         * path so the bytes land in c->reply independent of val_ptr.
+         *
+         * Cost: one memcpy bounded by compression-max-value-size (default
+         * 128 KiB → ~30 µs at memory bandwidth). */
+        if (transientViewActive(obj)) return 0;
     }
 
     /* Copy avoidance is preferred for any string size starting certain number of I/O threads  */

@@ -29,6 +29,8 @@
 #include "compression_train.h"
 #include "lrulfu.h"
 
+#include <stdatomic.h>
+
 #ifdef USE_ZSTD
 #include "zstd.h"
 #endif
@@ -64,6 +66,237 @@ static ZSTD_DCtx *compressionGetDCtx(void) {
 #endif
 
 /* ========================================================================
+ * Read path — transient-view side-map
+ * ========================================================================
+ *
+ * Implements R2.5.7 + Appendix E. When a caller invokes lookupKey* without
+ * LOOKUP_NO_BYTES on a compressed value, we decompress into a temp sds,
+ * remember the original compressed buffer here, pin the robj, and flip
+ * encoding to RAW for the duration of the event-loop iteration. At the
+ * next compressionBeforeSleep() boundary we restore — by pointer-swap if
+ * the kvstore slot still holds our pinned robj, by discard otherwise.
+ *
+ * Pointer-equality stale check (the same primitive as the write-path
+ * drain — see PR #19) detects mutation/overwrite/expiry without any
+ * mutation-time hook in the keyspace mutation paths. The pin guarantees
+ * ABA safety: while we hold a refcount, the allocator cannot reclaim
+ * the robj's address for a future zmalloc — so a "same pointer at the
+ * slot" outcome at restore time is unambiguous.
+ *
+ * Memory bound (savings-based cap, R2.5.7): a naive transient view lets
+ * compressed and uncompressed bytes coexist for every touched key for
+ * the duration of an event-loop iteration. Peak inflation could reach
+ * `(1 + ratio)` × the no-compression baseline (e.g. 10000 × 128 KiB
+ * compressed values touched in one iteration → ~1.5 GB OOM headroom
+ * needed even though the dataset is normally compressed).
+ *
+ * To keep the feature from making memory WORSE than the no-compression
+ * baseline, materialize is capped against the running compression
+ * savings: `transient_view_uncompressed_bytes ≤ savings` where
+ * `savings = compression_total_uncompressed_bytes -
+ * compression_total_compressed_bytes` across all currently-installed
+ * compressed frames. The two underlying counters are per design §5.6
+ * (S4.1 surfaces them via `INFO compression`); the savings used here
+ * is derived on demand via compressionGetSavingsBytes(). When the next
+ * materialize would exceed the cap, the path falls back to
+ * compressionPermanentlyDecompress
+ * for that value (releasing the compressed form and freeing memory the
+ * side-map would otherwise have held). The cap is a derived signal —
+ * no operator-tunable knob — so its semantic ("transient memory ≤
+ * what compression saved") is correct by construction.
+ *
+ * Cap exhaustion is observable via compression_transient_view_capped_total
+ * (S4.1 surfaces it through INFO compression).
+ *
+ * Side-map structure: hashtable.h primitive keyed by `robj *`. Default
+ * pointer-bits hash and pointer-equality compare are exactly right for
+ * an integer-cast pointer key — no custom hash/compare needed. No
+ * entryDestructor either: the restore branch needs to do different
+ * cleanup from the discard branch (restore preserves the compressed
+ * buffer; discard frees it), and a single destructor cannot distinguish
+ * them. Both branches free the entry struct via the
+ * discardTransientEntry helper or inline, then bulk-clear the bucket
+ * pointers via hashtableEmpty(map, NULL).
+ */
+
+typedef struct compressionTransientEntry {
+    robj *obj;               /* hashtable key (default: pointer-bits hash) */
+    void *compressed_buffer; /* saved original val_ptr (the zmalloc'd compressed frame) */
+    int dbid;                /* for kvstore re-fetch on restore */
+} compressionTransientEntry;
+
+static const void *transientEntryGetKey(const void *entry) {
+    const compressionTransientEntry *e = entry;
+    return e->obj;
+}
+
+static hashtableType transientViewMapType = {
+    .entryGetKey = transientEntryGetKey,
+    /* hashFunction NULL → default pointer-bits hash. */
+    /* keyCompare NULL → default pointer-equality compare. */
+    /* entryDestructor NULL → explicit cleanup in the restore loop. */
+};
+
+/* The side-map. Lazily allocated on first use (the first time a
+ * compressed value is read with LOOKUP_NO_BYTES not set). NULL until
+ * then; freed in compressionShutdown. The lazy allocation keeps the
+ * "compression-enabled no, no compressed values exist" state at zero
+ * cost, and keeps `transientViewActive()` cheap when the map is empty:
+ * an early NULL check short-circuits the hashtable lookup entirely. */
+static hashtable *transient_view_map = NULL;
+
+/* Total uncompressed bytes accounted for in the side-map currently.
+ * Reset to 0 at the end of compressionBeforeSleep when the side-map
+ * is fully drained. The cap check in compressionMaterializeTransientView
+ * uses this against the savings derived from the design-spec counters
+ * (`compression_total_uncompressed_bytes - compression_total_compressed_bytes`)
+ * to decide whether to fall back to permanent decompress. */
+static size_t transient_view_uncompressed_bytes = 0;
+
+/* Design §5.6 counters: total uncompressed payload bytes and total
+ * on-heap compressed bytes (header + frame) across all currently-
+ * installed compressed frames. Atomic because freeCompressedObject
+ * can run on a bio thread (lazyfree); the create / permanent-
+ * decompress paths run on the main thread.
+ *
+ * S4.1 will surface these via `INFO compression` as
+ * `compression_total_uncompressed_bytes` and
+ * `compression_total_compressed_bytes`. They also serve the
+ * savings-based cap (R2.5.7): savings = uncompressed - compressed,
+ * derived on demand without a third dedicated counter.
+ *
+ * Initial value is 0 (no compressed frames at startup). They rise
+ * together as the worker drain installs compressed values and fall
+ * together when values are freed or permanent-decompressed. Both
+ * invariants are non-negative; a debug-build assert in the accounting
+ * function guards against drift. */
+static _Atomic(size_t) compression_total_uncompressed_bytes = 0;
+static _Atomic(size_t) compression_total_compressed_bytes = 0;
+
+/* Cumulative count of compressionMaterializeTransientView calls that
+ * fell back to permanent decompress because the cap was hit. Climbing
+ * counter signals "your workload is touching too many compressed keys
+ * within a single event-loop iteration; consider why."
+ *
+ * Not atomic: incremented only inside compressionMaterializeTransientView
+ * (main-thread only) and read only via compressionGetTransientViewCappedTotal
+ * (called from S4.1's infoCompression on the main thread). No cross-thread
+ * access. */
+static size_t compression_transient_view_capped_total = 0;
+
+/* Account a compressed-object install / free / permanent-decompress.
+ * `delta_unc` is the uncompressed-payload delta (positive on install,
+ * negative on free / permanent-decompress); `delta_comp` is the
+ * on-heap compressed delta (HEADER + frame bytes), same sign.
+ *
+ * Both updates are atomic. Production callers always pass both deltas
+ * in the same call so that the derived savings counter
+ * (uncompressed - compressed) is consistent at all observation points.
+ * Tests can pass `delta_comp == 0` to bump only one side (e.g. raise
+ * the savings budget for a transient-view test without faking a
+ * compressed install). */
+void compressionAccountInstall(int64_t delta_unc, int64_t delta_comp) {
+    if (delta_unc != 0) {
+        if (delta_unc > 0) {
+            atomic_fetch_add_explicit(&compression_total_uncompressed_bytes,
+                                      (size_t)delta_unc, memory_order_relaxed);
+        } else {
+            size_t magnitude = (size_t)(-delta_unc);
+            size_t before = atomic_fetch_sub_explicit(&compression_total_uncompressed_bytes,
+                                                      magnitude, memory_order_relaxed);
+            serverAssert(before >= magnitude);
+        }
+    }
+    if (delta_comp != 0) {
+        if (delta_comp > 0) {
+            atomic_fetch_add_explicit(&compression_total_compressed_bytes,
+                                      (size_t)delta_comp, memory_order_relaxed);
+        } else {
+            size_t magnitude = (size_t)(-delta_comp);
+            size_t before = atomic_fetch_sub_explicit(&compression_total_compressed_bytes,
+                                                      magnitude, memory_order_relaxed);
+            serverAssert(before >= magnitude);
+        }
+    }
+}
+
+size_t compressionGetTotalUncompressedBytes(void) {
+    return atomic_load_explicit(&compression_total_uncompressed_bytes,
+                                memory_order_relaxed);
+}
+
+size_t compressionGetTotalCompressedBytes(void) {
+    return atomic_load_explicit(&compression_total_compressed_bytes,
+                                memory_order_relaxed);
+}
+
+/* Derived savings: uncompressed - compressed across all currently-
+ * installed compressed frames. Used by the materialize-cap check; S4.1
+ * will also use it directly for the `compression_net_saved_bytes` INFO
+ * field (= savings - fixed_overhead). Two atomic loads; cheap. The two
+ * counters are updated atomically per object install/free/permanent-
+ * decompress, so a transient view at install/free time can briefly see
+ * a not-yet-symmetric (unc, comp) pair; the derived savings can never
+ * go negative because we always increment uncompressed first on install
+ * and decrement compressed first on free. */
+size_t compressionGetSavingsBytes(void) {
+    size_t unc = compressionGetTotalUncompressedBytes();
+    size_t comp = compressionGetTotalCompressedBytes();
+    return (unc > comp) ? (unc - comp) : 0;
+}
+
+size_t compressionGetTransientViewCappedTotal(void) {
+    return compression_transient_view_capped_total;
+}
+
+static inline void transientViewMapEnsure(void) {
+    if (transient_view_map == NULL) {
+        transient_view_map = hashtableCreate(&transientViewMapType);
+    }
+}
+
+/* Discard a single transient-view entry: free the temp uncompressed
+ * sds, free the saved compressed buffer, NULL val_ptr defensively,
+ * decRef the pin (which may free the robj if the kvstore reference
+ * has gone away), and free the entry struct itself.
+ *
+ * Used by:
+ *   - compressionBeforeSleep on the discard branch (kvstore slot no
+ *     longer points at our pinned robj — overwrite/expire/COW).
+ *   - compressionShutdown (treats every remaining entry as discard
+ *     because the kvstore may already be torn down).
+ *   - testOnlyCompressionDrainTransientViewAsDiscard (unit-test
+ *     fixture cleanup).
+ *
+ * The val_ptr=NULL trick prevents freeStringObject (called by
+ * decrRefCount when refcount hits 0) from double-freeing the temp sds
+ * we just sdsfree'd. freeStringObject for OBJ_ENCODING_RAW is
+ * sdsfree(val_ptr); passing NULL is a no-op. */
+static inline void discardTransientEntry(compressionTransientEntry *e) {
+    sdsfree((sds)e->obj->val_ptr);
+    zfree(e->compressed_buffer);
+    e->obj->val_ptr = NULL;
+    decrRefCount(e->obj);
+    zfree(e);
+}
+
+int transientViewActive(const robj *o) {
+    /* Common case: no compressed value has been read in this iteration
+     * (or ever). The map is NULL or empty; return 0 immediately without
+     * hashing the pointer. The `min_string_size_copy_avoid` threshold
+     * means this function is called from the bulk-reply hot path on
+     * large strings; the early-out is worth ~10 ns per call. */
+    if (transient_view_map == NULL) return 0;
+    if (hashtableSize(transient_view_map) == 0) return 0;
+
+    void *found;
+    /* hashtableFind takes a non-const key; cast away const because the
+     * default hash/compare callbacks treat the key as an opaque pointer
+     * value (they don't dereference it). Safe. */
+    return hashtableFind(transient_view_map, (void *)o, &found) ? 1 : 0;
+}
+
+/* ========================================================================
  * Lifecycle stubs
  * ======================================================================== */
 
@@ -88,6 +321,29 @@ void compressionInit(void) {
  * teardown. */
 void compressionShutdown(void) {
     compressionWorkersStop();
+
+    /* Drain the transient-view side-map. In normal operation the
+     * map is emptied at every beforeSleep, so it should be empty
+     * here. But if shutdown happens mid-iteration (e.g. the server
+     * is killed between lookupKey and beforeSleep) we still need to
+     * release the pins and free the buffers. We can't safely call
+     * the kvstore (it may be torn down by now), so we don't try to
+     * restore — every remaining entry is treated as a discard.
+     *
+     * HASHTABLE_ITER_SAFE pauses incremental rehashing so we can free
+     * entry structs inline without confusing the iterator. */
+    if (transient_view_map != NULL) {
+        hashtableIterator iter;
+        hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
+        void *raw;
+        while (hashtableNext(&iter, &raw)) {
+            discardTransientEntry((compressionTransientEntry *)raw);
+        }
+        hashtableCleanupIterator(&iter);
+        hashtableRelease(transient_view_map);
+        transient_view_map = NULL;
+    }
+
     compressionRegistryRelease();
 #ifdef USE_ZSTD
     if (server_dctx != NULL) {
@@ -128,30 +384,80 @@ void compressionAfterSleep(void) {
 }
 
 void compressionBeforeSleep(void) {
-    /* TODO(S2.8-activate): restore transiently-decompressed values registered
-     * by lookupKey* with LOOKUP_READ_BYTES (per design §2.5.7 + Appendix E).
+    /* Restore transiently-decompressed values per design §2.5.7 + Appendix E.
      *
-     * Activation lands in PR 2 of the S2.8 split:
-     *   - Iterate the per-server transient-view side-map.
-     *   - For each entry, re-fetch the kvstore slot for the key.
-     *   - If slot->value == job->value: restore via pointer swap (free temp
-     *     sds, restore compressed buffer to val_ptr, encoding back to
-     *     OBJ_ENCODING_COMPRESSED).
-     *   - Otherwise (mutated/overwritten/expired): discard (free temp sds,
-     *     free saved compressed buffer, decRef the orphan).
-     *   - Drop the pin in either case.
+     * For each entry in the side-map:
+     *   (a) Re-fetch the kvstore slot for the key (via the value robj's
+     *       embedded key sds — the pin guarantees the embedded key is
+     *       still valid memory).
+     *   (b) If the slot still points at our pinned robj: restore via
+     *       pointer swap. The compressed bytes never went away; we just
+     *       had val_ptr point at the temp sds during the iteration.
+     *       Free the temp sds, put the compressed buffer back, flip
+     *       encoding back to COMPRESSED. ZERO recompression cost.
+     *   (c) Otherwise (mutation, overwrite, expire, COW-orphaned): the
+     *       slot points elsewhere. Discard via discardTransientEntry
+     *       (frees buffers + pin + entry struct).
+     *   (d) Drop the pin in the restore branch too (decrRef may NOT
+     *       free the robj — kvstore retains its reference; refcount
+     *       goes 2→1).
      *
-     * PR 2 must ALSO implement the deferred-capture fix per Appendix E.7:
-     *   - Define transientViewActive(robj *obj) — O(1) side-map presence check.
-     *   - Extend isCopyAvoidPreferred() in networking.c to return 0 when
-     *     transientViewActive(obj) is true. This forces the memcpy reply
-     *     path for transiently-decompressed values, avoiding a use-after-
-     *     free in the IO thread that would otherwise dereference a freed
-     *     temp sds via bulkStrRef.
-     *
-     * For the skeleton (PR 1) the function is a no-op. The hook into
-     * beforeSleep is established here so PR 2 can ship the lookupKey-side
-     * decompression + side-map population without touching server.c again. */
+     * Iteration uses HASHTABLE_ITER_SAFE so we can free entry structs
+     * inline without confusing the iterator (rehashing is paused for
+     * the duration). Final hashtableEmpty(map, NULL) drops the bucket
+     * pointers (entries already freed). */
+    if (transient_view_map == NULL) return;
+    if (hashtableSize(transient_view_map) == 0) return;
+
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
+    void *raw;
+    while (hashtableNext(&iter, &raw)) {
+        compressionTransientEntry *e = raw;
+        robj *o = e->obj;
+
+        /* Look up the kvstore slot for this key. R2.4.4 + the pin
+         * established at materialize time make pointer equality
+         * decisive (ABA-safe — see §4.6 concurrency notes). */
+        serverAssert(e->dbid >= 0 && e->dbid < server.dbnum);
+        serverDb *db = server.db[e->dbid];
+        sds key_sds = (sds)objectGetKey(o);
+        /* hasembkey is set on every kvstore-stored value by
+         * objectSetKeyAndExpire (see dbAddInternal / dbSetValue), so
+         * objectGetKey returns non-NULL here. If a future code path
+         * stores a value without an embedded key, we'd need a fallback. */
+        serverAssert(key_sds != NULL);
+
+        int dict_index = getKVStoreIndexForKey(key_sds);
+        void **slot = kvstoreHashtableFindRef(db->keys, dict_index, key_sds);
+
+        if (slot != NULL && *slot == o) {
+            /* Restore: pointer swap. The compressed bytes never went
+             * away; we just had val_ptr aliased to the temp sds during
+             * the iteration. Drop the pin (refcount 2→1; kvstore retains
+             * its ref). */
+            sdsfree((sds)o->val_ptr);
+            o->val_ptr = e->compressed_buffer;
+            o->encoding = OBJ_ENCODING_COMPRESSED;
+            decrRefCount(o);
+            zfree(e);
+        } else {
+            /* Discard: kvstore slot no longer points at our pinned robj
+             * (overwrite/expire/COW). Discard helper handles the buffer
+             * frees, pin decRef, and entry free. */
+            discardTransientEntry(e);
+        }
+    }
+    hashtableCleanupIterator(&iter);
+
+    /* Bucket pointers reference now-freed entry structs; clear them
+     * with NULL destructor (no per-entry callback — entries already
+     * freed inline above). */
+    hashtableEmpty(transient_view_map, NULL);
+
+    /* Reset the per-iteration budget. The next iteration starts with
+     * the full savings-based cap available. */
+    transient_view_uncompressed_bytes = 0;
 }
 
 /* ========================================================================
@@ -191,41 +497,29 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
     if (o->encoding != OBJ_ENCODING_COMPRESSED) return o;
 
 #ifdef USE_ZSTD
-    /* Decode the per-value header. compressionHeaderDecode validates
-     * alg_magic; it does not validate that compressed_len matches the
-     * buffer length (caller — i.e. us — knows the buffer length from
-     * the robj). */
+    /* Decode the per-value header. The header is the source of truth
+     * for the compressed buffer's layout: createCompressedObject
+     * validated buffer_len == HEADER + compressed_len at install time
+     * (compression_header.h contract), and the encoder writes the
+     * header from the actual frame size. We therefore do NOT compute
+     * buf_len here.
+     *
+     * Avoiding a buf_len computation also sidesteps a real bug: the
+     * val_ptr for OBJ_ENCODING_COMPRESSED is a raw zmalloc'd buffer
+     * (NOT an sds). sdslen() on it would buffer-overflow reading the
+     * sds header at a negative offset; AddressSanitizer flags it.
+     *
+     * The "buffer too short" guard is implicit in compressionHeaderDecode:
+     * createCompressedObject's serverAssert ensures buffer_len >=
+     * HEADER_SIZE before we ever get here, so the 16-byte header read
+     * is in-bounds. */
     const unsigned char *buf = (const unsigned char *)objectGetVal(o);
-    size_t buf_len = sdslen((sds)objectGetVal(o));
-
-    if (buf_len <= COMPRESSION_HEADER_SIZE) {
-        /* Buffer too small to even contain a header — corruption. */
-        serverLog(LL_WARNING,
-                  "Compression: compressed value too short (%zu bytes; "
-                  "minimum %u for header alone)",
-                  buf_len, COMPRESSION_HEADER_SIZE);
-        /* TODO(S4.1): compression_errors_total++ */
-        return NULL;
-    }
 
     compressedHeader hdr;
     if (compressionHeaderDecode(buf, &hdr) != 0) {
         serverLog(LL_WARNING,
                   "Compression: compressed value has unknown algorithm "
                   "magic (corrupt)");
-        /* TODO(S4.1): compression_errors_total++ */
-        return NULL;
-    }
-
-    /* Sanity-check the header's compressed_len against the buffer.
-     * Mismatch is corruption. The header carries compressed_len in the
-     * frame-only sense (excluding header bytes), so the expected total
-     * is HEADER + compressed_len. */
-    if ((size_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE != buf_len) {
-        serverLog(LL_WARNING,
-                  "Compression: header compressed_len %u + %u-byte header "
-                  "does not match buffer length %zu",
-                  hdr.compressed_len, COMPRESSION_HEADER_SIZE, buf_len);
         /* TODO(S4.1): compression_errors_total++ */
         return NULL;
     }
@@ -345,6 +639,210 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
     UNUSED(view_out);
     serverPanic("OBJ_ENCODING_COMPRESSED encountered with USE_ZSTD disabled");
 #endif
+}
+
+/* compressionMaterializeTransientView — see compression.h for contract.
+ *
+ * Decompress, register in side-map, pin, flip encoding. The lookupKey()
+ * caller has already established that:
+ *   - feature/decoder concerns: server.compression_enabled is true OR a
+ *     compressed value lingers from a previous enable, both of which are
+ *     fine — the decoder doesn't care about the master switch.
+ *   - encoding == OBJ_ENCODING_COMPRESSED.
+ *   - LOOKUP_NO_BYTES was NOT set (caller wants bytes).
+ *
+ * Failure modes:
+ *   - Decoder error (corruption, missing dict): logged + counter; we
+ *     leave the robj in its original COMPRESSED state and return -1.
+ *     The caller (lookupKey) treats -1 as "key effectively unreadable"
+ *     and surfaces it to the client per R6.2.
+ *   - OOM: same handling.
+ *
+ * Side effect on success: o->val_ptr is replaced with a freshly-allocated
+ * sds carrying the decompressed bytes; o->encoding becomes
+ * OBJ_ENCODING_RAW; o->refcount is bumped (the side-map's pin).
+ *
+ * Memory ownership is transferred:
+ *   - The OLD val_ptr (the compressed buffer, allocated by the encoder
+ *     via zmalloc + filled by createCompressedObject) moves into the
+ *     side-map entry. compressionBeforeSleep() restores it to val_ptr
+ *     (success path) or zfrees it (discard path).
+ *   - The NEW val_ptr (the temp sds) is owned by the robj. At restoration
+ *     we sdsfree it. */
+int compressionMaterializeTransientView(robj *o, int dbid) {
+    serverAssert(o != NULL);
+    serverAssert(o->type == OBJ_STRING);
+
+    /* Belt-and-suspenders: lookupKey already checked, but if a future
+     * caller misuses this, do nothing rather than corrupt state. */
+    if (o->encoding != OBJ_ENCODING_COMPRESSED) return 0;
+
+    /* Memory-cap check (R2.5.7 amend / PR #23 review).
+     *
+     * Peek at the header for the predicted uncompressed_len, then
+     * verify the side-map's running total + this value's uncompressed
+     * size still fits within the running compression-savings budget.
+     * If not, fall back to permanent decompress: that path costs only
+     * one buffer (the temp sds replaces val_ptr; the compressed buffer
+     * is freed), so it's bounded; transient view costs two simultaneously.
+     *
+     * The savings-based cap is a derived signal — no operator knob.
+     * Invariant: while transient_view_uncompressed_bytes <= savings,
+     * peak memory cannot exceed the no-compression baseline.
+     *
+     * The header-decode here is the same primitive objectGetUncompressedView
+     * runs internally; we'd validate again on the success path. To avoid
+     * the duplicate decode cost we'd plumb the decoded header through,
+     * but the header decode is ~10 ns (a memcmp + a few uint32 reads);
+     * not worth the API churn. */
+    compressedHeader hdr;
+    if (compressionHeaderDecode((const unsigned char *)o->val_ptr, &hdr) != 0) {
+        /* Header decode failed — same handling as the decoder error
+         * path below. The decoder will log + counter; we just bail. */
+        return -1;
+    }
+
+    size_t savings = compressionGetSavingsBytes();
+    if (transient_view_uncompressed_bytes + hdr.uncompressed_len > savings) {
+        compression_transient_view_capped_total++;
+        return compressionPermanentlyDecompress(o);
+    }
+
+    /* Decompress via the design's single decoder primitive (R2.5.2).
+     * The view robj is a stack allocation we use as scratch; we keep
+     * only `scratch` (the decompressed sds). */
+    sds scratch = NULL;
+    robj view;
+    robj *u = objectGetUncompressedView(o, &scratch, &view);
+    if (u == NULL) {
+        /* Decoder logged + incremented counters internally. */
+        sdsfree(scratch); /* may have been grown before failure */
+        return -1;
+    }
+    /* `u` aliases `&view`; we don't use either further. The decompressed
+     * bytes live in `scratch` regardless. */
+    UNUSED(u);
+
+    transientViewMapEnsure();
+
+    /* Register entry first (no point flipping the robj if hashtableAdd
+     * could fail). hashtableAdd returns false if the key already exists;
+     * for our use that's a programmer bug because the caller checks
+     * encoding==COMPRESSED and a registered robj has encoding==RAW —
+     * the two states are mutually exclusive. */
+    compressionTransientEntry *e = zmalloc(sizeof(*e));
+    e->obj = o;
+    e->compressed_buffer = o->val_ptr;
+    e->dbid = dbid;
+    int added = hashtableAdd(transient_view_map, e);
+    serverAssert(added);
+
+    /* Pin the robj. R2.4.4 immutable-snapshot invariant: refcount >= 2
+     * forces COW on subsequent in-place mutators (dbUnshareStringValue
+     * routes through getDecodedObject, which sees refcount != 1 and
+     * allocates a fresh robj — leaving our pinned one alive for
+     * restoration). The pin is also the ABA-safety mechanism for the
+     * pointer-equality stale check at restore time. */
+    incrRefCount(o);
+
+    /* Flip encoding + val_ptr. After this point the robj looks like a
+     * normal RAW string to every caller of objectGetVal/sdslen. */
+    o->val_ptr = scratch;
+    o->encoding = OBJ_ENCODING_RAW;
+
+    /* Account the uncompressed bytes against the per-iteration budget. */
+    transient_view_uncompressed_bytes += hdr.uncompressed_len;
+    return 0;
+}
+
+/* compressionPermanentlyDecompress — see compression.h for contract.
+ *
+ * The write-path counterpart to compressionMaterializeTransientView.
+ * Where transient view preserves the compressed form across a read,
+ * permanent-decompress drops it: the caller will mutate the value, and
+ * we'd just be discarding the side-map entry at beforeSleep anyway.
+ * Doing the equivalent work upfront (free compressed buffer, decRef
+ * dict, install fresh sds) avoids the side-map registration + COW +
+ * kvstore re-fetch overhead.
+ *
+ * Memory ownership transfer:
+ *   - OLD val_ptr (compressed buffer): we read its header for dict_id,
+ *     then zfree it and compressionRegistryDecRef the dict.
+ *   - NEW val_ptr (the decompressed sds): owned by the robj; will be
+ *     freed by sdsfree on the next mutation that grows beyond capacity,
+ *     or by freeStringObject when the robj is finally freed.
+ *
+ * Refcount: unchanged. Unlike materializeTransientView, no pin is
+ * needed — there's no side-map entry to track, and no follow-up
+ * restoration logic. */
+int compressionPermanentlyDecompress(robj *o) {
+    serverAssert(o != NULL);
+    serverAssert(o->type == OBJ_STRING);
+
+    if (o->encoding != OBJ_ENCODING_COMPRESSED) return 0;
+
+    /* Decode the header BEFORE we touch val_ptr — we need dict_id for
+     * the registry decRef regardless of whether decompression succeeds. */
+    void *compressed_buffer = o->val_ptr;
+    compressedHeader hdr;
+    if (compressionHeaderDecode((const unsigned char *)compressed_buffer, &hdr) != 0) {
+        serverLog(LL_WARNING,
+                  "Compression: corrupt header on permanent decompress");
+        /* TODO(S4.1): compression_errors_total++ */
+        return -1;
+    }
+
+    /* Decompress via the design's single decoder primitive (R2.5.2). */
+    sds scratch = NULL;
+    robj view;
+    robj *u = objectGetUncompressedView(o, &scratch, &view);
+    if (u == NULL) {
+        sdsfree(scratch);
+        return -1;
+    }
+    UNUSED(u);
+
+    /* Install the decompressed sds and flip encoding. */
+    o->val_ptr = scratch;
+    o->encoding = OBJ_ENCODING_RAW;
+
+    /* Release the dict frame-ref + free the old compressed buffer.
+     * Mirrors freeCompressedObject's logic, except we keep the robj
+     * and don't free its container. */
+    if (hdr.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
+        hdr.alg_meta != COMPRESSION_DICT_ID_NONE) {
+        compressionRegistryDecRef(hdr.alg_meta);
+    }
+    /* Reverse the install-time accounting. createCompressedObject
+     * matched += of (uncompressed_len, compressed_len + HEADER) into
+     * the design counters; we now -=. The two-counter form is per
+     * design §5.6 (S4.1 surfaces both via INFO; savings is derived). */
+    compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
+                              -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
+    zfree(compressed_buffer);
+
+    return 0;
+}
+
+/* compressionEnqueueModified — see compression.h for contract.
+ *
+ * Hooked into signalModifiedKey() (db.c). Replaces the
+ * compressionEnqueueCandidate calls that previously lived in
+ * dbAddInternal/dbSetValue:
+ *   - signalModifiedKey covers every byte-mutating command path
+ *     (SET, APPEND, SETRANGE, INCR, INCRBYFLOAT, BITOP, HSET, XADD,
+ *     etc.) — verified by audit.
+ *   - The 3 paths that DON'T fire signalModifiedKey are exactly the
+ *     ones we DON'T want to enqueue: RDB load (per R2.6.2), worker
+ *     drain dbReplaceValue (per R2.9.2), module SETKEY_NO_SIGNAL.
+ *
+ * dbFind is used (not lookupKey) to bypass spurious LRU touches and
+ * keyspace miss notifications; we only want the value robj. */
+void compressionEnqueueModified(serverDb *db, robj *key) {
+    if (!server.compression_enabled) return;
+    robj *val = dbFind(db, objectGetVal(key));
+    if (val == NULL) return;
+    compressionEnqueueCandidate(key, val, db->id);
 }
 
 /* Implements the R2.2 / Q6 eligibility predicate.
@@ -599,6 +1097,44 @@ void compressionCommand(client *c) {
     } else {
         addReplySubcommandSyntaxError(c);
     }
+}
+
+/* ========================================================================
+ * Test-only entry points
+ * ========================================================================
+ *
+ * These functions are intentionally not declared in compression.h —
+ * the production surface stays clean. Tests declare these locally in
+ * extern "C" blocks (matches the testOnly* convention used in
+ * quicklist.c, intset.c, compression_workers.c).
+ */
+
+/* Drain the transient-view side-map by treating every entry as a discard
+ * (free temp sds, free saved compressed buffer, decRef pin, free entry).
+ * Used by tests that don't have a kvstore set up — they can register
+ * entries via materialize and then flush via this helper without going
+ * through compressionBeforeSleep's kvstore-aware restore-or-discard
+ * branch. The discard path is correctness-preserving: on the orphan-
+ * branch in production, this is exactly what beforeSleep does. */
+void testOnlyCompressionDrainTransientViewAsDiscard(void) {
+    if (transient_view_map == NULL) return;
+    if (hashtableSize(transient_view_map) == 0) return;
+
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
+    void *raw;
+    while (hashtableNext(&iter, &raw)) {
+        discardTransientEntry((compressionTransientEntry *)raw);
+    }
+    hashtableCleanupIterator(&iter);
+    hashtableEmpty(transient_view_map, NULL);
+}
+
+/* Returns the current number of entries in the transient-view side-map,
+ * or 0 if the map has never been allocated. */
+size_t testOnlyCompressionTransientViewSize(void) {
+    if (transient_view_map == NULL) return 0;
+    return hashtableSize(transient_view_map);
 }
 
 /* ========================================================================

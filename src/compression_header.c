@@ -22,6 +22,7 @@
  */
 
 #include "server.h"
+#include "compression.h"
 #include "compression_header.h"
 #include "compression_registry.h"
 #include "serverassert.h"
@@ -110,6 +111,17 @@ robj *createCompressedObject(int type, void *buffer, size_t buffer_len) {
         compressionRegistryIncRef(h.alg_meta);
     }
 
+    /* Account the install in the design §5.6 counters: total
+     * uncompressed payload bytes and total on-heap compressed bytes
+     * (frame + 16-byte header). Atomic because the matching free path
+     * can run on bio (lazyfree). The savings counter that the
+     * transient-view memory cap (R2.5.7) consults is derived from
+     * these two via compressionGetSavingsBytes(); we deliberately
+     * track both totals rather than just savings so S4.1 can surface
+     * them under their canonical INFO field names. */
+    compressionAccountInstall((int64_t)h.uncompressed_len,
+                              (int64_t)h.compressed_len + COMPRESSION_HEADER_SIZE);
+
     return o;
 }
 
@@ -129,6 +141,11 @@ void freeCompressedObject(robj *o) {
         h.alg_meta != COMPRESSION_DICT_ID_NONE) {
         compressionRegistryDecRef(h.alg_meta);
     }
+
+    /* Reverse the install accounting. May run on a bio thread
+     * (lazyfree); compressionAccountInstall is atomic. */
+    compressionAccountInstall(-(int64_t)h.uncompressed_len,
+                              -((int64_t)h.compressed_len + COMPRESSION_HEADER_SIZE));
 
     zfree(buffer);
 }

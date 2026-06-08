@@ -774,7 +774,10 @@ void debugCommand(client *c) {
         for (j = 0; j < keys; j++) {
             snprintf(buf, sizeof(buf), "%s:%lu", (c->argc == 3) ? "key" : (char *)objectGetVal(c->argv[3]), j);
             key = createStringObject(buf, strlen(buf));
-            if (lookupKeyWrite(c->db, key) != NULL) {
+            /* LOOKUP_NO_BYTES (S2.8): DEBUG POPULATE only checks if the key
+             * already exists before populating; the value's bytes are
+             * never read. */
+            if (lookupKeyWriteWithFlags(c->db, key, LOOKUP_NO_BYTES) != NULL) {
                 decrRefCount(key);
                 continue;
             }

@@ -1685,9 +1685,14 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs) {
 /* ======================= The OBJECT and MEMORY commands =================== */
 
 /* This is a helper function for the OBJECT command. We need to lookup keys
- * without any modification of LRU or other parameters. */
+ * without any modification of LRU or other parameters.
+ *
+ * LOOKUP_NO_BYTES (S2.8): OBJECT introspection (ENCODING, REFCOUNT, IDLETIME,
+ * FREQ) and MEMORY USAGE need only metadata. Avoiding the transient-view
+ * decompression here keeps the truthful "compressed" encoding visible to
+ * operators AND saves the per-call decompression CPU. */
 robj *objectCommandLookup(client *c, robj *key) {
-    return lookupKeyReadWithFlags(c->db, key, LOOKUP_NOTOUCH | LOOKUP_NONOTIFY);
+    return lookupKeyReadWithFlags(c->db, key, LOOKUP_NOTOUCH | LOOKUP_NONOTIFY | LOOKUP_NO_BYTES);
 }
 
 robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply) {

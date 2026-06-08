@@ -157,7 +157,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
   - Returns `NULL` on any failure (corrupt header, missing dict, ZSTD error). Caller logs / increments `compression_errors_total` and translates to a client-visible error.
   - Rationale for the `view_out` out-parameter (vs returning a heap robj): keeps every read of every compressed value off the allocator hot path. Stack-allocated `robj` + `OBJ_STATIC_REFCOUNT` matches the existing `initStaticStringObject` pattern in `server.h`.
 
-  **In v1 the helper is called from inside `lookupKey*`** when the caller passes the `LOOKUP_READ_BYTES` flag; this implements the transient-view model (R2.5.7). A small set of paths that bypass lookupKey (AOF rewrite child, RDB save for replication full-sync, R2.6.8) call the helper directly. The helper itself is unchanged across these call sites — the centralization is in *who* calls it, not in *how* it works.
+  **In v1 the helper is called from inside `lookupKey*`** when the caller does NOT pass the `LOOKUP_NO_BYTES` opt-out flag; this implements the transient-view model (R2.5.7). A small set of paths that bypass lookupKey (AOF rewrite child, RDB save for replication full-sync, R2.6.8) call the helper directly. The helper itself is unchanged across these call sites — the centralization is in *who* calls it, not in *how* it works.
 - **R2.5.3** The helper **must not** call `signalModifiedKey`. (Q11)
 - **R2.5.4** `compression-max-value-size` (default `131072` bytes = 128 KiB, `0` = no bound) excludes values large enough that their main-thread decompression cost is not worth the memory win, keeping per-read decompression latency within the event-loop budget. (Q7)
 - **R2.5.5** **Per-read decompression cost is proportional to value size** (~1 µs/KB at ZSTD level 3 with dictionary). **Multi-key commands pay the sum of per-value costs**, with no per-command cap — by design: a per-command cap would either break transparency (error mid-command) or defeat its own purpose (block). v1 is tuned for the small/moderate-value sweet spot (256 B – 8 KB). Workloads that routinely read many compressed values per command (wide `MGET`, long `SORT`, scripts touching many keys, heavy pipelines over large values) should benchmark before enabling; their remedies are (a) raise `compression-min-value-size` or lower `compression-max-value-size` to exclude the large values, or (b) wait for v2 async decompression. (Q7)
@@ -171,7 +171,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     Auto-demotion of read-hot compressed values is explicit v2 scope (Appendix D — "Read-hot compressed value auto-demotion"). The v1 ship gate is that the cost is **bounded** (R2.5.4) and **observable** (R2.10.2); operator action remains the only demotion path.
 
-- **R2.5.7** **Transient decompression model.** Sub-section §2.5.1–§2.5.6 describes *what* decompression looks like to callers. R2.5.7 specifies *where* it is integrated into the read path. The single decoder helper (R2.5.2) is called from inside `lookupKey*` when the caller passes the new `LOOKUP_READ_BYTES` flag. The lookupKey path then:
+- **R2.5.7** **Transient decompression model.** Sub-section §2.5.1–§2.5.6 describes *what* decompression looks like to callers. R2.5.7 specifies *where* it is integrated into the read path. The single decoder helper (R2.5.2) is called from inside `lookupKey*` when the caller does NOT pass the new `LOOKUP_NO_BYTES` opt-out flag. The lookupKey path then:
 
     1. Decompresses the value into a freshly-allocated **temp uncompressed sds**.
     2. Saves the original compressed buffer pointer in a per-server **decompression side-map**, keyed by the robj address.
@@ -189,7 +189,11 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     **ABA safety.** The pin keeps the original robj address reserved by the allocator for the duration of the transient state. A subsequent mutation creates a new robj at a different address. Pointer comparison at restoration time is therefore decisive (same property as the dict-lifetime invariant in §4.4 and the write-path stale check in §4.6).
 
-    **Memory bound.** Peak memory during an event-loop iteration that touches N compressed keys: sum of N uncompressed sizes (the temp sds allocations) plus the compressed buffers (still alive in the side-map). Both forms exist simultaneously. The bound: **at most the uncompressed dataset size — i.e., the same memory the dataset would use if compression were disabled.** No additional cap is needed; the feature cannot make memory worse than the no-compression baseline.
+    **Memory bound.** A naive transient-view implementation would let peak memory during an event-loop iteration grow as `sum(uncompressed_i) + sum(compressed_i)` over the keys touched — i.e., **`(1 + ratio)` × the no-compression baseline**, since both the temp sds and the compressed buffer live simultaneously for each entry. With `compression-max-value-size = 128 KiB` and a Lua script that touches 10 000 compressed keys without yielding, peak memory could reach ~1.5 GB above baseline.
+
+    To prevent this OOM hazard, materialize is **capped against the running compression-savings counter**: `transient_view_uncompressed_bytes ≤ compression_savings_bytes` where `compression_savings_bytes = total_uncompressed - total_compressed` across all currently-installed compressed frames. When the next materialize would exceed the cap, the path falls back to **permanent decompress** for that value (the same code that handles `LOOKUP_WRITE` lookups). The fallback releases the compressed form for that specific value, freeing memory the side-map would otherwise have held; the value re-compresses on the next sweep tick if still eligible.
+
+    The cap is a **derived signal** — no operator-tunable knob. Its semantic is the right invariant: while transient views never spend more than what compression has saved, peak memory stays at-or-below the no-compression baseline by construction. Cap exhaustion is observable via `compression_transient_view_capped_total` (S4.1 surfaces it via `INFO compression`).
 
     **Deferred-pointer-capture sites within the lookupKey-routed path.** A small number of code paths capture a pointer derived from `val_ptr` into a structure that persists across the event-loop boundary, most notably `_addBulkStrRefToBufferOrList` (the bulk-reply zero-copy path used by `tryAvoidBulkStrCopyToReply`). For these sites the transient-view model would otherwise produce a use-after-free at IO-thread write time. The fix is to force-copy on bulk replies when the robj is in the transient-view side-map: `isCopyAvoidPreferred` returns 0 via a `transientViewActive(obj)` predicate (O(1) hashtable lookup keyed by robj pointer). See Appendix E.7 for the full audit and resolution; the implementation lands with the side-map (PR 2 of the S2.8 split).
 
@@ -200,7 +204,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     The replication feed (`feedReplicationBufferWithObject` in `src/replication.c`) operates on `argv` arguments and synthetic SELECT robjs — never on kvstore values. **No decompression needed.** AOF append (steady-state) likewise propagates command argv, not kvstore values.
 
-    **`LOOKUP_READ_BYTES` flag plumbing.** Most lookupKey* callers read value bytes; the few that don't (introspection: `OBJECT ENCODING`, `DEBUG OBJECT`; eviction sampler; active-expiry) explicitly opt out by omitting the flag. This preserves the operator-visible encoding (compressed values appear as `compressed` to introspection commands) and avoids unnecessary decompression CPU on metadata-only paths.
+    **`LOOKUP_NO_BYTES` flag plumbing.** Most lookupKey* callers read value bytes; the default behavior (no flag) is to decompress into a transient view. The few callers that don't read bytes (introspection: `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`; existence checks like `EXISTS` / `TYPE`; eviction sampler; active-expiry; TTL/expire commands) explicitly opt out by passing `LOOKUP_NO_BYTES`. This preserves the operator-visible encoding (compressed values appear as `compressed` to introspection commands) and avoids unnecessary decompression CPU on metadata-only paths.
 
 ### 2.6 Persistence
 
@@ -363,7 +367,7 @@ graph TB
 
 All feature integration happens at a small, well-defined set of seams:
 
-- **Read path** (`lookupKey*` in `src/db.c`): every type-command handler already funnels through this. Handlers that read value bytes pass `LOOKUP_READ_BYTES`; the lookup helper transparently decompresses (transient-view model — R2.5.7). `objectGetUncompressedView` remains the single decoder primitive (R2.5.2) but is invoked from inside the lookupKey path for centralized control. Three out-of-process paths bypass this hook (AOF rewrite child, RDB save for replication full-sync, worker threads) and call the helper explicitly.
+- **Read path** (`lookupKey*` in `src/db.c`): every type-command handler already funnels through this. Handlers that read value bytes pass no extra flag; the lookup helper transparently decompresses (transient-view model — R2.5.7). Handlers that don't need bytes (introspection, existence checks, expire) pass `LOOKUP_NO_BYTES` to opt out. `objectGetUncompressedView` remains the single decoder primitive (R2.5.2) but is invoked from inside the lookupKey path for centralized control. Three out-of-process paths bypass this hook (AOF rewrite child, RDB save for replication full-sync, worker threads) and call the helper explicitly.
 - **Write path** (`dbAddInternal`, `dbSetValue`, `dbOverwrite` in `src/db.c`): on insert/overwrite, check eligibility and enqueue on the candidate inbox. Compression itself happens later, off-thread.
 - **Replication feed** (`feedReplicationBufferWithObject` in `src/replication.c`): routes through `objectGetUncompressedView`.
 - **AOF writer**: routes through `objectGetUncompressedView`.
@@ -417,7 +421,7 @@ All new source files live under `src/`. Every `.c` is registered in **both** `sr
 | `src/server.c` | Call `compressionInit` at startup; wire `compressionCron` into `serverCron`; wire `compressionAfterSleep` into the event-loop `afterSleep` hook; add `infoCompression` to `genValkeyInfoString`. |
 | `src/object.c` | `createCompressedObject`; `freeStringObject` frees compressed buffers correctly; `OBJECT ENCODING` returns `"compressed"`. |
 | `src/config.c` | Register `compression-*` configs; register `compression_cpulist`. |
-| `src/db.c` | `lookupKey*` accepts a new `LOOKUP_READ_BYTES` flag. When set on a compressed value, decompresses transparently into a temp sds and registers the robj in the per-server transient-view side-map (see §2.5.7). `dbAddInternal`, `dbSetValue`, `dbOverwrite` call `compressionEnqueueCandidate(obj)` after the new value is installed. |
+| `src/db.c` | `lookupKey*` accepts a new `LOOKUP_NO_BYTES` flag. When set on a compressed value, the lookup leaves it compressed (no decode, no side-map registration); useful for introspection / existence / expire commands that don't need byte content. When NOT set on a compressed value (default), decompresses transparently into a temp sds and registers the robj in the per-server transient-view side-map (see §2.5.7). `dbAddInternal`, `dbSetValue`, `dbOverwrite` call `compressionEnqueueCandidate(obj)` after the new value is installed. |
 | `src/t_string.c` | `getCommand`, `appendCommand`, `strlenCommand`, `getrangeCommand`, `setrangeCommand` etc. route through `objectGetUncompressedView` for reads and decompress-in-place for writes on compressed values. |
 | `src/replication.c` | `feedReplicationBufferWithObject` routes through `objectGetUncompressedView`. |
 | `src/aof.c` | `feedAppendOnlyFile` path routes through `objectGetUncompressedView`. |
@@ -1125,7 +1129,7 @@ This is the leakage surface for approach 1. Even one missed site creates silent 
 | `OBJECT ENCODING` consistent | Yes | **No** — changes after first GET | Yes |
 | Sweep treadmill | No | **Yes** — read-hot keys cycle decompress→sweep→compress | No |
 | CPU per repeat-read in same loop iteration | N decompresses for N reads | 0 (after first) | 1 decompress + 1 free restore |
-| Memory peak during loop | Low | Low | Bounded by uncompressed-baseline |
+| Memory peak during loop | Low | Low | Bounded by uncompressed-baseline (savings-based cap; falls back to permanent decompress when exceeded) |
 | Defrag impact | None | None | None (verified) |
 | Module API compat | Yes | Yes | Yes (with documented contract) |
 | Out-of-process work required | AOF rewrite, RDB-rep | AOF rewrite, RDB-rep | AOF rewrite, RDB-rep |
@@ -1140,20 +1144,20 @@ The "out-of-process work" row is identical across all three approaches and not a
 
 3. **Free restoration.** The "restore" is a pointer swap, not a re-compression: `o->val_ptr = saved_compressed_buffer; o->encoding = COMPRESSED; sdsfree(temp_sds)`. No `ZSTD_compress_usingCDict` call. The compressed bytes never went away — val_ptr just pointed at the temp sds during the iteration.
 
-4. **Bounded memory inflation.** Worst-case peak memory during an event-loop iteration = compressed buffers (still alive in side-map) + temp uncompressed sds for each touched key. The bound: **at most the uncompressed dataset size** — i.e., the same memory the dataset would use if compression were disabled. No arbitrary cap is needed; the feature cannot make memory worse than the no-compression baseline.
+4. **Bounded memory inflation.** Worst-case peak memory during an event-loop iteration = compressed buffers (still alive in side-map) + temp uncompressed sds for each touched key. The bound: **at most the uncompressed dataset size** — i.e., the same memory the dataset would use if compression were disabled. The bound is *enforced* by the savings-based cap (R2.5.7): `transient_view_uncompressed_bytes ≤ compression_savings_bytes`. When the next materialize would exceed the cap, the path falls back to `compressionPermanentlyDecompress` for that value; counted in `compression_transient_view_capped_total`. By construction, the feature cannot make memory worse than the no-compression baseline.
 
 5. **Reuses existing v1 invariants.** No new fundamental mechanism is introduced:
    - **R2.4.4** (refcount > 1 → COW via `dbUnshareStringValue`): pre-existing invariant. The transient model's pin (`incrRefCount(o)`) makes it apply automatically — mutating commands COW into a fresh robj, leaving the transient robj intact for restoration. **Mutation detection is free** at beforeSleep via pointer comparison.
    - **PR #19's pointer-equality stale check** (write-path drain): already a working primitive in `compressionInstall`. The same pattern detects "robj displaced from kvstore slot" at restoration time.
    - **R2.5.2 single decoder helper** (`objectGetUncompressedView`): unchanged. The transient model just calls it from inside lookupKey instead of from each handler.
 
-6. **Operationally clean introspection.** `OBJECT ENCODING` and `DEBUG OBJECT` opt out of `LOOKUP_READ_BYTES` (they don't need bytes; they read encoding metadata) and continue to report the truthful "compressed" state. `MEMORY USAGE` is unchanged (returns compressed footprint via `zmalloc_size`). No operator-visible surprises.
+6. **Operationally clean introspection.** `OBJECT ENCODING`, `DEBUG OBJECT`, `MEMORY USAGE`, `EXISTS`, `TYPE` and other metadata-only commands pass `LOOKUP_NO_BYTES` and continue to report the truthful "compressed" state — no decompression cost on these paths. Byte-reading commands (default behavior, no flag) get transparent decompression via the transient view. No operator-visible surprises.
 
 ### E.5 Limitations and notes for future work
 
 - **Module API contract clarification.** `RM_StringDMA` returns a pointer valid until the next event-loop yield; modules retaining pointers across yields must re-fetch via a new DMA call. This is already the documented contract — the transient model just makes it strictly enforced rather than informally honored.
 
-- **Long Lua scripts and `MULTI`/`EXEC`.** Within a script or transaction, `beforeSleep` does not fire — the side-map accumulates for the duration of the script. Bounded by uncompressed-baseline (E.3 / R2.5.7). No special handling needed.
+- **Long Lua scripts and `MULTI`/`EXEC`.** Within a script or transaction, `beforeSleep` does not fire — the side-map accumulates for the duration of the script. The savings-based cap (R2.5.7) applies on every materialize regardless of caller context, so a script touching many compressed keys hits cap-fallback (permanent decompress) before peak memory exceeds the no-compression baseline.
 
 - **AOF rewrite child** and **RDB save for replication full-sync** still require explicit `objectGetUncompressedView` calls in the iteration loop. These are S3.1/S3.3 work (persistence subsystem), not S2.8.
 

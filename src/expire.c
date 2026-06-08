@@ -796,7 +796,9 @@ void expireGenericCommand(client *c, mstime_t basetime, int unit) {
         when = 0;
     }
 
-    robj *obj = lookupKeyWrite(c->db, key);
+    /* LOOKUP_NO_BYTES (S2.8): setting a TTL only inspects key presence
+     * and metadata; no need to decompress the value via transient view. */
+    robj *obj = lookupKeyWriteWithFlags(c->db, key, LOOKUP_NO_BYTES);
 
     /* No key, return zero. */
     if (obj == NULL) {
@@ -900,7 +902,9 @@ void ttlGenericCommand(client *c, int output_ms, int output_abs) {
     mstime_t expire, ttl = -1;
 
     /* If the key does not exist at all, return -2 */
-    if ((o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOTOUCH)) == NULL) {
+    /* LOOKUP_NO_BYTES (S2.8): TTL/PTTL/EXPIRETIME only need the expire
+     * metadata; the value's bytes are never read. */
+    if ((o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOTOUCH | LOOKUP_NO_BYTES)) == NULL) {
         addReplyLongLong(c, -2);
         return;
     }
@@ -941,7 +945,9 @@ void pexpiretimeCommand(client *c) {
 
 /* PERSIST key */
 void persistCommand(client *c) {
-    if (lookupKeyWrite(c->db, c->argv[1])) {
+    /* LOOKUP_NO_BYTES (S2.8): PERSIST clears the TTL on a key; the
+     * value's bytes are never read. */
+    if (lookupKeyWriteWithFlags(c->db, c->argv[1], LOOKUP_NO_BYTES)) {
         if (removeExpire(c->db, c->argv[1])) {
             signalModifiedKey(c, c->db, c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "persist", c->argv[1], c->db->id);
@@ -958,8 +964,10 @@ void persistCommand(client *c) {
 /* TOUCH key1 [key2 key3 ... keyN] */
 void touchCommand(client *c) {
     int touched = 0;
+    /* LOOKUP_NO_BYTES (S2.8): TOUCH only updates LRU; the value's bytes
+     * are never read. */
     for (int j = 1; j < c->argc; j++)
-        if (lookupKeyRead(c->db, c->argv[j]) != NULL) touched++;
+        if (lookupKeyReadWithFlags(c->db, c->argv[j], LOOKUP_NO_BYTES) != NULL) touched++;
     addReplyLongLong(c, touched);
 }
 
