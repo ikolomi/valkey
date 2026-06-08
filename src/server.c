@@ -1851,6 +1851,12 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
+    /* Restore the compressed view for any robjs that were transiently
+     * decompressed during the previous iteration's lookupKey* calls
+     * (LOOKUP_READ_BYTES). See design §2.5.7. Currently a no-op stub —
+     * activated in PR 2 of the S2.8 split. */
+    compressionBeforeSleep();
+
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
 

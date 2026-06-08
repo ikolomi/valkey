@@ -127,6 +127,25 @@ void compressionAfterSleep(void) {
     compressionWorkersDrainOutbox(256);
 }
 
+void compressionBeforeSleep(void) {
+    /* TODO(S2.8-activate): restore transiently-decompressed values registered
+     * by lookupKey* with LOOKUP_READ_BYTES (per design §2.5.7 + Appendix E).
+     *
+     * Activation lands in PR 2 of the S2.8 split:
+     *   - Iterate the per-server transient-view side-map.
+     *   - For each entry, re-fetch the kvstore slot for the key.
+     *   - If slot->value == job->value: restore via pointer swap (free temp
+     *     sds, restore compressed buffer to val_ptr, encoding back to
+     *     OBJ_ENCODING_COMPRESSED).
+     *   - Otherwise (mutated/overwritten/expired): discard (free temp sds,
+     *     free saved compressed buffer, decRef the orphan).
+     *   - Drop the pin in either case.
+     *
+     * For the skeleton (PR 1) the function is a no-op. The hook into
+     * beforeSleep is established here so PR 2 can ship the lookupKey-side
+     * decompression + side-map population without touching server.c again. */
+}
+
 /* ========================================================================
  * Toggle stub
  * ======================================================================== */

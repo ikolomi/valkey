@@ -41,6 +41,14 @@ void compressionCron(void);
 /* Called from the event-loop afterSleep hook. Drains the worker outbox. */
 void compressionAfterSleep(void);
 
+/* Called from the event-loop beforeSleep hook. Restores the compressed view
+ * for any robjs that were transiently decompressed during the previous
+ * iteration's lookupKey* calls (LOOKUP_READ_BYTES). Restoration is a free
+ * pointer-swap when the kvstore slot still points at the pinned robj;
+ * mutated/overwritten/expired entries are detected via pointer-equality
+ * staleness check and discarded. See design §2.5.7 + Appendix E. */
+void compressionBeforeSleep(void);
+
 /* Called once from finishShutdown(). Stops the worker pool (joins all
  * worker threads), then releases the dictionary registry. The order
  * matters — workers must be joined before the registry is freed; this
