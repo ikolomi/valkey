@@ -7561,10 +7561,33 @@ struct COMMAND_STRUCT COMMANDLOG_Subcommands[] = {
 #define COMPRESSION_STATUS_Keyspecs NULL
 #endif
 
+/********** COMPRESSION SWEEP ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* COMPRESSION SWEEP history */
+#define COMPRESSION_SWEEP_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* COMPRESSION SWEEP tips */
+#define COMPRESSION_SWEEP_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* COMPRESSION SWEEP key specs */
+#define COMPRESSION_SWEEP_Keyspecs NULL
+#endif
+
+/* COMPRESSION SWEEP argument table */
+struct COMMAND_ARG COMPRESSION_SWEEP_Args[] = {
+{MAKE_ARG("direction",ARG_TYPE_STRING,-1,NULL,"direction=compress (default) walks every eligible string value and queues it for background compression. direction=decompress walks every compressed value and decompresses it in place; useful as the explicit drain step after disabling the feature.",NULL,CMD_ARG_OPTIONAL,0,NULL)},
+};
+
 /* COMPRESSION command table */
 struct COMMAND_STRUCT COMPRESSION_Subcommands[] = {
 {MAKE_CMD("help","Returns helpful text about the different COMPRESSION subcommands.","O(1)","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_HELP_History,0,COMPRESSION_HELP_Tips,0,compressionCommand,2,CMD_LOADING|CMD_STALE,ACL_CATEGORY_SLOW,NULL,COMPRESSION_HELP_Keyspecs,0,NULL,0)},
 {MAKE_CMD("status","Returns the current state of the real-time compression feature.","O(1)","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_STATUS_History,0,COMPRESSION_STATUS_Tips,0,compressionCommand,2,CMD_LOADING|CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_SLOW,NULL,COMPRESSION_STATUS_Keyspecs,0,NULL,0)},
+{MAKE_CMD("sweep","Trigger a compression sweep over the keyspace.","O(N) where N is the number of keys. Spread across multiple cron ticks under `compression-sweep-max-cpu-pct` pacing; does not block the main thread.","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_SWEEP_History,0,COMPRESSION_SWEEP_Tips,0,compressionCommand,-2,CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_SLOW,NULL,COMPRESSION_SWEEP_Keyspecs,0,NULL,1),.args=COMPRESSION_SWEEP_Args},
 {0}
 };
 

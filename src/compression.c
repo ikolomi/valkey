@@ -27,6 +27,7 @@
 #include "compression_registry.h"
 #include "compression_workers.h"
 #include "compression_train.h"
+#include "compression_sweep.h"
 #include "lrulfu.h"
 
 #include <stdatomic.h>
@@ -315,6 +316,7 @@ void compressionInit(void) {
     }
     /* TODO(S1.x): compressionTrainInit(); */
     compressionTrainInit();
+    compressionSweepInit();
 }
 
 /* Called from finishShutdown in src/server.c. Must run BEFORE
@@ -322,6 +324,7 @@ void compressionInit(void) {
  * teardown. */
 void compressionShutdown(void) {
     compressionWorkersStop();
+    compressionSweepRelease();
 
     /* Drain the transient-view side-map. In normal operation the
      * map is emptied at every beforeSleep, so it should be empty
@@ -357,7 +360,11 @@ void compressionShutdown(void) {
 void compressionCron(void) {
     /* Training: trigger evaluation, scan advancement, completion polling. */
     compressionTrainCron();
-    /* TODO(Phase 1): sweep tick + pacing. */
+    /* Sweep: per-tick advancement of an in-flight keyspace sweep
+     * (operator-triggered via COMPRESSION SWEEP, or auto-triggered on
+     * the master-switch no→yes transition). Honors
+     * compression-sweep-max-cpu-pct for pacing. */
+    compressionSweepCron();
 }
 
 void compressionAfterSleep(void) {
@@ -1043,9 +1050,23 @@ int compressionForceTrain(client *c) {
 }
 
 int compressionSweep(client *c, int direction) {
-    UNUSED(direction);
-    addReplyError(c, kDisabledReply);
-    return C_ERR;
+    /* Reject if the master switch is off — without it the sweep cron
+     * tick is a no-op and the request would silently dangle. */
+    if (!server.compression_enabled) {
+        addReplyError(c, "compression is disabled (CONFIG SET compression-enabled yes)");
+        return C_ERR;
+    }
+
+    if (compressionSweepRequest(direction) == 0) {
+        /* Single-flight: a sweep was already in-flight. Tell the
+         * operator they need to wait. */
+        addReplyError(c,
+                      "a compression sweep is already in progress; "
+                      "wait for it to complete before issuing another");
+        return C_ERR;
+    }
+    addReply(c, shared.ok);
+    return C_OK;
 }
 
 int compressionDictList(client *c) {
@@ -1084,15 +1105,52 @@ void compressionCommand(client *c) {
     } else if (!strcasecmp(sub, "enable") || !strcasecmp(sub, "disable")) {
         /* Phase 0: these are accepted but inert. */
         addReply(c, shared.ok);
+    } else if (!strcasecmp(sub, "sweep")) {
+        /* COMPRESSION SWEEP [direction=compress|decompress]
+         *
+         * Optional direction argument. Default: compress. The
+         * argument is parsed as a literal `direction=<value>` token
+         * to leave room for additional sweep options without
+         * reshuffling argv. */
+        int direction = COMPRESSION_SWEEP_DIR_COMPRESS;
+        if (c->argc == 3) {
+            const char *arg = (const char *)objectGetVal(c->argv[2]);
+            const char *eq = strchr(arg, '=');
+            if (eq == NULL || strncasecmp(arg, "direction", (size_t)(eq - arg)) != 0) {
+                addReplyError(c,
+                              "syntax: COMPRESSION SWEEP [direction=compress|decompress]");
+                return;
+            }
+            const char *val = eq + 1;
+            if (!strcasecmp(val, "compress")) {
+                direction = COMPRESSION_SWEEP_DIR_COMPRESS;
+            } else if (!strcasecmp(val, "decompress")) {
+                direction = COMPRESSION_SWEEP_DIR_DECOMPRESS;
+            } else {
+                addReplyError(c,
+                              "direction must be 'compress' or 'decompress'");
+                return;
+            }
+        } else if (c->argc != 2) {
+            addReplyErrorArity(c);
+            return;
+        }
+        compressionSweep(c, direction);
     } else if (!strcasecmp(sub, "help")) {
         const char *help[] = {
             "STATUS",
             "    Return the current compression state.",
+            "SWEEP [direction=compress|decompress]",
+            "    Trigger a keyspace sweep. Default direction is 'compress' —",
+            "    walks every eligible string value and queues it for",
+            "    background compression. direction=decompress walks every",
+            "    compressed value and decompresses it in place; useful as the",
+            "    explicit drain step after disabling the feature.",
             "HELP",
             "    Print this help.",
             "",
             "Note: compression is in Phase 0 (skeleton). Additional",
-            "subcommands (DICT LIST/DROP/EXPORT/IMPORT, SWEEP, TRAIN,",
+            "subcommands (DICT LIST/DROP/EXPORT/IMPORT, TRAIN,",
             "ENABLE, DISABLE) land in Phase 1.",
             NULL};
         addReplyHelp(c, help);

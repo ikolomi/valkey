@@ -1,0 +1,30 @@
+{
+    "SWEEP": {
+        "summary": "Trigger a compression sweep over the keyspace.",
+        "complexity": "O(N) where N is the number of keys. Spread across multiple cron ticks under `compression-sweep-max-cpu-pct` pacing; does not block the main thread.",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": -2,
+        "container": "COMPRESSION",
+        "function": "compressionCommand",
+        "command_flags": [
+            "STALE"
+        ],
+        "acl_categories": [
+            "ADMIN",
+            "SLOW"
+        ],
+        "arguments": [
+            {
+                "name": "direction",
+                "type": "string",
+                "optional": true,
+                "summary": "direction=compress (default) walks every eligible string value and queues it for background compression. direction=decompress walks every compressed value and decompresses it in place; useful as the explicit drain step after disabling the feature."
+            }
+        ],
+        "reply_schema": {
+            "description": "OK if the sweep was queued; an error if a sweep is already in progress or the master switch is off.",
+            "type": "string"
+        }
+    }
+}
