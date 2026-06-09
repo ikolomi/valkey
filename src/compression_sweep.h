@@ -40,7 +40,7 @@
 /* Sweep direction. The integer values match the public
  * `compressionSweep(client *c, int direction)` API in compression.h
  * (`1 = compress, -1 = decompress`). */
-#define COMPRESSION_SWEEP_DIR_COMPRESS   1
+#define COMPRESSION_SWEEP_DIR_COMPRESS 1
 #define COMPRESSION_SWEEP_DIR_DECOMPRESS (-1)
 
 /* Lifecycle — called by compressionInit / compressionShutdown. */

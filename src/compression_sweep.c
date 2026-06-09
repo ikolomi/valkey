@@ -55,12 +55,12 @@ typedef enum {
 
 typedef struct compressionSweepState {
     sweepStateEnum state;
-    int direction;             /* COMPRESSION_SWEEP_DIR_{COMPRESS,DECOMPRESS} */
-    int requested;             /* 1 = a sweep was asked for; cleared when scan starts */
-    int requested_direction;   /* direction of the queued request */
-    int current_db;            /* 0..dbnum-1 — DB being scanned */
-    unsigned long long cursor; /* kvstore scan cursor within current_db */
-    unsigned long long visited; /* keys touched this run, for the completion log */
+    int direction;                               /* COMPRESSION_SWEEP_DIR_{COMPRESS,DECOMPRESS} */
+    int requested;                               /* 1 = a sweep was asked for; cleared when scan starts */
+    int requested_direction;                     /* direction of the queued request */
+    int current_db;                              /* 0..dbnum-1 — DB being scanned */
+    unsigned long long cursor;                   /* kvstore scan cursor within current_db */
+    unsigned long long visited;                  /* keys touched this run, for the completion log */
     unsigned long long enqueued_or_decompressed; /* successful work this run */
     monotime started_at;
 } compressionSweepState;

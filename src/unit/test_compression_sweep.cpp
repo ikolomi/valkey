@@ -139,8 +139,7 @@ uint32_t installSyntheticDict() {
  * shape (embedded key, RAW encoding, cold lru) so kvstoreHashtableAdd
  * + drain-time pointer-equality checks both work.
  */
-robj *makeKeyedRawString(const char *key, size_t value_len, int seed,
-                         bool compressible) {
+robj *makeKeyedRawString(const char *key, size_t value_len, int seed, bool compressible) {
     sds val = sdsnewlen(NULL, value_len);
     if (compressible) {
         /* JSON-shaped — same patterns as the corpus → high compression. */
@@ -185,10 +184,10 @@ EncodingCounts countEncodings(int dbid) {
         c.total++;
         switch (o->encoding) {
         case OBJ_ENCODING_COMPRESSED: c.compressed++; break;
-        case OBJ_ENCODING_RAW:        c.raw++; break;
-        case OBJ_ENCODING_EMBSTR:     c.embstr++; break;
-        case OBJ_ENCODING_INT:        c.int_enc++; break;
-        default:                      c.other++; break;
+        case OBJ_ENCODING_RAW: c.raw++; break;
+        case OBJ_ENCODING_EMBSTR: c.embstr++; break;
+        case OBJ_ENCODING_INT: c.int_enc++; break;
+        default: c.other++; break;
         }
     }
     kvstoreIteratorRelease(it);
@@ -207,19 +206,34 @@ int driveAndDrain(int max_iterations_ms) {
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(max_iterations_ms);
     int iterations = 0;
+
+    /* Phase 1: drive the sweep state machine until it hits IDLE.
+     * Each loop iteration: one cron tick + one drain of any outbox
+     * results that surfaced during this tick. */
     while (std::chrono::steady_clock::now() < deadline) {
         iterations++;
         compressionSweepDriveForTesting(1);
         compressionWorkersDrainOutbox(/*budget=*/256);
-        if (!compressionSweepIsScanning()) {
-            /* Sweep done. Drain any final outbox items the workers
-             * are still finishing. */
-            for (int i = 0; i < 5; i++) {
-                int got = compressionWorkersDrainOutbox(256);
-                if (got == 0) break;
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-            }
-            break;
+        if (!compressionSweepIsScanning()) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+
+    /* Phase 2: sweep is IDLE but workers may still be processing jobs
+     * the sweep enqueued. Drain until we see a sustained stretch of
+     * zero results (workers truly idle). 32-bit and slow CI runners
+     * are noticeably slower than amd64 here — keep the budget
+     * generous. We exit early if the deadline expires too. */
+    int consecutive_zero_drains = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int got = compressionWorkersDrainOutbox(/*budget=*/256);
+        if (got == 0) {
+            consecutive_zero_drains++;
+            /* 10 consecutive empty drains spaced ~500 µs apart = 5 ms
+             * of quiescence, which is well past the worst-case
+             * worker-to-drain handoff latency on a slow CI runner. */
+            if (consecutive_zero_drains >= 10) break;
+        } else {
+            consecutive_zero_drains = 0;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
@@ -254,7 +268,7 @@ class CompressionSweepTest : public ::testing::Test {
         server.compression_min_value_size = 64;
         server.compression_max_value_size = 131072;
         server.compression_min_savings_ratio = 10;
-        server.compression_lfu_threshold = 255; /* don't filter on LFU */
+        server.compression_lfu_threshold = 255;  /* don't filter on LFU */
         server.compression_min_idle_seconds = 0; /* don't filter on LRU */
         server.compression_dict_max_versions = 4;
         server.hz = 10;
@@ -472,27 +486,34 @@ TEST_F(CompressionSweepTest, SparseDbIteratesPastNullSlots) {
  * rejected (returns 0). The first sweep continues unaffected. */
 TEST_F(CompressionSweepTest, SingleFlightRejectsConcurrentRequest) {
     ASSERT_NE(0u, installSyntheticDict());
-    /* Populate a lot of values so the sweep takes >1 cron tick. */
+    /* Populate enough values so the sweep can't possibly finish in
+     * one cron tick under tight pacing. */
     constexpr int n = 500;
     for (int i = 0; i < n; i++) {
         char keybuf[64];
         snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
-        robj *o = makeKeyedRawString(keybuf, 4096, i, true);
+        robj *o = makeKeyedRawString(keybuf, 1024, i, true);
         kvstoreHashtableAdd(server.db[0]->keys, 0, o);
     }
-    /* Constrain sweep budget so it definitely takes multiple ticks. */
+    /* Force a tiny per-tick budget. The budget formula is
+     * `pct * 1000000 / 100 / hz`; with pct=1 and hz=500 we get
+     * 20 µs/tick — well below the few-ms it takes to enqueue 500
+     * keys, so the first cron tick is guaranteed to leave the
+     * sweep in SCANNING state. */
     server.compression_sweep_max_cpu_pct = 1;
+    server.hz = 500;
 
     EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
     /* Drive one tick — sweep enters SCANNING. */
     compressionSweepDriveForTesting(1);
-    EXPECT_TRUE(compressionSweepIsScanning());
+    ASSERT_TRUE(compressionSweepIsScanning());
 
     /* Second request: refused. */
     EXPECT_EQ(0, compressionSweepRequest(COMPRESSION_SWEEP_DIR_DECOMPRESS));
 
     /* Restore pacing and drive to completion. */
     server.compression_sweep_max_cpu_pct = 100;
+    server.hz = 10;
     driveAndDrain(2000);
     EXPECT_FALSE(compressionSweepIsScanning());
     EXPECT_EQ(n, countEncodings(0).compressed);
