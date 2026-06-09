@@ -134,6 +134,15 @@ static void trainingScanCallback(void *privdata, void *entry, int didx) {
 static unsigned long long totalDbKeys(void) {
     unsigned long long total = 0;
     for (int j = 0; j < server.dbnum; j++) {
+        /* server.db is sparse: created on first use of each DB. Slots
+         * 1..dbnum-1 are NULL until something accesses them via
+         * createDatabaseIfNeeded() (called from selectDb / SWAPDB).
+         * On a fresh server with default `databases 16`, only db[0]
+         * is materialized; iterating through 1..15 dereferences NULL.
+         * A NULL DB trivially has 0 keys; skip it. Same guard pattern
+         * is used by the equivalent loop in server.c (e.g. the
+         * blocking/watched-keys aggregator). */
+        if (server.db[j] == NULL) continue;
         total += kvstoreSize(server.db[j]->keys);
     }
     return total;
@@ -200,6 +209,16 @@ static void advanceScan(compressionTrainState *ts) {
 
     while (1) {
         serverDb *db = server.db[ts->current_db];
+        if (db == NULL) {
+            /* Sparse DB slot (never accessed). Treated as empty —
+             * advance to the next slot. Same NULL guard as totalDbKeys
+             * above. */
+            ts->current_db++;
+            if (ts->current_db >= server.dbnum) {
+                break; /* All DBs scanned. */
+            }
+            continue;
+        }
         ts->cursor = kvstoreScan(db->keys, ts->cursor, -1,
                                  trainingScanCallback, NULL, ts);
 

@@ -131,4 +131,30 @@ start_server {tags {"compression"}} {
         assert_match "*compression_enabled:0*" $status
         r config set compression-enabled no
     }
+
+    test {Server survives cron ticks while compression-enabled is yes} {
+        # Regression for the totalDbKeys NULL deref: the previous test
+        # toggles compression-enabled yes/no synchronously, racing past
+        # the cron tick at hz=10 (the toggle sequence runs in <10 ms;
+        # the next cron tick fires ~100 ms later). That window hid a
+        # crash where compressionTrainCron's totalDbKeys() was iterating
+        # `j < server.dbnum` without checking that `server.db[j]` is
+        # non-NULL — true for slots 1..dbnum-1 on a fresh server before
+        # they get materialized via createDatabaseIfNeeded(). To guard
+        # against future regressions, this test enables the feature
+        # then waits long enough for multiple cron ticks (default hz=10
+        # → 100 ms each) to fire while the master switch is on, then
+        # asserts the server is still alive.
+        r config set compression-enabled yes
+        # Wait ~5 cron ticks plus margin.
+        after 600
+        assert_equal "PONG" [r ping]
+        # Also stress the path with one DB slot populated so the loop
+        # iterates past index 0 and hits the would-be NULL slots.
+        r set keyfortrain "value"
+        after 300
+        assert_equal "PONG" [r ping]
+        r config set compression-enabled no
+        r del keyfortrain
+    }
 }
