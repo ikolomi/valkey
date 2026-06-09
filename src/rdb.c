@@ -41,6 +41,7 @@
 #include "stream.h"
 #include "functions.h"
 #include "intset.h" /* Compact integer set structure */
+#include "compression.h"
 #include "bio.h"
 #include "zmalloc.h"
 #include "module.h"
@@ -554,6 +555,38 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
      * object is already integer encoded. */
     if (obj->encoding == OBJ_ENCODING_INT) {
         return rdbSaveLongLongAsStringObject(rdb, (long)objectGetVal(obj));
+    } else if (obj->encoding == OBJ_ENCODING_COMPRESSED) {
+        /* RDB save runs in a forked child (BGSAVE, AOF rewrite preamble,
+         * full-sync replication) iterating the kvstore directly,
+         * bypassing the lookupKey() transient-view hook. We get the
+         * compressed encoding here and must decompress on the fly.
+         *
+         * Per R2.6.5 (AOF preamble) and R2.6.8 (full-sync replication
+         * RDB), uncompressed bytes are mandatory. Per R2.6.1, disk RDB
+         * MAY contain compressed values for memory savings on reload —
+         * but that's the RDB_ENC_COMPRESSED encoding (S3.1/S3.2),
+         * which is not yet implemented. Until S3.1/S3.2 lands, the
+         * conservative choice for ALL RDB targets is uncompressed,
+         * matching pre-feature behavior. Disk RDB pays the
+         * decompression cost once at save time and re-acquires the
+         * compression at load time via the sweeper.
+         *
+         * Dict lifetime safety: registry is a fork-time snapshot;
+         * DDicts are immutable; child uses its own copy of the
+         * registry pointers. */
+        sds scratch = NULL;
+        robj view;
+        robj *u = objectGetUncompressedView(obj, &scratch, &view);
+        if (u == NULL) {
+            /* Decoder failed (corrupt frame, missing dict). Decoder
+             * logs internally; return failure so the RDB save reports
+             * a clean error rather than panicking. */
+            sdsfree(scratch);
+            return -1;
+        }
+        ssize_t ret = rdbSaveRawString(rdb, (unsigned char *)scratch, sdslen(scratch));
+        sdsfree(scratch);
+        return ret;
     } else {
         serverAssertWithInfo(NULL, obj, sdsEncodedObject(obj));
         return rdbSaveRawString(rdb, objectGetVal(obj), sdslen(objectGetVal(obj)));

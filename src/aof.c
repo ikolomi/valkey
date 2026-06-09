@@ -32,6 +32,7 @@
 #include "rio.h"
 #include "functions.h"
 #include "module.h"
+#include "compression.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -1905,6 +1906,32 @@ int rioWriteBulkObject(rio *r, robj *obj) {
      * in a child process when this function is called). */
     if (obj->encoding == OBJ_ENCODING_INT) {
         return rioWriteBulkLongLong(r, (long)objectGetVal(obj));
+    } else if (obj->encoding == OBJ_ENCODING_COMPRESSED) {
+        /* AOF on-disk format is uncompressed RESP per R2.6.5. AOF
+         * rewrite runs in a forked child and iterates the kvstore
+         * directly, bypassing the lookupKey() transient-view hook —
+         * so we get the compressed encoding here as-is and must
+         * decompress on the fly.
+         *
+         * The decoder is sync; the dictionary registry is a fork-time
+         * snapshot. Dict lifetime is safe because the parent's
+         * registry GC cannot reach into the child's address space —
+         * the child uses its own copy of the registry pointers and
+         * the immutable DDicts they reference. */
+        sds scratch = NULL;
+        robj view;
+        robj *u = objectGetUncompressedView(obj, &scratch, &view);
+        if (u == NULL) {
+            /* Decoder failed (corrupt frame, missing dict, etc.).
+             * The decoder logs internally and increments
+             * compression_errors_total. Return failure so the AOF
+             * rewrite reports a clean error rather than crashing. */
+            sdsfree(scratch);
+            return 0;
+        }
+        int ret = rioWriteBulkString(r, scratch, sdslen(scratch));
+        sdsfree(scratch);
+        return ret;
     } else if (sdsEncodedObject(obj)) {
         return rioWriteBulkString(r, objectGetVal(obj), sdslen(objectGetVal(obj)));
     } else {
