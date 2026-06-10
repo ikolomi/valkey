@@ -746,8 +746,8 @@ TEST_F(CompressionSweepTest, BeforeSleepCooperatesWithDecompressSweep) {
     /* Step 6: verify permanent-decompress, NOT restoration. */
     EXPECT_EQ(OBJ_ENCODING_RAW, (int)target->encoding);
     EXPECT_EQ(temp_sds_ptr, target->val_ptr) << "val_ptr should be unchanged "
-        << "(permanent-decompress mode keeps the temp sds installed; "
-        << "restore mode would have swapped back to compressed_buffer)";
+                                             << "(permanent-decompress mode keeps the temp sds installed; "
+                                             << "restore mode would have swapped back to compressed_buffer)";
     EXPECT_EQ(0, transientViewActive(target));
 
     /* Step 7: drive sweep to completion + final cleanup. */
