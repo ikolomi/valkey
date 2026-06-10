@@ -60,9 +60,22 @@ Requirements are consolidated from `idea-honing.md`. Each bullet is traceable to
 
 - **R2.1.1** The feature is gated by a master switch `compression-enabled` (bool, default `no`, `MODIFIABLE_CONFIG`). When `no`, no compression CPU is spent and no worker threads run. (Q5)
 - **R2.1.2** Two surfaces toggle the switch: `CONFIG SET compression-enabled yes|no` (primary) and `COMPRESSION ENABLE`/`COMPRESSION DISABLE` (convenience alias, writes a `LL_NOTICE` log entry for audit trails). (Q5)
-- **R2.1.3** `no → yes` transition: background sweeper starts on the next cron tick; values are compressed opportunistically by new writes and by the sweeper. `COMPRESSION SWEEP` triggers immediate sweep. **Operators who want to enable without auto-sweeping existing data** can achieve this without any new config: set `compression-threads 0` before the toggle (worker pool disabled, candidates queue but no work happens), flip the master switch, then raise `compression-threads` to 1+ when ready to drain the queue. This is the symmetric counterpart to the `yes → no` default in R2.1.4. (Q5)
-- **R2.1.4** `yes → no` transition: new writes stop being compressed; existing compressed values continue to be decompressed **on read only** (cold/untouched keys remain compressed indefinitely); the dictionary registry stays alive. No automatic full-keyspace decompress. Operator explicitly runs `COMPRESSION SWEEP direction=decompress` to decompress all keys in the background — this **guarantees eventual full coverage** regardless of read activity, and eventually drains the compressed-frame population so the dictionary registry can retire. Peak memory during an explicit sweep grows proportionally to the uncompressed dataset size (factor `1/compression_ratio` vs. the compressed baseline — e.g. ~2–3× for typical ratios of 0.3–0.5), but growth is bounded by `compression-sweep-max-cpu-pct` pacing — never a synchronous spike. (Q5)
+- **R2.1.3** `no → yes` transition: master switch turns on. Eligible new writes (R2.2) are queued for background compression by the worker pool. The dictionary registry is consulted; if no active dict exists, training is triggered (R2.3.5) and writes are buffered until a dict is promoted (R2.1.5 third state). **Existing values in memory are not retroactively compressed.** Operator explicitly runs `COMPRESSION SWEEP direction=compress` to enqueue every eligible existing value for compression in the background. (Q5)
+- **R2.1.4** `yes → no` transition: master switch turns off. New writes stop being compressed (the eligibility predicate R2.2 returns false; the write-path enqueue path no-ops; an in-flight compress sweep aborts on the next cron tick — see §3.4 sweep state machine). Existing compressed frames continue to live in the kvstore in compressed form. The transient-view model (R2.5.7) still applies on read paths and restores the compressed form at the next `beforeSleep` boundary; cold/untouched keys remain compressed indefinitely; mutated values follow the write-path permanent-decompress described in R2.5.7. The dictionary registry stays alive. **Existing compressed values are not retroactively decompressed.** Operator explicitly runs `COMPRESSION SWEEP direction=decompress` to drain all compressed frames in the background — while a decompress sweep is running, the transient-view drain switches to permanent-decompression (R2.5.7) to cooperate. The decompress sweep guarantees eventual full coverage regardless of read activity, and eventually drains the compressed-frame population so the dictionary registry can retire (R2.3.4). Peak memory during the operator-initiated sweep grows proportionally to the uncompressed dataset size (factor `1/compression_ratio` vs. the compressed baseline — e.g. ~2–3× for typical ratios of 0.3–0.5), but growth is bounded by `compression-sweep-max-cpu-pct` pacing — never a synchronous spike. (Q5)
 - **R2.1.5** A third state — "`compression-enabled yes` but no active dictionary for new writes" — behaves identically to disabled for writes. Decompression of any existing compressed frames continues to work: **refcount-based dictionary retirement (R2.3.4) and the safety check in `COMPRESSION DICT DROP` (§4.5) together guarantee that a dict cannot be freed while any frame references it.** A "retiring" dict stays in the registry and services decompressions until its last referencing frame is rewritten, overwritten, expired, or explicitly decompressed. The state *"no dicts in registry AND compressed frames exist"* is by-construction unreachable. Documented as expected behavior. (Q5)
+- **R2.1.6** **Master-switch semantics — rationale.** R2.1.3 and R2.1.4 deliberately treat `compression-enabled` as a switch over **future behavior**, not over **current state**. Toggling the switch never retroactively converts in-memory data; the operator runs `COMPRESSION SWEEP direction=…` explicitly when they want the keyspace converted. This matches the pattern of every other "stop doing X" master switch in the codebase:
+
+  | Toggle | Enabling does | Enabling does NOT do | Disabling does | Disabling does NOT do |
+  |---|---|---|---|---|
+  | `appendonly yes\|no` | Begin appending new commands to the AOF | Backfill missed writes from the keyspace | Stop appending new commands | Delete the existing AOF file |
+  | `rdbcompression yes\|no` | Compress new RDB string payloads (LZF) | Recompress existing in-memory snapshots | Stop compressing new RDB string payloads | Decompress existing chunks in the on-disk RDB |
+  | `notify-keyspace-events <flags>` | Begin emitting matching events from now on | Replay already-occurred events | Stop emitting | Undo events already emitted to subscribers |
+  | `replica-read-only yes\|no` | Begin rejecting writes on replica | Replay or roll back any past state | Begin accepting writes on replica | Reverse past read-only behavior |
+  | `lazyfree-lazy-* yes\|no` | Switch future evictions/expirations to async | Convert previously-synchronous frees to async retroactively | Switch future evictions to sync | Synchronously re-collect already-freed objects |
+  | `maxmemory-policy noeviction → allkeys-lru` | Begin evicting under pressure | Reverse the absence of past evictions | Stop evicting | Restore previously evicted keys |
+  | `protected-mode yes\|no` | Reject external connections going forward | Disconnect already-accepted external connections | Accept external connections going forward | Re-accept previously-disconnected ones |
+
+  Compression follows the same pattern: the master switch governs which writes will be compressed and which sweeps may run; in-memory state is preserved across toggles. An auto-trigger on enable was considered (Appendix D — `compression-auto-sweep-on-enable`) and rejected for v1: it would be the only "stop doing X" switch in Valkey that *reverses* state on toggle, and it conflicts with the common "operator wants to test the toggle without disrupting state" workflow. Operators who want eager retroactive conversion run the explicit `COMPRESSION SWEEP` after toggling. (Q5; refined during S2.9 review)
 
 ### 2.2 Value eligibility
 
@@ -189,11 +202,17 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
     4. Replaces `o->val_ptr` with the temp sds and flips `o->encoding` from `OBJ_ENCODING_COMPRESSED` to `OBJ_ENCODING_RAW`.
     5. Returns `o` — every caller downstream sees a normal RAW string robj, with no awareness of compression.
 
-    The compressed form is restored at the next event-loop boundary. The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map:
+    The compressed form is restored at the next event-loop boundary. The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map. The drain operates in one of two modes per iteration, selected based on whether an explicit decompress sweep is in flight:
 
-    - For each entry, re-fetch the kvstore slot for the key.
-    - If `slot->value == o` (the pinned robj is still in the slot, unchanged), restore via pointer swap: free temp sds, restore compressed buffer to `val_ptr`, flip encoding back to `OBJ_ENCODING_COMPRESSED`. **This is O(1) per entry with no decompression or compression cost** — the compressed bytes never went away, we just had val_ptr point at the temp sds during the iteration.
-    - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, free the saved compressed buffer, decrement the pin (which may free the orphaned robj).
+    - **Restore mode** (default): used whenever no decompress sweep is currently scanning. For each entry, re-fetch the kvstore slot for the key.
+        - If `slot->value == o` (the pinned robj is still in the slot, unchanged), restore via pointer swap: free temp sds, restore compressed buffer to `val_ptr`, flip encoding back to `OBJ_ENCODING_COMPRESSED`. **This is O(1) per entry with no decompression or compression cost** — the compressed bytes never went away, we just had val_ptr point at the temp sds during the iteration. Drop the pin (refcount 2→1; kvstore retains its reference).
+        - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, release the saved compressed buffer (decRef the dict frame-ref, update accounting, free the buffer), drop the pin (which may free the orphaned robj).
+
+    - **Permanent-decompress mode**: used when `compressionSweepIsScanning() && compressionSweepCurrentDirection() == COMPRESSION_SWEEP_DIR_DECOMPRESS` at drain entry. The operator has explicitly asked for the keyspace to be drained; the transient-view drain cooperates by finalizing each side-map entry as RAW instead of restoring the compressed form. For each entry:
+        - If the slot still points at the pinned robj: leave the temp sds installed as the value, release the saved compressed buffer (decRef dict frame-ref, update accounting, free the buffer), encoding stays `OBJ_ENCODING_RAW`. The value is now permanently decompressed; drop the pin. Every read of a still-compressed key during the sweep saves the sweep one item of work.
+        - Otherwise: same discard path as restore mode. Mode selection per iteration; no per-entry branching beyond the slot check.
+
+    Mode selection rationale aligns with R2.1.6: when no sweep is running (default state, including immediately after a `yes → no` toggle), restoration preserves existing compressed state per "master switch governs future behavior." When an operator explicitly issues `COMPRESSION SWEEP direction=decompress`, that intent extends to the iteration drain — both paths converge on the same goal of draining the compressed-frame population.
 
     **Mutation-detection invariant.** The pin (`refcount = 2`) forces any subsequent mutating command to honor the `dbUnshareStringValue` discipline (R2.4.4), creating a fresh robj that replaces the kvstore slot. The original (transient) robj is left intact for restoration; the slot now points elsewhere — detected at restoration time via pointer comparison. **No mutation-time hook is needed in any byte-mutating site.** This is the same staleness mechanism used by the write-path drain handler (R2.4.3 / §4.6).
 
@@ -405,6 +424,36 @@ Separation invariants:
 - Workers never touch `robj` or mutate the registry — see §2.11 R2.11.4 for the full worker contract and §4.4 for the QSBR lifetime model.
 - `bio` is reused for training (one-at-a-time, long-running); not for per-value compression.
 - Synchronous decompression runs on the main thread directly; no offload.
+
+### 3.4 Sweep state machine
+
+The keyspace sweep is a single-flight state machine driven by `compressionSweepCron()` (called from `serverCron`) and parameterized at request time. Two states (`IDLE`, `SCANNING`) and one direction property (`COMPRESS` / `DECOMPRESS`); transitions are observed on each cron tick or on each public `compressionSweep(client, direction)` API call.
+
+The table is the authoritative specification for the v1 sweep behavior. R2.1.3, R2.1.4, R2.1.6, R2.5.7, R2.9.2, and §6.6 all read against it.
+
+| Current state | Trigger | Master switch | Next state | Side effects |
+|---|---|---|---|---|
+| `IDLE` | `request(COMPRESS)` from `compressionSweep` cmd | on | `IDLE.requested(COMPRESS)` | `+OK` reply |
+| `IDLE` | `request(COMPRESS)` from `compressionSweep` cmd | off | `IDLE` (unchanged) | command rejected: *"compression is disabled; only direction=decompress is permitted"* |
+| `IDLE` | `request(DECOMPRESS)` from `compressionSweep` cmd | * | `IDLE.requested(DECOMPRESS)` | `+OK` reply |
+| `IDLE.requested(D)` | cron tick | (D=COMPRESS && off) — defensive | `IDLE` | clear `requested`; should be unreachable since the command handler rejects the COMPRESS-while-off case |
+| `IDLE.requested(D)` | cron tick | (otherwise) | `SCANNING(D)` | log `LL_NOTICE` "Compression sweep: started (direction=...)" |
+| `SCANNING(D)` | `request(D)` (same direction) | * | `SCANNING(D)` | `+OK` reply (idempotent — the in-flight sweep already covers the requested intent) |
+| `SCANNING(D1)` | `request(D2)`, D1 ≠ D2 | * | `SCANNING(D1)` | command rejected: *"a {compress\|decompress} sweep is in progress; toggle compression-enabled to abort an in-flight compress sweep, or wait for completion"*. v2 considers queueing or abort-and-restart (Appendix D). |
+| `SCANNING(COMPRESS)` | cron tick | on | `SCANNING(COMPRESS)` | `advanceScan()`; on completion → `IDLE` + log |
+| `SCANNING(COMPRESS)` | cron tick | off (master switch turned off mid-sweep) | `IDLE` | log `LL_NOTICE` "Compression sweep aborted: master switch turned off". In-flight worker-pool jobs (already enqueued by sweepScanCallback) still complete and install — workers don't observe the master switch (R2.4 / R2.11.4). The sweep state machine is the authoritative lever; further work just stops being produced. |
+| `SCANNING(DECOMPRESS)` | cron tick | * (any) | `SCANNING(DECOMPRESS)` | `advanceScan()`; on completion → `IDLE` + log. **This is the canonical drain path for R2.1.4** — runs whether the master switch is on or off. |
+
+Interaction with the transient-view drain (§2.5.7):
+
+- When `state == SCANNING(DECOMPRESS)`, the drain in `compressionBeforeSleep` switches to permanent-decompress mode. Read-touched compressed keys are converted to RAW in cooperation with the sweep, instead of being restored to compressed form.
+- All other states (`IDLE`, `SCANNING(COMPRESS)`) leave the drain in restore mode — the default behavior preserves existing compressed state across reads.
+
+What the v1 state machine does **not** support:
+
+- **Different-direction request while `SCANNING`**: rejected, not queued. Operator must wait for the current sweep to complete, or use the master-switch toggle as the abort lever for an in-flight compress sweep.
+- **Abort command for an in-flight decompress sweep**: not provided. A decompress sweep is idempotent (worst case it touches every key once and produces zero work for already-RAW values), so the missing affordance has limited operational impact.
+- **Memory-pressure pause during the decompress sweep**: not provided. Pacing limits CPU but does not currently throttle on `used_memory`. v2 may add a `compression_decompress_paused_oom` INFO field plus a backoff cycle.
 
 ---
 
@@ -1061,6 +1110,7 @@ Deferred to **v2** as a targeted optimization: speculative pre-decompression for
 | Async decompression | Yes | Planned as opt-in `compression-async-decompress-threshold` (default `0` = disabled). |
 | Decompressed-view coexistence cache | Yes | Planned as orthogonal extension. |
 | Adaptive kill-switch | Yes | Planned as opt-in `compression-kill-switch` (default `no`). |
+| Auto-trigger sweep on `compression-enabled` toggle | Yes | Planned as opt-in `compression-auto-sweep-on-enable` (default `no`) and `compression-auto-sweep-on-disable` (default `no`). v1 deliberately keeps both directions operator-driven per R2.1.6: master switches in Valkey govern future behavior, not current state. Operators who want eager retroactive conversion run the explicit `COMPRESSION SWEEP direction=…` after the toggle. |
 | Read-hot compressed value auto-demotion | Yes | Planned — sweeper-based demotion mirroring the compress eligibility filter, with hysteresis. Adds `compression-promote-min-freq` (LFU mode) / `compression-promote-max-idle-seconds` (LRU/noeviction) configs. Closes the R2.5.6 gap (read-only-hot keys keep paying decompression CPU until operator intervention). |
 | Compressed-in-place cluster `MIGRATE` | Yes | Planned — ship dict prelude inside the RDB chunk. |
 | Cluster-wide dictionary gossip | Yes | Conditional — only if operational pain surfaces. Preshared import (R2.3.10) covers the deterministic-fleet use case today. |
