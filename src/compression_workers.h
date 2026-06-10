@@ -65,9 +65,11 @@
  *
  * Called from compressionInit (startup) and from the
  * `compression-threads` config apply path (runtime resize). `n_threads`
- * == 0 disables the pool entirely — eligible candidates still enqueue
- * but no work happens (this is the "enable without auto-sweep" pattern
- * from §2.1 R2.1.3).
+ * == 0 disables the pool entirely — eligible write-path candidates
+ * (and any explicit COMPRESSION SWEEP direction=compress request) still
+ * enqueue but no work happens; the inbox accumulates until the pool is
+ * resized back up. Useful as a "pause new compression without
+ * disabling the feature" knob.
  *
  * Start/stop are NOT reentrant. Calling Start when already running, or
  * Stop when not running, is a programmer error and trips an assertion.

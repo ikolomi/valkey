@@ -410,10 +410,11 @@ void compressionShutdown(void) {
 void compressionCron(void) {
     /* Training: trigger evaluation, scan advancement, completion polling. */
     compressionTrainCron();
-    /* Sweep: per-tick advancement of an in-flight keyspace sweep
-     * (operator-triggered via COMPRESSION SWEEP, or auto-triggered on
-     * the master-switch no→yes transition). Honors
-     * compression-sweep-max-cpu-pct for pacing. */
+    /* Sweep: per-tick advancement of an in-flight keyspace sweep.
+     * Triggered exclusively by the operator-issued `COMPRESSION SWEEP`
+     * command (R2.1.6 — master-switch toggles do NOT auto-trigger
+     * sweeps in v1). Honors compression-sweep-max-cpu-pct for pacing.
+     * State-machine semantics in detailed-design.md §3.4. */
     compressionSweepCron();
 }
 
