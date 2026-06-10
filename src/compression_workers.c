@@ -419,24 +419,33 @@ void compressionWorkersStop(void) {
 
     /* Drain any leftover inbox items. If the pool was stopped while
      * jobs were in flight, the workers may have left some unconsumed.
-     * Free their job structs; the caller's incrRefCount on the value
-     * robj is leaked at shutdown — accepted as shutdown cleanup, since
-     * the entire process is exiting. Skip any leftover sentinels —
-     * they're addresses of a static, not heap allocations. */
+     * Free their job structs and drop the caller's pin
+     * (incrRefCount(job->value) at enqueue time → matching decRef
+     * here so the robj's refcount accurately reflects what's left.
+     * Skip any leftover sentinels — they're addresses of a static, not
+     * heap allocations). NULL value is permitted via the test-only
+     * raw-enqueue path (testOnlyCompressionWorkersEnqueueRaw uses a
+     * NULL sentinel; nothing to decRef). */
     void *leftover;
     while ((leftover = mutexQueuePop(pool.inbox, /*blocking=*/false)) != NULL) {
         if (IS_SHUTDOWN_SENTINEL(leftover)) continue;
         compressionJob *job = (compressionJob *)leftover;
+        if (job->value != NULL) decrRefCount(job->value);
         zfree(job->dst);
         zfree(job);
     }
 
-    /* Drain any outbox results similarly. */
+    /* Drain any outbox results similarly. Worker-completed jobs whose
+     * result hasn't been installed: the dict registry IncRef happens
+     * inside the install path (compressionInstall), so an undelivered
+     * outbox entry has NOT incremented the dict frame-ref — zfree(dst)
+     * is correct. The caller's pin must still be released. */
     void *jobs_out[64];
     size_t got;
     while ((got = mpscDequeueBatch(&pool.outbox, jobs_out, 64)) > 0) {
         for (size_t i = 0; i < got; i++) {
             compressionJob *job = jobs_out[i];
+            if (job->value != NULL) decrRefCount(job->value);
             zfree(job->dst);
             zfree(job);
         }

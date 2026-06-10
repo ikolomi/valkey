@@ -548,8 +548,14 @@ TEST_F(CompressionSweepTest, InFlightCompressSweepAbortsOnDisable) {
      * working through the remaining keys. */
     server.compression_sweep_max_cpu_pct = 100;
     server.hz = 10;
-    /* Drain whatever was already in-flight when we aborted. */
-    for (int i = 0; i < 20; i++) compressionWorkersDrainOutbox(256);
+    /* Drain whatever was already in-flight when we aborted. After the
+     * abort no new jobs enqueue; this just lets the workers finish
+     * any compression jobs they had picked up before the abort, and
+     * the drain handler installs the resulting compressed buffers
+     * into the kvstore. Without this, leftover jobs would be cleaned
+     * up at TearDown by compressionWorkersStop, but we want the test
+     * to verify state after a clean drain. */
+    driveAndDrain(2000);
     EncodingCounts after_abort = countEncodings(0);
     EXPECT_LT(after_abort.compressed, n)
         << "abort should have stopped before completing the keyspace";
