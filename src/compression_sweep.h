@@ -71,6 +71,17 @@ int compressionSweepRequest(int direction);
  * accepted. */
 int compressionSweepIsScanning(void);
 
+/* Returns the direction of the in-flight sweep
+ * (COMPRESSION_SWEEP_DIR_COMPRESS or COMPRESSION_SWEEP_DIR_DECOMPRESS),
+ * or 0 if no sweep is currently scanning. Used by the transient-view
+ * drain in `compressionBeforeSleep` to cooperate with an
+ * operator-initiated decompress sweep — when this returns
+ * COMPRESSION_SWEEP_DIR_DECOMPRESS, the drain switches to
+ * permanent-decompress mode (R2.5.7) instead of restoring the
+ * compressed form. Cheap (single int read; no atomics, single-threaded
+ * access from the main thread). */
+int compressionSweepCurrentDirection(void);
+
 /* Test-only: synchronously advance the sweep until completion or
  * `max_iterations` cron ticks elapsed. Returns the number of ticks
  * actually executed. Allows unit tests to drive the state machine

@@ -256,10 +256,60 @@ static inline void transientViewMapEnsure(void) {
     }
 }
 
+/* Release ownership of a compressed buffer: decode the per-value
+ * header to extract the dictID and byte counts, decrement the dict
+ * frame-ref (R2.3.4), reverse the compression accounting (R2.10.1's
+ * compression_total_*_bytes counters), and free the underlying
+ * memory.
+ *
+ * Used by every code path that disposes of a compressed buffer
+ * outside `freeStringObject` (which handles the steady-state
+ * decRef→free path):
+ *   - `compressionPermanentlyDecompress` after installing the
+ *     decompressed sds and flipping encoding to RAW
+ *   - `compressionBeforeSleep` permanent-decompress mode (R2.5.7,
+ *     when a decompress sweep is in flight)
+ *   - `discardTransientEntry` (orphan-branch — the original robj
+ *     was overwritten/expired/COW'd while the compressed bytes
+ *     were squirreled away in the side-map; freeStringObject on the
+ *     dropped robj sees encoding=RAW and never gets to decRef the
+ *     dict for us)
+ *
+ * Caller is responsible for ensuring the buffer is no longer
+ * referenced by any robj's `val_ptr` before calling — this function
+ * does not touch any robj. Returns 0 on success, -1 on header-decode
+ * failure (caller must still free the buffer; counters and dict
+ * remain untouched in that case so they don't drift on corruption). */
+static int releaseCompressedBuffer(void *compressed_buffer) {
+    if (compressed_buffer == NULL) return 0;
+    compressedHeader hdr;
+    if (compressionHeaderDecode((const unsigned char *)compressed_buffer, &hdr) != 0) {
+        serverLog(LL_WARNING,
+                  "Compression: corrupt header on releaseCompressedBuffer; "
+                  "dict frame-ref + accounting not adjusted (will leak).");
+        zfree(compressed_buffer);
+        return -1;
+    }
+    if (hdr.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
+        hdr.alg_meta != COMPRESSION_DICT_ID_NONE) {
+        compressionRegistryDecRef(hdr.alg_meta);
+    }
+    /* Reverse the install-time accounting (R2.10.1; see the createCompressedObject
+     * `compressionAccountInstall(+unc, +comp+HEADER)` call in compression_header.c). */
+    compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
+                              -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
+    zfree(compressed_buffer);
+    return 0;
+}
+
 /* Discard a single transient-view entry: free the temp uncompressed
- * sds, free the saved compressed buffer, NULL val_ptr defensively,
- * decRef the pin (which may free the robj if the kvstore reference
- * has gone away), and free the entry struct itself.
+ * sds, release the saved compressed buffer (decRef dict + accounting
+ * via releaseCompressedBuffer — without this the dict frame-ref leaks
+ * and `compression_total_*_bytes` go stale because freeStringObject
+ * on the dropped robj sees encoding=RAW and skips the decRef path),
+ * NULL val_ptr defensively, decRef the pin (which may free the robj
+ * if the kvstore reference has gone away), and free the entry struct
+ * itself.
  *
  * Used by:
  *   - compressionBeforeSleep on the discard branch (kvstore slot no
@@ -275,7 +325,7 @@ static inline void transientViewMapEnsure(void) {
  * sdsfree(val_ptr); passing NULL is a no-op. */
 static inline void discardTransientEntry(compressionTransientEntry *e) {
     sdsfree((sds)e->obj->val_ptr);
-    zfree(e->compressed_buffer);
+    releaseCompressedBuffer(e->compressed_buffer);
     e->obj->val_ptr = NULL;
     decrRefCount(e->obj);
     zfree(e);
@@ -393,23 +443,46 @@ void compressionAfterSleep(void) {
 }
 
 void compressionBeforeSleep(void) {
-    /* Restore transiently-decompressed values per design §2.5.7 + Appendix E.
+    /* Drain transiently-decompressed values per design §2.5.7 + §3.4
+     * + Appendix E.
      *
-     * For each entry in the side-map:
-     *   (a) Re-fetch the kvstore slot for the key (via the value robj's
-     *       embedded key sds — the pin guarantees the embedded key is
-     *       still valid memory).
-     *   (b) If the slot still points at our pinned robj: restore via
-     *       pointer swap. The compressed bytes never went away; we just
-     *       had val_ptr point at the temp sds during the iteration.
-     *       Free the temp sds, put the compressed buffer back, flip
-     *       encoding back to COMPRESSED. ZERO recompression cost.
-     *   (c) Otherwise (mutation, overwrite, expire, COW-orphaned): the
-     *       slot points elsewhere. Discard via discardTransientEntry
-     *       (frees buffers + pin + entry struct).
-     *   (d) Drop the pin in the restore branch too (decrRef may NOT
-     *       free the robj — kvstore retains its reference; refcount
-     *       goes 2→1).
+     * Two operating modes selected once per invocation based on
+     * whether an explicit decompress sweep is in flight:
+     *
+     *   restore mode (default) — preserves existing compressed state
+     *     across reads. Aligned with R2.1.6's "master switch governs
+     *     future behavior; existing state preserved."
+     *
+     *   permanent-decompress mode — fires when
+     *     compressionSweepIsScanning() &&
+     *     compressionSweepCurrentDirection() == DECOMPRESS.
+     *     The operator has explicitly asked the keyspace to be
+     *     drained; the iteration drain cooperates by finalizing each
+     *     side-map entry as RAW. Every read of a still-compressed
+     *     key during the sweep saves the sweep one item of work.
+     *     Aligned with R2.1.4 + R2.5.7's two-mode contract.
+     *
+     * For each entry, regardless of mode:
+     *   (a) Re-fetch the kvstore slot for the key (via the value
+     *       robj's embedded key sds — the pin guarantees the embedded
+     *       key is still valid memory).
+     *   (b) If the slot still points at our pinned robj:
+     *         restore mode → pointer-swap back to compressed (free
+     *           temp sds, reinstall compressed buffer, flip encoding
+     *           back to OBJ_ENCODING_COMPRESSED). ZERO recompression
+     *           cost.
+     *         permanent mode → leave temp sds installed as the value;
+     *           release the saved compressed buffer (decRef dict +
+     *           reverse accounting via releaseCompressedBuffer);
+     *           encoding stays OBJ_ENCODING_RAW. The value is now
+     *           permanently decompressed.
+     *   (c) Otherwise (mutation, overwrite, expire, COW-orphaned):
+     *         discard via discardTransientEntry. Same path in both
+     *         modes — discardTransientEntry routes through
+     *         releaseCompressedBuffer to keep dict frame-refs +
+     *         accounting consistent.
+     *   (d) Drop the pin in either case (decrRef may NOT free the
+     *       robj — kvstore retains its reference; refcount goes 2→1).
      *
      * Iteration uses HASHTABLE_ITER_SAFE so we can free entry structs
      * inline without confusing the iterator (rehashing is paused for
@@ -417,6 +490,10 @@ void compressionBeforeSleep(void) {
      * pointers (entries already freed). */
     if (transient_view_map == NULL) return;
     if (hashtableSize(transient_view_map) == 0) return;
+
+    int permanent_mode =
+        (compressionSweepIsScanning() &&
+         compressionSweepCurrentDirection() == COMPRESSION_SWEEP_DIR_DECOMPRESS);
 
     hashtableIterator iter;
     hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
@@ -441,19 +518,30 @@ void compressionBeforeSleep(void) {
         void **slot = kvstoreHashtableFindRef(db->keys, dict_index, key_sds);
 
         if (slot != NULL && *slot == o) {
-            /* Restore: pointer swap. The compressed bytes never went
-             * away; we just had val_ptr aliased to the temp sds during
-             * the iteration. Drop the pin (refcount 2→1; kvstore retains
-             * its ref). */
-            sdsfree((sds)o->val_ptr);
-            o->val_ptr = e->compressed_buffer;
-            o->encoding = OBJ_ENCODING_COMPRESSED;
-            decrRefCount(o);
-            zfree(e);
+            if (permanent_mode) {
+                /* Permanent-decompress: leave the temp sds installed
+                 * as the value (encoding already RAW from materialize),
+                 * release the saved compressed buffer (decRef dict +
+                 * reverse accounting). Drop the pin (refcount 2→1;
+                 * kvstore retains its ref). */
+                releaseCompressedBuffer(e->compressed_buffer);
+                decrRefCount(o);
+                zfree(e);
+            } else {
+                /* Restore: pointer swap. The compressed bytes never
+                 * went away; we just had val_ptr aliased to the temp
+                 * sds during the iteration. Drop the pin (refcount
+                 * 2→1; kvstore retains its ref). */
+                sdsfree((sds)o->val_ptr);
+                o->val_ptr = e->compressed_buffer;
+                o->encoding = OBJ_ENCODING_COMPRESSED;
+                decrRefCount(o);
+                zfree(e);
+            }
         } else {
             /* Discard: kvstore slot no longer points at our pinned robj
              * (overwrite/expire/COW). Discard helper handles the buffer
-             * frees, pin decRef, and entry free. */
+             * release, pin decRef, and entry free. */
             discardTransientEntry(e);
         }
     }
@@ -790,16 +878,11 @@ int compressionPermanentlyDecompress(robj *o) {
 
     if (o->encoding != OBJ_ENCODING_COMPRESSED) return 0;
 
-    /* Decode the header BEFORE we touch val_ptr — we need dict_id for
-     * the registry decRef regardless of whether decompression succeeds. */
+    /* Hold the compressed buffer pointer locally; we'll release it
+     * via releaseCompressedBuffer (decode header + decRef dict +
+     * reverse accounting + zfree) after we install the decompressed
+     * sds. */
     void *compressed_buffer = o->val_ptr;
-    compressedHeader hdr;
-    if (compressionHeaderDecode((const unsigned char *)compressed_buffer, &hdr) != 0) {
-        serverLog(LL_WARNING,
-                  "Compression: corrupt header on permanent decompress");
-        /* TODO(S4.1): compression_errors_total++ */
-        return -1;
-    }
 
     /* Decompress via the design's single decoder primitive (R2.5.2). */
     sds scratch = NULL;
@@ -815,20 +898,9 @@ int compressionPermanentlyDecompress(robj *o) {
     o->val_ptr = scratch;
     o->encoding = OBJ_ENCODING_RAW;
 
-    /* Release the dict frame-ref + free the old compressed buffer.
-     * Mirrors freeCompressedObject's logic, except we keep the robj
-     * and don't free its container. */
-    if (hdr.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
-        hdr.alg_meta != COMPRESSION_DICT_ID_NONE) {
-        compressionRegistryDecRef(hdr.alg_meta);
-    }
-    /* Reverse the install-time accounting. createCompressedObject
-     * matched += of (uncompressed_len, compressed_len + HEADER) into
-     * the design counters; we now -=. The two-counter form is per
-     * design §5.6 (S4.1 surfaces both via INFO; savings is derived). */
-    compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
-                              -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
-    zfree(compressed_buffer);
+    /* Release the dict frame-ref + free the old compressed buffer
+     * (mirrors freeCompressedObject's logic, but keeps the robj). */
+    releaseCompressedBuffer(compressed_buffer);
 
     return 0;
 }
@@ -1050,19 +1122,28 @@ int compressionForceTrain(client *c) {
 }
 
 int compressionSweep(client *c, int direction) {
-    /* Reject if the master switch is off — without it the sweep cron
-     * tick is a no-op and the request would silently dangle. */
-    if (!server.compression_enabled) {
-        addReplyError(c, "compression is disabled (CONFIG SET compression-enabled yes)");
+    /* R2.1.4 + §3.4 state-machine table: COMPRESS direction requires
+     * the master switch on (otherwise we'd violate "new writes stop
+     * being compressed" on the disable side). DECOMPRESS direction
+     * is always allowed — it's the canonical drain path for the
+     * yes→no transition; an operator MUST be able to invoke it
+     * after disabling. */
+    if (direction == COMPRESSION_SWEEP_DIR_COMPRESS && !server.compression_enabled) {
+        addReplyError(c, "compression is disabled; only direction=decompress is permitted");
         return C_ERR;
     }
 
     if (compressionSweepRequest(direction) == 0) {
-        /* Single-flight: a sweep was already in-flight. Tell the
-         * operator they need to wait. */
+        /* Single-flight: a sweep is already SCANNING. v1 doesn't
+         * queue or preempt; operator's escape hatch for an in-flight
+         * compress sweep is to toggle compression-enabled off (the
+         * cron tick will observe and abort — §3.4 state-machine
+         * table). A decompress sweep has no abort affordance in v1
+         * because it's idempotent. */
         addReplyError(c,
                       "a compression sweep is already in progress; "
-                      "wait for it to complete before issuing another");
+                      "toggle compression-enabled to abort an in-flight "
+                      "compress sweep, or wait for completion");
         return C_ERR;
     }
     addReply(c, shared.ok);

@@ -412,8 +412,13 @@ TEST_F(CompressionSweepTest, NoActiveDictGracefulNoOp) {
     EXPECT_EQ(n, c.raw);
 }
 
-/* Master switch off: cron tick is a no-op even with a queued request. */
-TEST_F(CompressionSweepTest, MasterSwitchOffMakesCronNoOp) {
+/* P1 (R2.1.6): toggling master switch yes does NOT auto-compress
+ * existing values. The applyCompressionEnabled apply hook was removed;
+ * the master switch now governs only future write eligibility (and
+ * gates compress-direction sweep requests). Operator must run an
+ * explicit `COMPRESSION SWEEP direction=compress` to retroactively
+ * compress the keyspace. */
+TEST_F(CompressionSweepTest, NoAutoTriggerOnEnable) {
     ASSERT_NE(0u, installSyntheticDict());
     constexpr int n = 50;
     for (int i = 0; i < n; i++) {
@@ -423,22 +428,172 @@ TEST_F(CompressionSweepTest, MasterSwitchOffMakesCronNoOp) {
         kvstoreHashtableAdd(server.db[0]->keys, 0, o);
     }
 
-    server.compression_enabled = 0; /* master switch OFF */
-    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
-
-    /* Drive a few ticks — sweep should NOT advance because the cron
-     * function returns early on !server.compression_enabled. */
-    for (int i = 0; i < 10; i++) compressionSweepDriveForTesting(1);
-
-    /* State machine still IDLE (request flag set but never picked up). */
-    EXPECT_FALSE(compressionSweepIsScanning());
-    EXPECT_EQ(0, countEncodings(0).compressed);
-
-    /* Re-enable: pending request gets picked up immediately. */
+    /* Simulate `CONFIG SET compression-enabled no` then `... yes`. The
+     * test fixture's SetUp set compression_enabled = 1; flip to 0
+     * then back to 1. With the apply-hook gone, this is just a flag
+     * write — no sweep should be queued. */
+    server.compression_enabled = 0;
     server.compression_enabled = 1;
+
+    /* Drive cron ticks. State machine must stay IDLE (no requested
+     * flag set; nothing for the cron to pick up). */
+    for (int i = 0; i < 10; i++) compressionSweepDriveForTesting(1);
+    EXPECT_FALSE(compressionSweepIsScanning());
+
+    /* No values compressed — eligibility is enforced at the write path
+     * (compressionEnqueueModified, called from signalModifiedKey),
+     * which the test bypasses by using kvstoreHashtableAdd directly. */
+    EncodingCounts c = countEncodings(0);
+    EXPECT_EQ(n, c.total);
+    EXPECT_EQ(n, c.raw);
+    EXPECT_EQ(0, c.compressed);
+
+    /* Operator's explicit compress sweep DOES compress them. */
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
     int iters = driveAndDrain(2000);
     EXPECT_LE(iters, 200);
-    EXPECT_GT(countEncodings(0).compressed, 0);
+    EXPECT_EQ(n, countEncodings(0).compressed);
+}
+
+/* P1 + §3.4 state-machine table: when an `IDLE.requested(COMPRESS)`
+ * meets a master-switch-off state at cron entry, the cron defensively
+ * clears the request without entering SCANNING. This path is only
+ * reachable if a caller bypasses the command handler (which itself
+ * rejects compress-while-disabled), e.g. internal future auto-trigger
+ * code racing with a CONFIG SET. */
+TEST_F(CompressionSweepTest, CompressRequestClearedAtCronWhenDisabled) {
+    ASSERT_NE(0u, installSyntheticDict());
+    /* Bypass the command handler by calling compressionSweepRequest
+     * directly, then disable BEFORE the cron picks up the request. */
+    server.compression_enabled = 1;
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    server.compression_enabled = 0; /* now disabled with COMPRESS queued */
+
+    compressionSweepDriveForTesting(1);
+
+    /* State stays IDLE; request was cleared without entering SCANNING. */
+    EXPECT_FALSE(compressionSweepIsScanning());
+}
+
+/* P1 + R2.1.4: `COMPRESSION SWEEP direction=decompress` is the
+ * canonical drain path for the yes→no transition. It MUST work when
+ * the master switch is off — that's the operator's only way to
+ * convert the keyspace back to RAW after disabling. */
+TEST_F(CompressionSweepTest, DecompressSweepRunsWhenDisabled) {
+    ASSERT_NE(0u, installSyntheticDict());
+
+    /* First populate + compress with master switch on. */
+    constexpr int n = 100;
+    for (int i = 0; i < n; i++) {
+        char keybuf[64];
+        snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
+        robj *o = makeKeyedRawString(keybuf, 1024, i, true);
+        kvstoreHashtableAdd(server.db[0]->keys, 0, o);
+    }
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    driveAndDrain(2000);
+    EXPECT_EQ(n, countEncodings(0).compressed);
+
+    /* Disable the feature. Existing compressed values stay compressed. */
+    server.compression_enabled = 0;
+    EXPECT_EQ(n, countEncodings(0).compressed);
+
+    /* Run the operator-initiated decompress sweep. This is the
+     * scenario the bug fix targets: pre-fix, this command would be
+     * rejected at the handler and the cron would refuse to advance
+     * even if accepted. */
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_DECOMPRESS));
+    int iters = driveAndDrain(2000);
+    EXPECT_LE(iters, 200);
+
+    /* All values back to RAW. */
+    EncodingCounts post = countEncodings(0);
+    EXPECT_EQ(0, post.compressed);
+    EXPECT_EQ(n, post.raw);
+}
+
+/* P1 + §3.4: a SCANNING(COMPRESS) sweep aborts when the master switch
+ * flips off. R2.1.4's "new writes stop being compressed" extends to
+ * background work — a still-running compress sweep would violate that. */
+TEST_F(CompressionSweepTest, InFlightCompressSweepAbortsOnDisable) {
+    ASSERT_NE(0u, installSyntheticDict());
+    /* Populate enough that the sweep can't finish in one tick under
+     * tight pacing (same trick as SingleFlightRejectsConcurrentRequest). */
+    constexpr int n = 500;
+    for (int i = 0; i < n; i++) {
+        char keybuf[64];
+        snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
+        robj *o = makeKeyedRawString(keybuf, 1024, i, true);
+        kvstoreHashtableAdd(server.db[0]->keys, 0, o);
+    }
+    server.compression_sweep_max_cpu_pct = 1;
+    server.hz = 500; /* 20 µs/tick */
+
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    compressionSweepDriveForTesting(1);
+    ASSERT_TRUE(compressionSweepIsScanning());
+
+    /* Toggle off mid-sweep. */
+    server.compression_enabled = 0;
+
+    /* Next cron tick observes master-switch-off + direction=COMPRESS
+     * and aborts; state returns to IDLE. */
+    compressionSweepDriveForTesting(1);
+    EXPECT_FALSE(compressionSweepIsScanning());
+
+    /* Some keys may have been processed before the abort (the first
+     * tick enqueued some). After the abort, no further compress work
+     * happens. We don't assert an exact count — just that the abort
+     * happened cleanly (state IDLE) and the sweep didn't continue
+     * working through the remaining keys. */
+    server.compression_sweep_max_cpu_pct = 100;
+    server.hz = 10;
+    /* Drain whatever was already in-flight when we aborted. */
+    for (int i = 0; i < 20; i++) compressionWorkersDrainOutbox(256);
+    EncodingCounts after_abort = countEncodings(0);
+    EXPECT_LT(after_abort.compressed, n)
+        << "abort should have stopped before completing the keyspace";
+}
+
+/* P1 + §3.4: a SCANNING(DECOMPRESS) sweep is unaffected by master-
+ * switch state. It runs regardless — it's the canonical drain path. */
+TEST_F(CompressionSweepTest, InFlightDecompressSweepContinuesOnDisable) {
+    ASSERT_NE(0u, installSyntheticDict());
+
+    /* First populate + compress everything. */
+    constexpr int n = 500;
+    for (int i = 0; i < n; i++) {
+        char keybuf[64];
+        snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
+        robj *o = makeKeyedRawString(keybuf, 1024, i, true);
+        kvstoreHashtableAdd(server.db[0]->keys, 0, o);
+    }
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    driveAndDrain(2000);
+    EXPECT_EQ(n, countEncodings(0).compressed);
+
+    /* Now run a paced decompress sweep. */
+    server.compression_sweep_max_cpu_pct = 1;
+    server.hz = 500;
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_DECOMPRESS));
+    compressionSweepDriveForTesting(1);
+    ASSERT_TRUE(compressionSweepIsScanning());
+
+    /* Toggle off mid-decompress-sweep. The sweep should NOT abort —
+     * it's the drain path that the operator presumably wants to
+     * complete (and disabling and then explicitly draining is the
+     * R2.1.4 happy path). */
+    server.compression_enabled = 0;
+
+    /* Restore pacing and drive to completion. */
+    server.compression_sweep_max_cpu_pct = 100;
+    server.hz = 10;
+    int iters = driveAndDrain(2000);
+    EXPECT_LE(iters, 200);
+    EXPECT_FALSE(compressionSweepIsScanning());
+    EXPECT_EQ(0, countEncodings(0).compressed)
+        << "decompress sweep should have completed despite master-switch toggle";
+    EXPECT_EQ(n, countEncodings(0).raw);
 }
 
 /* Sparse server.db: only db[0] and db[5] populated; db[1..4], db[6..15]
@@ -517,6 +672,126 @@ TEST_F(CompressionSweepTest, SingleFlightRejectsConcurrentRequest) {
     driveAndDrain(2000);
     EXPECT_FALSE(compressionSweepIsScanning());
     EXPECT_EQ(n, countEncodings(0).compressed);
+}
+
+/* P1 + R2.5.7 two-mode drain: when a decompress sweep is in flight,
+ * `compressionBeforeSleep` permanent-decompresses side-map entries
+ * instead of restoring them. This cooperation lets read-touched values
+ * help drain the keyspace.
+ *
+ * Test pattern:
+ *   1. Compress N values via an explicit compress sweep.
+ *   2. Pick one, materialize a transient view → encoding flips RAW,
+ *      pin established (refcount=2), side-map size 1.
+ *   3. Tight pacing + request DECOMPRESS sweep + drive 1 tick to
+ *      enter SCANNING(DECOMPRESS).
+ *   4. Verify compressionSweepCurrentDirection() returns DECOMPRESS.
+ *   5. Call compressionBeforeSleep manually.
+ *   6. Verify the materialized robj is now permanently RAW (val_ptr
+ *      remains the temp sds — NOT swapped back to compressed_buffer)
+ *      and the side-map is empty.
+ *   7. Drive sweep to completion.
+ */
+TEST_F(CompressionSweepTest, BeforeSleepCooperatesWithDecompressSweep) {
+    ASSERT_NE(0u, installSyntheticDict());
+
+    /* Step 1: populate + compress. */
+    constexpr int n = 200;
+    for (int i = 0; i < n; i++) {
+        char keybuf[64];
+        snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
+        robj *o = makeKeyedRawString(keybuf, 1024, i, true);
+        kvstoreHashtableAdd(server.db[0]->keys, 0, o);
+    }
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    driveAndDrain(2000);
+    ASSERT_EQ(n, countEncodings(0).compressed);
+
+    /* Step 2: materialize one. Look up a known-key compressed robj. */
+    sds target_key = sdsnew("k:000050");
+    void *found = NULL;
+    ASSERT_TRUE(kvstoreHashtableFind(server.db[0]->keys, 0, target_key, &found));
+    sdsfree(target_key);
+    robj *target = (robj *)found;
+    ASSERT_EQ(OBJ_ENCODING_COMPRESSED, (int)target->encoding);
+
+    /* The savings counter is already non-zero from step 1's
+     * compress sweep — savings = total_unc - total_comp > 0 — so the
+     * materialize cap won't fall back to permanent decompress. */
+    int rc = compressionMaterializeTransientView(target, 0);
+    ASSERT_EQ(0, rc);
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)target->encoding);
+    EXPECT_EQ(2, (int)target->refcount); /* pinned */
+    EXPECT_EQ(1, transientViewActive(target));
+
+    /* Snapshot val_ptr. After permanent-decompress drain, val_ptr
+     * MUST still point at the temp sds (the materialized bytes).
+     * After restore drain, val_ptr would be swapped back to the
+     * original compressed_buffer. The two are distinguishable. */
+    void *temp_sds_ptr = target->val_ptr;
+
+    /* Step 3: tight pacing + decompress sweep request. */
+    server.compression_sweep_max_cpu_pct = 1;
+    server.hz = 500; /* 20 µs/tick */
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_DECOMPRESS));
+    compressionSweepDriveForTesting(1);
+    ASSERT_TRUE(compressionSweepIsScanning());
+
+    /* Step 4: direction helper reports DECOMPRESS. */
+    EXPECT_EQ(COMPRESSION_SWEEP_DIR_DECOMPRESS, compressionSweepCurrentDirection());
+
+    /* Step 5: drain. Mode should be permanent-decompress. */
+    compressionBeforeSleep();
+
+    /* Step 6: verify permanent-decompress, NOT restoration. */
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)target->encoding);
+    EXPECT_EQ(temp_sds_ptr, target->val_ptr) << "val_ptr should be unchanged "
+        << "(permanent-decompress mode keeps the temp sds installed; "
+        << "restore mode would have swapped back to compressed_buffer)";
+    EXPECT_EQ(0, transientViewActive(target));
+
+    /* Step 7: drive sweep to completion + final cleanup. */
+    server.compression_sweep_max_cpu_pct = 100;
+    server.hz = 10;
+    driveAndDrain(2000);
+    EXPECT_FALSE(compressionSweepIsScanning());
+    EXPECT_EQ(0, countEncodings(0).compressed);
+}
+
+/* Sanity: compressionSweepCurrentDirection() returns 0 when IDLE,
+ * the queued direction when SCANNING. Used by compressionBeforeSleep
+ * to select restore vs permanent-decompress mode (R2.5.7). */
+TEST_F(CompressionSweepTest, SweepCurrentDirectionReportsState) {
+    ASSERT_NE(0u, installSyntheticDict());
+
+    /* IDLE → 0. */
+    EXPECT_EQ(0, compressionSweepCurrentDirection());
+
+    /* Populate enough that the sweep can't finish in 1 tick under
+     * tight pacing. */
+    for (int i = 0; i < 500; i++) {
+        char keybuf[64];
+        snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
+        robj *o = makeKeyedRawString(keybuf, 1024, i, true);
+        kvstoreHashtableAdd(server.db[0]->keys, 0, o);
+    }
+    server.compression_sweep_max_cpu_pct = 1;
+    server.hz = 500;
+
+    /* Request COMPRESS, drive 1 tick → SCANNING(COMPRESS). */
+    EXPECT_EQ(1, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    compressionSweepDriveForTesting(1);
+    ASSERT_TRUE(compressionSweepIsScanning());
+    EXPECT_EQ(COMPRESSION_SWEEP_DIR_COMPRESS, compressionSweepCurrentDirection());
+
+    /* Restore pacing; drive to completion. */
+    server.compression_sweep_max_cpu_pct = 100;
+    server.hz = 10;
+    driveAndDrain(2000);
+    EXPECT_FALSE(compressionSweepIsScanning());
+
+    /* Back to IDLE → 0. */
+    EXPECT_EQ(0, compressionSweepCurrentDirection());
 }
 
 #endif /* USE_ZSTD */

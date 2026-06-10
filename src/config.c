@@ -3268,36 +3268,6 @@ static int applyCompressionThreads(const char **err) {
     return 1;
 }
 
-static int applyCompressionEnabled(const char **err) {
-    UNUSED(err);
-    /* Track the previous master-switch state so we can detect a
-     * `no → yes` transition and auto-trigger a compress-direction
-     * sweep (R2.1.3). The static initializer matches the config
-     * default (0/no) so the very first apply call after startup
-     * with `compression-enabled yes` in valkey.conf correctly
-     * triggers a sweep — it'll run on the first serverCron tick
-     * after RDB load completes.
-     *
-     * The reverse transition (`yes → no`) does NOT auto-trigger a
-     * decompress sweep per R2.1.4 — the operator must explicitly
-     * run `COMPRESSION SWEEP direction=decompress` if they want
-     * the keyspace drained. */
-    static int prev_state = 0;
-    int new_state = server.compression_enabled ? 1 : 0;
-    if (prev_state == 0 && new_state == 1) {
-        /* Set the requested flag; the next compressionCron tick
-         * picks it up. Safe to call even before compressionSweepInit
-         * has run (sweep_state is zero-initialized via static
-         * default). The request can race with an in-flight sweep
-         * (a no→yes→no→yes flicker between cron ticks) — the
-         * single-flight model collapses such races to one sweep,
-         * which is the operator-intended behavior. */
-        compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS);
-    }
-    prev_state = new_state;
-    return 1;
-}
-
 standardConfig static_configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -3563,7 +3533,7 @@ standardConfig static_configs[] = {
      * Phase 0: parsed and validated but feature-off has no effect.
      * =========================================================
      * Primary knobs (5) */
-    createBoolConfig("compression-enabled", NULL, MODIFIABLE_CONFIG, server.compression_enabled, 0, NULL, applyCompressionEnabled),
+    createBoolConfig("compression-enabled", NULL, MODIFIABLE_CONFIG, server.compression_enabled, 0, NULL, NULL),
     createIntConfig("compression-threads", NULL, MODIFIABLE_CONFIG, 0, 16, server.compression_threads, 1, INTEGER_CONFIG, NULL, applyCompressionThreads),
     createSizeTConfig("compression-min-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_min_value_size, 256, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("compression-max-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_max_value_size, 131072, MEMORY_CONFIG, NULL, NULL),

@@ -259,26 +259,55 @@ int compressionSweepRequest(int direction) {
 }
 
 void compressionSweepCron(void) {
-    /* Master switch off: do not advance any state. Honor the
-     * "compression-threads 0 = pool inert" idiom too — without
-     * workers, a compress-direction sweep would just refuse every
-     * enqueue, but a decompress-direction sweep is still useful
-     * (it doesn't depend on the worker pool). */
-    if (!server.compression_enabled) return;
-
-    /* Pick up a queued request when idle. */
+    /* Pick up a queued request. The state-machine table in §3.4
+     * specifies the master-switch interaction explicitly:
+     *   - request(COMPRESS) when disabled is rejected at the command
+     *     handler; reaching the cron with such a request would be a
+     *     defensive corner case (config race during startup or a
+     *     future caller bypassing the command handler). Drop it.
+     *   - request(DECOMPRESS) is always allowed — it's the canonical
+     *     drain path for R2.1.4's yes→no transition. */
     if (sweep_state.state == SWEEP_IDLE && sweep_state.requested) {
         sweep_state.requested = 0;
+        if (sweep_state.requested_direction == COMPRESSION_SWEEP_DIR_COMPRESS &&
+            !server.compression_enabled) {
+            return;
+        }
         enterScanning(&sweep_state, sweep_state.requested_direction);
     }
 
     if (sweep_state.state == SWEEP_SCANNING) {
+        /* Master switch toggled off mid-sweep. A compress-direction
+         * sweep now violates R2.1.4's "new writes stop being
+         * compressed" guarantee (background work is "new
+         * compression" too), so abort. A decompress-direction sweep
+         * continues — it's exactly the drain path R2.1.4 calls out.
+         *
+         * Worker-pool jobs already enqueued by sweepScanCallback
+         * still complete and install — workers don't observe the
+         * master switch (R2.4 / R2.11.4). The sweep state machine
+         * is the authoritative lever; further work just stops being
+         * produced. */
+        if (sweep_state.direction == COMPRESSION_SWEEP_DIR_COMPRESS &&
+            !server.compression_enabled) {
+            serverLog(LL_NOTICE,
+                      "Compression sweep aborted: master switch turned off "
+                      "(direction=compress, visited=%llu, work=%llu).",
+                      sweep_state.visited, sweep_state.enqueued_or_decompressed);
+            enterIdle(&sweep_state);
+            return;
+        }
         advanceScan(&sweep_state);
     }
 }
 
 int compressionSweepIsScanning(void) {
     return sweep_state.state == SWEEP_SCANNING;
+}
+
+int compressionSweepCurrentDirection(void) {
+    if (sweep_state.state != SWEEP_SCANNING) return 0;
+    return sweep_state.direction;
 }
 
 int compressionSweepDriveForTesting(int max_iterations) {
