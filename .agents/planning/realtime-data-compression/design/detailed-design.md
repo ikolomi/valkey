@@ -217,7 +217,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     Natural pressure-relief exists for keys that get **written** after compression: `dbOverwrite` installs a fresh uncompressed robj, and partial-write commands (`APPEND`, `SETRANGE`, bit operations, module DMA-write per R2.7.6) decompress in place before mutating (the COW-invariant audit list in R2.4.5 enumerates the call sites). Read-only-hot keys have no equivalent demotion trigger.
 
-    Worst-case per-iteration decompression cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can run `COMPRESSION SWEEP direction=decompress` to drop all compressed frames and restart eligibility evaluation.
+    Worst-case per-iteration decompression cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can drain the keyspace by setting `compression-master-switch decompression` (which auto-retires the active dict per R2.1.5 and switches the transient view to permanent-decompress mode per R2.5.7) and `compression-sweeper enabled` (R2.1.2) to converge the keyspace to fully RAW.
 
     Auto-demotion of read-hot compressed values is explicit v2 scope (Appendix D — "Read-hot compressed value auto-demotion"). The v1 ship gate is that the cost is **bounded** (R2.5.4) and **observable** (R2.10.2); operator action remains the only demotion path.
 
@@ -229,11 +229,27 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
     4. Replaces `o->val_ptr` with the temp sds and flips `o->encoding` from `OBJ_ENCODING_COMPRESSED` to `OBJ_ENCODING_RAW`.
     5. Returns `o` — every caller downstream sees a normal RAW string robj, with no awareness of compression.
 
-    The compressed form is restored at the next event-loop boundary. The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map:
+    **Drain mode at the next event-loop boundary** is gated on `compression-master-switch` state (R2.1.1). The `beforeSleep` hook reads the master switch once per invocation and dispatches:
+
+    | Master switch | Drain mode | Per-entry behavior |
+    |---|---|---|
+    | `compression` or `off` | **restore** | Pointer-swap each side-map entry back to compressed (the default behavior described below). The compressed form is preserved across the iteration boundary. |
+    | `decompression` | **permanent-decompress** | Each side-map entry is finalized as RAW: the compressed buffer is released via `releaseCompressedBuffer` (decRef dict frame-ref + reverse install accounting + free buffer); the temp sds stays installed as the value's `val_ptr`; encoding stays `OBJ_ENCODING_RAW`. The value is now permanently decompressed. |
+
+    This is the only cross-mechanism dependency in the design (Master switch ↔ Transient view per R2.1's three-orthogonal-mechanics framing). It exists because in `decompression` mode the operator's intent is "drain the DB", and a transient view that restores the compressed form would defeat that intent: every read-touched key would oscillate between compressed and uncompressed each iteration. Permanent-decompress mode honors the operator's declared state.
+
+    **Restore mode (default, `master ∈ {compression, off}`).** The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map:
 
     - For each entry, re-fetch the kvstore slot for the key.
     - If `slot->value == o` (the pinned robj is still in the slot, unchanged), restore via pointer swap: free temp sds, restore compressed buffer to `val_ptr`, flip encoding back to `OBJ_ENCODING_COMPRESSED`. **This is O(1) per entry with no decompression or compression cost** — the compressed bytes never went away, we just had val_ptr point at the temp sds during the iteration.
-    - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, free the saved compressed buffer, decrement the pin (which may free the orphaned robj).
+    - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, release the saved compressed buffer (via `releaseCompressedBuffer` — decRef dict + reverse accounting), decrement the pin (which may free the orphaned robj).
+
+    **Permanent-decompress mode (`master == decompression`).** Same iteration; for each entry, regardless of slot occupancy:
+    - Release the saved compressed buffer (decRef dict frame-ref + reverse install accounting + zfree via `releaseCompressedBuffer`).
+    - Leave the temp sds installed as `val_ptr`; encoding already RAW from materialize.
+    - Decrement the pin.
+
+    The two modes share `discardTransientEntry`'s release-and-decRef cleanup logic; only the restore vs leave-as-RAW step differs.
 
     **Mutation-detection invariant.** The pin (`refcount = 2`) forces any subsequent mutating command to honor the `dbUnshareStringValue` discipline (R2.4.4), creating a fresh robj that replaces the kvstore slot. The original (transient) robj is left intact for restoration; the slot now points elsewhere — detected at restoration time via pointer comparison. **No mutation-time hook is needed in any byte-mutating site.** This is the same staleness mechanism used by the write-path drain handler (R2.4.3 / §4.6).
 
