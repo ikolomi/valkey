@@ -310,7 +310,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 ### 2.10 Observability
 
 - **R2.10.1** New `INFO compression` section with the following fields (see §5.6):
-  `compression_enabled`, `compression_state`, `compression_active_dict_id`, `compression_dict_age_seconds`, `compression_known_dicts`, `compression_dict_cap_reached`, `compression_compressed_objects`, `compression_total_uncompressed_bytes`, `compression_total_compressed_bytes`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_candidates_pending`, `compression_candidates_dropped_total`, `compression_sweep_backpressure_total`, `compression_sweep_pacing_sleeps_total`, `compression_outbox_backpressure_total`, `compression_compressions_per_sec`, `compression_decompressions_per_sec`, `compression_skipped_incompressible`, `compression_training_last_duration_ms`, `compression_training_last_sample_count`, `compression_errors_total`. (Q10)
+  `compression_master_switch`, `compression_sweeper`, `compression_sweeper_interval`, `compression_sweeper_state`, `compression_state`, `compression_active_dict_id`, `compression_dict_age_seconds`, `compression_known_dicts`, `compression_dict_cap_reached`, `compression_compressed_objects`, `compression_total_uncompressed_bytes`, `compression_total_compressed_bytes`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_candidates_pending`, `compression_candidates_dropped_total`, `compression_sweep_backpressure_total`, `compression_sweep_pacing_sleeps_total`, `compression_outbox_backpressure_total`, `compression_compressions_per_sec`, `compression_decompressions_per_sec`, `compression_skipped_incompressible`, `compression_training_last_duration_ms`, `compression_training_last_sample_count`, `compression_errors_total`. The `compression_master_switch` reports `compression` / `decompression` / `off` per R2.1.1. The `compression_sweeper` reports `enabled` / `disabled` per R2.1.2. The `compression_sweeper_state` reports `idle` / `scanning` / `sleeping` / `disabled` to make the runtime engine state visible separately from the configured switch. (Q10)
 - **R2.10.2** Latency-monitor events `compress-sync`, `decompress-sync`, `compression-train` use the existing `latency-monitor-threshold` floor. No new config. (Q10)
 - **R2.10.3** **No keyspace notifications** for compression events. Operator audit trail is provided by server log entries at `LL_NOTICE` (normal transitions) and `LL_WARNING` (training failures, cap reached). (Q10)
 - **R2.10.4** **Queue back-pressure observability contract.** The worker pool is fed by a single shared bounded queue (§4.6), so "compression is not keeping up" has several distinct root causes and each one has a different remediation. The `INFO compression` section exposes four counters plus one gauge so operators can disambiguate without reading logs:
@@ -343,20 +343,22 @@ All configs below are `MODIFIABLE_CONFIG` and persist via `CONFIG REWRITE`. Conf
 
 All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is documentation-only, not a hiding mechanism.
 
-#### Primary knobs (5)
+#### Primary knobs (6)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
-| `compression-enabled` | bool | `no` | master switch |
-| `compression-threads` | int | `1` | worker pool size (0..16; 0 = disabled) |
+| `compression-master-switch` | enum | `off` | master switch (R2.1.1). `compression` / `decompression` / `off`. |
+| `compression-sweeper` | enum | `disabled` | automatic background sweeper (R2.1.2). `enabled` / `disabled`. |
+| `compression-threads` | int | `1` | worker pool size (0..16; 0 = disabled). Only relevant in `master=compression` mode (R2.1.6). |
 | `compression-min-value-size` | bytes | `256` | lower size bound for eligibility |
 | `compression-max-value-size` | bytes | `131072` | upper size bound (0 = unbounded; default 128 KiB bounds worst-case sync decompression latency) |
 | `compression-dict-size` | bytes | `102400` | zstd trainer target dict size |
 
-#### Advanced knobs (11)
+#### Advanced knobs (12)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
+| `compression-sweeper-interval` | seconds | `0` | re-run interval after a sweeper pass completes (R2.1.3). `0` = no periodic re-runs (single pass on master-switch direction change, then idle). |
 | `compression-sweep-max-cpu-pct` | int | `25` | sweep pacing (1..100) |
 | `compression_cpulist` | string | `""` | CPU pinning |
 | `compression-min-savings-ratio` | percent | `10` | post-compression net-savings guard |
