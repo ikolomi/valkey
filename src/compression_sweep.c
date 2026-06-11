@@ -7,11 +7,15 @@
 /*
  * compression_sweep.c — keyspace sweep state machine.
  *
- * See compression_sweep.h for the contract. Implementation pattern
- * mirrors compression_train.c's training-tick state machine: a file-
- * scoped state struct, a kvstoreScan callback that does the per-key
- * work, and a tick function that splices iteration across cron ticks
- * under a wall-time budget.
+ * See compression_sweep.h for the contract — the file-level docstring
+ * there specifies the trigger surface (operator-driven only in v1; no
+ * auto-trigger on master-switch toggles per R2.1.6), the pacing model,
+ * and the §3.4 state-machine table the cron implements.
+ *
+ * Implementation pattern mirrors compression_train.c's training-tick
+ * state machine: a file-scoped state struct, a kvstoreScan callback
+ * that does the per-key work, and a tick function that splices
+ * iteration across cron ticks under a wall-time budget.
  *
  * Per-tick budget:
  *   target_ms_per_sec = 1000 × compression_sweep_max_cpu_pct / 100
@@ -21,10 +25,17 @@
  * (up to 100) for faster keyspace coverage at the cost of main-thread
  * latency.
  *
- * Single-flight model: only one sweep at a time. Overlapping requests
- * during an in-flight sweep are dropped; the operator can re-issue
- * after the current run completes. This matches R2.1.4's "operator
- * owns the timing" property.
+ * Single-flight model: only one sweep at a time. The
+ * compressionSweepRequest API is the low-level state-machine entry
+ * point and silently drops a second request while SCANNING; the
+ * COMPRESSION SWEEP command handler in compression.c sits in front
+ * and adds (a) the direction-conditional master-switch guard
+ * (compress requires the master switch on; decompress does not),
+ * (b) friendly rejection text for the different-direction case, and
+ * (c) idempotent +OK reply for a same-direction request while a
+ * matching sweep is already in flight (R2.1.6 / §3.4 table). The
+ * cron itself observes the master switch directly to abort an
+ * in-flight COMPRESS sweep on yes→no.
  */
 
 #include "server.h"
@@ -151,16 +162,26 @@ static void enterScanning(compressionSweepState *ss, int direction) {
               direction == COMPRESSION_SWEEP_DIR_COMPRESS ? "compress" : "decompress");
 }
 
-static void enterIdle(compressionSweepState *ss) {
-    long long elapsed_ms = elapsedMs(ss->started_at);
-    serverLog(LL_NOTICE,
-              "Compression sweep: completed (direction=%s, visited=%llu, "
-              "%s=%llu, duration=%lldms).",
-              ss->direction == COMPRESSION_SWEEP_DIR_COMPRESS ? "compress" : "decompress",
-              ss->visited,
-              ss->direction == COMPRESSION_SWEEP_DIR_COMPRESS ? "enqueued" : "decompressed",
-              ss->enqueued_or_decompressed,
-              elapsed_ms);
+static void enterIdle(compressionSweepState *ss, int aborted) {
+    /* Two callers:
+     *   - advanceScan() when the keyspace scan completes naturally
+     *     (cursor wraps on the last DB). Logs "completed".
+     *   - compressionSweepCron() on the abort path
+     *     (SCANNING(COMPRESS) observes master_off). The abort path
+     *     emits its own "aborted" log line just before calling us;
+     *     we suppress the "completed" line in that case to avoid
+     *     two NOTICE entries for one event. */
+    if (!aborted) {
+        long long elapsed_ms = elapsedMs(ss->started_at);
+        serverLog(LL_NOTICE,
+                  "Compression sweep: completed (direction=%s, visited=%llu, "
+                  "%s=%llu, duration=%lldms).",
+                  ss->direction == COMPRESSION_SWEEP_DIR_COMPRESS ? "compress" : "decompress",
+                  ss->visited,
+                  ss->direction == COMPRESSION_SWEEP_DIR_COMPRESS ? "enqueued" : "decompressed",
+                  ss->enqueued_or_decompressed,
+                  elapsed_ms);
+    }
     ss->state = SWEEP_IDLE;
     ss->visited = 0;
     ss->enqueued_or_decompressed = 0;
@@ -192,7 +213,7 @@ static void advanceScan(compressionSweepState *ss) {
              * keys aggregator at server.c:6105). */
             ss->current_db++;
             if (ss->current_db >= server.dbnum) {
-                enterIdle(ss);
+                enterIdle(ss, /*aborted=*/0);
                 return;
             }
             continue;
@@ -206,7 +227,7 @@ static void advanceScan(compressionSweepState *ss) {
             ss->current_db++;
             if (ss->current_db >= server.dbnum) {
                 /* All DBs scanned — sweep done. */
-                enterIdle(ss);
+                enterIdle(ss, /*aborted=*/0);
                 return;
             }
             /* Continue with next DB on the same tick if budget allows. */
@@ -238,6 +259,15 @@ void compressionSweepRelease(void) {
 }
 
 int compressionSweepRequest(int direction) {
+    /* Low-level state-machine entry point. See compression_sweep.h for
+     * the full contract — in particular: this API does NOT enforce
+     * the master-switch / direction constraints from the §3.4 table
+     * (those live one layer up in the COMPRESSION SWEEP command
+     * handler in compression.c, which also handles the same-direction
+     * idempotent case before reaching here). The cron's defensive
+     * clear of an IDLE.requested(COMPRESS) request when the master
+     * switch is off is the backstop for any caller that bypasses the
+     * command handler. */
     if (direction != COMPRESSION_SWEEP_DIR_COMPRESS &&
         direction != COMPRESSION_SWEEP_DIR_DECOMPRESS) {
         /* Caller bug — assert in debug, return failure in release. */
@@ -247,10 +277,12 @@ int compressionSweepRequest(int direction) {
         return 0;
     }
 
-    /* If a sweep is already in flight, drop the request. Operators
-     * can re-issue once the current run completes. The `requested`
-     * flag governs the IDLE→SCANNING transition; an in-flight
-     * SCANNING sweep is unaffected. */
+    /* Single-flight: if a sweep is already in flight (regardless of
+     * direction), drop the request. The command handler distinguishes
+     * the same-direction case BEFORE reaching here and replies +OK
+     * for idempotency; reaching this branch from the handler always
+     * means a different-direction request (which the handler renders
+     * as a friendly error). */
     if (sweep_state.state == SWEEP_SCANNING) return 0;
 
     sweep_state.requested = 1;
@@ -294,7 +326,7 @@ void compressionSweepCron(void) {
                       "Compression sweep aborted: master switch turned off "
                       "(direction=compress, visited=%llu, work=%llu).",
                       sweep_state.visited, sweep_state.enqueued_or_decompressed);
-            enterIdle(&sweep_state);
+            enterIdle(&sweep_state, /*aborted=*/1);
             return;
         }
         advanceScan(&sweep_state);

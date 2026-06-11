@@ -1134,13 +1134,23 @@ int compressionSweep(client *c, int direction) {
         return C_ERR;
     }
 
+    /* Same-direction request while a matching sweep is already in
+     * flight: idempotent +OK reply per §3.4. The in-flight sweep
+     * already covers the requested intent; emitting an error here
+     * would surprise operators (e.g., a runbook that issues the
+     * sweep idempotently after every config change). */
+    if (compressionSweepIsScanning() && compressionSweepCurrentDirection() == direction) {
+        addReply(c, shared.ok);
+        return C_OK;
+    }
+
     if (compressionSweepRequest(direction) == 0) {
-        /* Single-flight: a sweep is already SCANNING. v1 doesn't
-         * queue or preempt; operator's escape hatch for an in-flight
-         * compress sweep is to toggle compression-enabled off (the
-         * cron tick will observe and abort — §3.4 state-machine
-         * table). A decompress sweep has no abort affordance in v1
-         * because it's idempotent. */
+        /* Single-flight: a different-direction sweep is in flight.
+         * v1 doesn't queue or preempt; operator's escape hatch for
+         * an in-flight compress sweep is to toggle compression-enabled
+         * off (the cron tick will observe and abort — §3.4 state-
+         * machine table). A decompress sweep has no abort affordance
+         * in v1 because it's idempotent. */
         addReplyError(c,
                       "a compression sweep is already in progress; "
                       "toggle compression-enabled to abort an in-flight "

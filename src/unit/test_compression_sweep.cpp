@@ -669,8 +669,22 @@ TEST_F(CompressionSweepTest, SingleFlightRejectsConcurrentRequest) {
     compressionSweepDriveForTesting(1);
     ASSERT_TRUE(compressionSweepIsScanning());
 
-    /* Second request: refused. */
+    /* Different-direction second request: refused at the low level. */
     EXPECT_EQ(0, compressionSweepRequest(COMPRESSION_SWEEP_DIR_DECOMPRESS));
+
+    /* Same-direction second request: also returns 0 from the low-level
+     * compressionSweepRequest API (single-flight rejection regardless
+     * of direction). The COMPRESSION SWEEP command handler in
+     * compression.c sits in front and renders this case as an
+     * idempotent +OK reply per §3.4 — verified via the helper-based
+     * predicate (compressionSweepIsScanning() &&
+     * compressionSweepCurrentDirection() == direction) that the
+     * handler checks BEFORE calling compressionSweepRequest. We
+     * verify the predicate here; the handler test path is covered
+     * by smoke testing against a live server. */
+    EXPECT_EQ(0, compressionSweepRequest(COMPRESSION_SWEEP_DIR_COMPRESS));
+    EXPECT_TRUE(compressionSweepIsScanning());
+    EXPECT_EQ(COMPRESSION_SWEEP_DIR_COMPRESS, compressionSweepCurrentDirection());
 
     /* Restore pacing and drive to completion. */
     server.compression_sweep_max_cpu_pct = 100;
