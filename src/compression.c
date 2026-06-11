@@ -255,10 +255,63 @@ static inline void transientViewMapEnsure(void) {
     }
 }
 
+/* Release ownership of a compressed buffer: decode the per-value
+ * header to extract the dictID and byte counts, decrement the dict
+ * frame-ref (R2.3.4), reverse the compression accounting (R2.10.1's
+ * compression_total_*_bytes counters), and free the underlying
+ * memory.
+ *
+ * Used by every code path that disposes of a compressed buffer
+ * outside `freeStringObject` (which handles the steady-state
+ * decRef→free path). Specifically:
+ *   - `compressionPermanentlyDecompress` after installing the
+ *     decompressed sds and flipping encoding to RAW (the robj is
+ *     not freed here, so we can't defer to freeStringObject).
+ *   - `discardTransientEntry` orphan-branch (the original robj was
+ *     overwritten/expired/COW'd while the compressed bytes were
+ *     squirreled away in the side-map; freeStringObject on the
+ *     dropped robj sees encoding=RAW and never gets to decRef the
+ *     dict for us — without this helper, the dict frame-ref leaked
+ *     and `compression_total_*_bytes` drifted whenever the side-map
+ *     discarded an orphaned entry).
+ *
+ * Caller is responsible for ensuring the buffer is no longer
+ * referenced by any robj's `val_ptr` before calling — this function
+ * does not touch any robj. Returns 0 on success, -1 on header-decode
+ * failure (the buffer is freed regardless; counters and dict remain
+ * untouched in that case so they don't drift on corruption). */
+static int releaseCompressedBuffer(void *compressed_buffer) {
+    if (compressed_buffer == NULL) return 0;
+    compressedHeader hdr;
+    if (compressionHeaderDecode((const unsigned char *)compressed_buffer, &hdr) != 0) {
+        serverLog(LL_WARNING,
+                  "Compression: corrupt header on releaseCompressedBuffer; "
+                  "dict frame-ref + accounting not adjusted (will leak).");
+        zfree(compressed_buffer);
+        return -1;
+    }
+    if (hdr.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
+        hdr.alg_meta != COMPRESSION_DICT_ID_NONE) {
+        compressionRegistryDecRef(hdr.alg_meta);
+    }
+    /* Reverse the install-time accounting (R2.10.1; see the
+     * createCompressedObject path's
+     * compressionAccountInstall(+unc, +comp+HEADER) call in
+     * compression_header.c). */
+    compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
+                              -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
+    zfree(compressed_buffer);
+    return 0;
+}
+
 /* Discard a single transient-view entry: free the temp uncompressed
- * sds, free the saved compressed buffer, NULL val_ptr defensively,
- * decRef the pin (which may free the robj if the kvstore reference
- * has gone away), and free the entry struct itself.
+ * sds, release the saved compressed buffer (decRef dict + reverse
+ * accounting via releaseCompressedBuffer — without this the dict
+ * frame-ref leaks and `compression_total_*_bytes` go stale because
+ * freeStringObject on the dropped robj sees encoding=RAW and skips
+ * the decRef path), NULL val_ptr defensively, decRef the pin (which
+ * may free the robj if the kvstore reference has gone away), and
+ * free the entry struct itself.
  *
  * Used by:
  *   - compressionBeforeSleep on the discard branch (kvstore slot no
@@ -274,7 +327,7 @@ static inline void transientViewMapEnsure(void) {
  * sdsfree(val_ptr); passing NULL is a no-op. */
 static inline void discardTransientEntry(compressionTransientEntry *e) {
     sdsfree((sds)e->obj->val_ptr);
-    zfree(e->compressed_buffer);
+    releaseCompressedBuffer(e->compressed_buffer);
     e->obj->val_ptr = NULL;
     decrRefCount(e->obj);
     zfree(e);
@@ -783,16 +836,11 @@ int compressionPermanentlyDecompress(robj *o) {
 
     if (o->encoding != OBJ_ENCODING_COMPRESSED) return 0;
 
-    /* Decode the header BEFORE we touch val_ptr — we need dict_id for
-     * the registry decRef regardless of whether decompression succeeds. */
+    /* Hold the compressed buffer pointer locally; we'll release it
+     * via releaseCompressedBuffer (decode header + decRef dict +
+     * reverse accounting + zfree) after we install the decompressed
+     * sds. */
     void *compressed_buffer = o->val_ptr;
-    compressedHeader hdr;
-    if (compressionHeaderDecode((const unsigned char *)compressed_buffer, &hdr) != 0) {
-        serverLog(LL_WARNING,
-                  "Compression: corrupt header on permanent decompress");
-        /* TODO(S4.1): compression_errors_total++ */
-        return -1;
-    }
 
     /* Decompress via the design's single decoder primitive (R2.5.2). */
     sds scratch = NULL;
@@ -808,20 +856,9 @@ int compressionPermanentlyDecompress(robj *o) {
     o->val_ptr = scratch;
     o->encoding = OBJ_ENCODING_RAW;
 
-    /* Release the dict frame-ref + free the old compressed buffer.
-     * Mirrors freeCompressedObject's logic, except we keep the robj
-     * and don't free its container. */
-    if (hdr.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
-        hdr.alg_meta != COMPRESSION_DICT_ID_NONE) {
-        compressionRegistryDecRef(hdr.alg_meta);
-    }
-    /* Reverse the install-time accounting. createCompressedObject
-     * matched += of (uncompressed_len, compressed_len + HEADER) into
-     * the design counters; we now -=. The two-counter form is per
-     * design §5.6 (S4.1 surfaces both via INFO; savings is derived). */
-    compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
-                              -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
-    zfree(compressed_buffer);
+    /* Release the dict frame-ref + free the old compressed buffer
+     * (mirrors freeCompressedObject's logic, but keeps the robj). */
+    releaseCompressedBuffer(compressed_buffer);
 
     return 0;
 }
