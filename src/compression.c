@@ -277,18 +277,31 @@ static inline void transientViewMapEnsure(void) {
  *
  * Caller is responsible for ensuring the buffer is no longer
  * referenced by any robj's `val_ptr` before calling — this function
- * does not touch any robj. Returns 0 on success, -1 on header-decode
- * failure (the buffer is freed regardless; counters and dict remain
- * untouched in that case so they don't drift on corruption). */
-static int releaseCompressedBuffer(void *compressed_buffer) {
-    if (compressed_buffer == NULL) return 0;
+ * does not touch any robj.
+ *
+ * Header-decode failure is treated as memory corruption (serverPanic).
+ * The buffer that reaches this function was written by
+ * `createCompressedObject` (or RDB load through the same path) and
+ * validated at install. A header that decodes correctly at install
+ * but fails to decode at release time means heap corruption or
+ * pointer-aliasing. Silently logging + leaking the buffer would stack
+ * dict frame-refs (the dict cannot retire because frame_refs cannot
+ * reach 0) until `compression-dict-max-versions` is hit and training
+ * freezes — a subtle and delayed operational fault. Panicking here
+ * surfaces the memory-safety bug at its actual origin.
+ *
+ * Note that `compressionHeaderDecode` itself remains an agnostic
+ * primitive (returns -1 on bad header) because RDB load needs to
+ * reject corrupt files via `rdbReportCorruptRDB` rather than crash
+ * the server. The "panic" decision lives at internal-only call sites
+ * like this one and `freeCompressedObject`. */
+static void releaseCompressedBuffer(void *compressed_buffer) {
+    if (compressed_buffer == NULL) return;
     compressedHeader hdr;
     if (compressionHeaderDecode((const unsigned char *)compressed_buffer, &hdr) != 0) {
-        serverLog(LL_WARNING,
-                  "Compression: corrupt header on releaseCompressedBuffer; "
-                  "dict frame-ref + accounting not adjusted (will leak).");
-        zfree(compressed_buffer);
-        return -1;
+        serverPanic("Compression: header-decode failure on "
+                    "releaseCompressedBuffer indicates heap corruption "
+                    "or buffer misuse");
     }
     if (hdr.alg_magic == COMPRESSION_ALG_ZSTD_MAGIC &&
         hdr.alg_meta != COMPRESSION_DICT_ID_NONE) {
@@ -301,7 +314,6 @@ static int releaseCompressedBuffer(void *compressed_buffer) {
     compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
                               -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
     zfree(compressed_buffer);
-    return 0;
 }
 
 /* Discard a single transient-view entry: free the temp uncompressed
