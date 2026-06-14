@@ -56,16 +56,32 @@ void compressionBeforeSleep(void);
 void compressionShutdown(void);
 
 /* ========================================================================
- * Master-switch toggle
+ * Master-switch + active-sweeper apply hooks
  * ========================================================================
  *
- * Called by the config apply hook for `compression-enabled` and by the
- * `COMPRESSION ENABLE`/`DISABLE` convenience subcommands (§2.1 R2.1.2).
+ * Called by the config layer when `compression-master-switch` /
+ * `compression-active-sweeper` is set (R2.1.1 / R2.1.2). The field
+ * `server.compression_master_switch` (resp. `..._active_sweeper`) has
+ * already been written to the new value; the hook detects the
+ * transition relative to its own static prior value and applies side
+ * effects (most importantly: auto-retire the active dict on any
+ * transition INTO `decompression`, per R2.1.5).
  *
- * Returns 1 on success, 0 on error (with *err set to an sds caller must
- * sdsfree()). The caller owns the sds; NULL if no error.
+ * Convenience aliases `COMPRESSION ENABLE` / `COMPRESSION DISABLE` are
+ * NOT part of v1's surface — operators set the master switch via
+ * `CONFIG SET compression-master-switch …` directly (the 3-state enum
+ * doesn't map cleanly to enable/disable verbs).
+ *
+ * Returns 1 on success, 0 on error (with *err set to a static C string
+ * the caller does not free).
  */
-int compressionToggle(int enabled, sds *err);
+int applyCompressionMasterSwitch(const char **err);
+int applyCompressionActiveSweeper(const char **err);
+
+/* Hook called by applyCompressionThreads (in config.c) after a
+ * compression-threads change has been applied. Maintains the warning
+ * for the non-functional `master=compression + threads=0` state (R2.1.6). */
+void compressionAfterThreadsApplied(void);
 
 /* ========================================================================
  * Hot path — read

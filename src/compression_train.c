@@ -295,7 +295,11 @@ int compressionTrainAdvanceSampling(int budget) {
 
 /* Called from compressionCron in compression.c. */
 void compressionTrainCron(void) {
-    if (!server.compression_enabled) return;
+    /* Training only runs when the operator's intent is productive
+     * compression. In master=decompression we are draining (no point
+     * training a new dict that would never be used); in master=off we
+     * are paused. (R2.1.5) */
+    if (server.compression_master_switch != COMPRESSION_MASTER_COMPRESSION) return;
 
     compressionTrainState *ts = &train_state;
 

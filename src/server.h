@@ -506,6 +506,21 @@ typedef enum {
 #define AOF_FSYNC_ALWAYS 1
 #define AOF_FSYNC_EVERYSEC 2
 
+/* Compression master-switch values (compression-master-switch config — R2.1.1).
+ * The operator declares the desired DB compression state; the engine
+ * (write-path hook + sweeper + transient view) maintains it. See
+ * design/detailed-design.md §2.1 for the full state-transition table. */
+#define COMPRESSION_MASTER_OFF 0
+#define COMPRESSION_MASTER_COMPRESSION 1
+#define COMPRESSION_MASTER_DECOMPRESSION 2
+
+/* Compression active-sweeper values (compression-active-sweeper config — R2.1.2).
+ * Independent of the master switch: enables/disables the cron-driven
+ * background convergence engine. The sweeper takes its direction from
+ * the current master switch on every iteration. */
+#define COMPRESSION_ACTIVE_SWEEPER_DISABLED 0
+#define COMPRESSION_ACTIVE_SWEEPER_ENABLED 1
+
 /* Replication diskless load defines */
 #define REPL_DISKLESS_LOAD_DISABLED 0
 #define REPL_DISKLESS_LOAD_WHEN_DB_EMPTY 1
@@ -2400,8 +2415,14 @@ struct valkeyServer {
      * Phase 1 lands the hot path. Defaults match §2.12 of the design.
      * ==========================================================
      */
-    /* Primary (§2.12 — 5 knobs) */
-    int compression_enabled;           /* Master switch. Default: 0 (no). */
+    /* Primary (§2.12 — 6 knobs) */
+    int compression_master_switch;            /* Master switch (R2.1.1). One of COMPRESSION_MASTER_OFF /
+                                                 _COMPRESSION / _DECOMPRESSION. Default: OFF. */
+    int compression_active_sweeper;           /* Sweeper switch (R2.1.2). One of COMPRESSION_ACTIVE_SWEEPER_DISABLED /
+                                                 _ENABLED. Default: DISABLED. */
+    int compression_active_sweeper_interval;  /* Re-run interval after a sweeper pass completes (R2.1.3),
+                                                 in seconds. Default: 0 (single pass on direction change,
+                                                 no periodic re-runs). */
     int compression_threads;           /* Worker pool size (0..16). Default: 1. */
     size_t compression_min_value_size; /* Lower size bound for eligibility. Default: 256. */
     size_t compression_max_value_size; /* Upper size bound (0 = unbounded). Default: 131072. */

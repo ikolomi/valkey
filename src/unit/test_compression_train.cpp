@@ -77,7 +77,7 @@ class CompressionTrainTest : public ::testing::Test {
         server.logfile = (char *)"";
         server.verbosity = LL_NOTHING;
 
-        server.compression_enabled = 1;
+        server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
         server.compression_dict_min_training_keys = 100;
         server.compression_dict_max_training_keys = 10000;
         server.compression_training_buffer_size = 4 * 1024 * 1024; /* 4 MiB for tests */
@@ -128,7 +128,7 @@ class CompressionTrainTest : public ::testing::Test {
  * ======================================================================== */
 
 TEST_F(CompressionTrainTest, CronSafeWhenDisabled) {
-    server.compression_enabled = 0;
+    server.compression_master_switch = COMPRESSION_MASTER_OFF;
     populateDb(200, 256);
     for (int i = 0; i < 100; i++) {
         compressionTrainCron();

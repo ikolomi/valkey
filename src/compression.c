@@ -140,9 +140,9 @@ static hashtableType transientViewMapType = {
 /* The side-map. Lazily allocated on first use (the first time a
  * compressed value is read with LOOKUP_NO_BYTES not set). NULL until
  * then; freed in compressionShutdown. The lazy allocation keeps the
- * "compression-enabled no, no compressed values exist" state at zero
- * cost, and keeps `transientViewActive()` cheap when the map is empty:
- * an early NULL check short-circuits the hashtable lookup entirely. */
+ * "master=off, no compressed values exist" state at zero cost, and
+ * keeps `transientViewActive()` cheap when the map is empty: an early
+ * NULL check short-circuits the hashtable lookup entirely. */
 static hashtable *transient_view_map = NULL;
 
 /* Total uncompressed bytes accounted for in the side-map currently.
@@ -365,6 +365,10 @@ int transientViewActive(const robj *o) {
  * Lifecycle stubs
  * ======================================================================== */
 
+/* Forward declaration: defined later, near the apply hooks block.
+ * Called once from compressionInit after boot config is applied. */
+static void syncApplyHookCaches(void);
+
 void compressionInit(void) {
     /* Order matters: registry must be ready before workers start, so
      * any in-flight worker that loads the active dict pointer sees a
@@ -380,6 +384,13 @@ void compressionInit(void) {
     }
     /* TODO(S1.x): compressionTrainInit(); */
     compressionTrainInit();
+
+    /* Boot config has been applied by the time compressionInit runs.
+     * Sync the apply-hook static caches with the boot values so any
+     * subsequent CONFIG SET sees correct "from" values for transition
+     * logging, and emit the non-functional warning if boot landed
+     * directly in master=compression + threads=0 (R2.1.6). */
+    syncApplyHookCaches();
 }
 
 /* Called from finishShutdown in src/server.c. Must run BEFORE
@@ -528,15 +539,142 @@ void compressionBeforeSleep(void) {
 }
 
 /* ========================================================================
- * Toggle stub
- * ======================================================================== */
+ * Master-switch + active-sweeper apply hooks
+ * ========================================================================
+ *
+ * Implements R2.1.5 (master-switch transition rules) and the warning
+ * logic for non-functional combinations (R2.1.6). Both hooks detect
+ * transitions by comparing against a function-static prior value;
+ * ordering relative to the config layer is fine because the field has
+ * already been written by the time the hook runs.
+ *
+ * The warning logic for the `master=compression + threads=0` non-
+ * functional combination is shared between this hook and
+ * applyCompressionThreads via maybeWarnNonFunctional().
+ */
 
-int compressionToggle(int enabled, sds *err) {
-    UNUSED(enabled);
-    /* Phase 0: toggling has no observable effect (feature is hard-off).
-     * We accept the toggle silently so the config layer does not error. */
-    if (err) *err = NULL;
+/* Map COMPRESSION_MASTER_* values to user-visible names for log lines.
+ * Stays in sync with the enum block in server.h. */
+static const char *masterSwitchName(int v) {
+    switch (v) {
+    case COMPRESSION_MASTER_OFF:           return "off";
+    case COMPRESSION_MASTER_COMPRESSION:   return "compression";
+    case COMPRESSION_MASTER_DECOMPRESSION: return "decompression";
+    default:                               return "?";
+    }
+}
+
+static const char *activeSweeperName(int v) {
+    return v == COMPRESSION_ACTIVE_SWEEPER_ENABLED ? "enabled" : "disabled";
+}
+
+/* Warn once on transition INTO the `master=compression + threads=0`
+ * state — writes will queue but no work happens, sweeper passes drop
+ * candidates (R2.1.6). Called from both apply hooks plus
+ * applyCompressionThreads (in config.c) plus once from compressionInit
+ * to handle the case where boot config lands directly in this state. */
+static int prev_master_for_warning = COMPRESSION_MASTER_OFF;
+static int prev_threads_for_warning = 1;
+
+/* Function-static caches for the apply hooks themselves — promoted to
+ * file-scope so compressionInit can sync them with the boot config
+ * before any apply hook runs. Without this, an operator who boots
+ * with `master=compression` and later sets `master=decompression`
+ * would see the apply hook log a misleading "off -> decompression"
+ * transition (because the static was initialized to the default,
+ * not synced with the boot value). */
+static int prev_master_for_apply = COMPRESSION_MASTER_OFF;
+static int prev_active_sweeper_for_apply = COMPRESSION_ACTIVE_SWEEPER_DISABLED;
+
+static void maybeWarnNonFunctional(void) {
+    int curr_master = server.compression_master_switch;
+    int curr_threads = server.compression_threads;
+    int was_nonfunc = (prev_master_for_warning == COMPRESSION_MASTER_COMPRESSION &&
+                       prev_threads_for_warning == 0);
+    int is_nonfunc = (curr_master == COMPRESSION_MASTER_COMPRESSION &&
+                      curr_threads == 0);
+    if (is_nonfunc && !was_nonfunc) {
+        serverLog(LL_WARNING,
+                  "Compression: master-switch=compression but compression-threads=0; "
+                  "writes enqueue but no work happens, sweeper passes drop candidates. "
+                  "Set compression-threads >= 1 to make this state functional.");
+    }
+    prev_master_for_warning = curr_master;
+    prev_threads_for_warning = curr_threads;
+}
+
+/* Called from compressionInit() after the boot config has been parsed
+ * and applied. Syncs the apply-hook static caches with the boot
+ * values so subsequent CONFIG SET-driven apply hooks see correct
+ * "from" values for transition logging. Also fires the non-functional
+ * warning if boot landed directly in master=compression + threads=0
+ * (apply hooks don't fire during boot-time config load). */
+static void syncApplyHookCaches(void) {
+    prev_master_for_apply = server.compression_master_switch;
+    prev_active_sweeper_for_apply = server.compression_active_sweeper;
+    /* Force the warning detector to emit if boot landed in the
+     * non-functional state. We do this by leaving the warning's prev
+     * values at their defaults (OFF, 1) and letting maybeWarnNonFunctional
+     * see the transition naturally. */
+    maybeWarnNonFunctional();
+}
+
+int applyCompressionMasterSwitch(const char **err) {
+    /* Field already written by config layer to server.compression_master_switch.
+     * The transition is detected against `prev_master_for_apply` which
+     * is synced with the boot value via syncApplyHookCaches(). */
+    int curr = server.compression_master_switch;
+    UNUSED(err);
+
+    if (prev_master_for_apply == curr) return 1;
+
+    /* On any transition INTO `decompression` (from `compression` or
+     * from `off`), retire the active dict if there is one. The dict
+     * must reach RETIRING state for canFree() to succeed once
+     * frame_refs reaches zero (§4.4 QSBR); without this, the dict
+     * would stay ACTIVE indefinitely and never be reclaimed even
+     * after the sweeper drains all frames. (R2.1.5) */
+    if (curr == COMPRESSION_MASTER_DECOMPRESSION) {
+        compressionDictPair *active = compressionRegistryActive();
+        if (active != NULL) {
+            uint32_t id = active->dict_id;
+            compressionRegistryRetire(id);
+            serverLog(LL_NOTICE,
+                      "Compression: master-switch entered decompression; "
+                      "retiring active dict %u.",
+                      id);
+        }
+    }
+
+    serverLog(LL_NOTICE,
+              "Compression: master-switch %s -> %s.",
+              masterSwitchName(prev_master_for_apply), masterSwitchName(curr));
+
+    prev_master_for_apply = curr;
+    maybeWarnNonFunctional();
     return 1;
+}
+
+int applyCompressionActiveSweeper(const char **err) {
+    /* C1 minimal: log the transition. Engine wiring (cron-tick driver,
+     * pass scheduling, sleep-between-passes, force-pass) lands in C3. */
+    int curr = server.compression_active_sweeper;
+    UNUSED(err);
+
+    if (prev_active_sweeper_for_apply == curr) return 1;
+    serverLog(LL_NOTICE,
+              "Compression: active-sweeper %s -> %s.",
+              activeSweeperName(prev_active_sweeper_for_apply), activeSweeperName(curr));
+    prev_active_sweeper_for_apply = curr;
+    return 1;
+}
+
+/* Called by applyCompressionThreads after the worker pool is resized
+ * — gives us a chance to update the non-functional-state warning when
+ * threads transitions to/from 0. Lives in compression.c so the static
+ * prev-state cache is co-located with the master-switch hook. */
+void compressionAfterThreadsApplied(void) {
+    maybeWarnNonFunctional();
 }
 
 /* ========================================================================
@@ -712,9 +850,10 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
  *
  * Decompress, register in side-map, pin, flip encoding. The lookupKey()
  * caller has already established that:
- *   - feature/decoder concerns: server.compression_enabled is true OR a
- *     compressed value lingers from a previous enable, both of which are
- *     fine — the decoder doesn't care about the master switch.
+ *   - feature/decoder concerns: master switch is `compression` OR a
+ *     compressed value lingers from an earlier productive period, both
+ *     of which are fine — the decoder doesn't care about the master
+ *     switch.
  *   - encoding == OBJ_ENCODING_COMPRESSED.
  *   - LOOKUP_NO_BYTES was NOT set (caller wants bytes).
  *
@@ -890,7 +1029,7 @@ int compressionPermanentlyDecompress(robj *o) {
  * dbFind is used (not lookupKey) to bypass spurious LRU touches and
  * keyspace miss notifications; we only want the value robj. */
 void compressionEnqueueModified(serverDb *db, robj *key) {
-    if (!server.compression_enabled) return;
+    if (server.compression_master_switch != COMPRESSION_MASTER_COMPRESSION) return;
     robj *val = dbFind(db, objectGetVal(key));
     if (val == NULL) return;
     compressionEnqueueCandidate(key, val, db->id);
@@ -905,8 +1044,11 @@ void compressionEnqueueModified(serverDb *db, robj *key) {
  * from the sweep cron tick.
  */
 int compressionIsEligible(robj *o) {
-    /* 1. Master switch. Zero overhead when disabled. */
-    if (!server.compression_enabled) return 0;
+    /* 1. Master switch. Zero overhead unless master == compression.
+     * The decompression and off states block the write-path enqueue
+     * since we don't want to install new compressed frames in either
+     * (R2.1.5: decompression is the drain mode; off freezes state). */
+    if (server.compression_master_switch != COMPRESSION_MASTER_COMPRESSION) return 0;
 
     /* 2. Type + encoding gate.
      *
@@ -1009,7 +1151,7 @@ void compressionEnqueueCandidate(robj *key, robj *value, int dbid) {
     UNUSED(key); /* embedded key in `value` is the authoritative lookup key */
 
     /* Master switch + eligibility (R2.2). compressionIsEligible
-     * already short-circuits on !server.compression_enabled, so no
+     * already short-circuits unless master == compression, so no
      * separate switch check needed. */
     if (!compressionIsEligible(value)) return;
 
@@ -1047,11 +1189,14 @@ static const char *kDisabledReply =
  * lines into `out`. Shared between COMPRESSION STATUS and
  * genValkeyInfoString's # Compression section so the two can never
  * diverge (§4.5: "COMPRESSION STATUS returns the INFO compression
- * section as a flat structured reply"). Phase 0: every field is 0 /
- * "disabled" because the feature is inert. */
+ * section as a flat structured reply"). C1 reflects the live master-
+ * switch and active-sweeper config values; the other fields stay 0 /
+ * "disabled" until later S2 PRs land their counters. */
 static sds compressionRenderFields(sds out) {
     return sdscatprintf(out,
-                        "compression_enabled:0\r\n"
+                        "compression_master_switch:%s\r\n"
+                        "compression_active_sweeper:%s\r\n"
+                        "compression_active_sweeper_interval:%d\r\n"
                         "compression_state:disabled\r\n"
                         "compression_active_dict_id:0\r\n"
                         "compression_known_dicts:0\r\n"
@@ -1072,7 +1217,10 @@ static sds compressionRenderFields(sds out) {
                         "compression_skipped_incompressible:0\r\n"
                         "compression_training_last_duration_ms:0\r\n"
                         "compression_training_last_sample_count:0\r\n"
-                        "compression_errors_total:0\r\n");
+                        "compression_errors_total:0\r\n",
+                        masterSwitchName(server.compression_master_switch),
+                        activeSweeperName(server.compression_active_sweeper),
+                        server.compression_active_sweeper_interval);
 }
 
 int compressionStatus(client *c) {

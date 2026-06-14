@@ -662,7 +662,7 @@ TEST_F(CompressionWorkersTest, NetSavingsGuardRejectsIncompressible) {
 
 TEST_F(CompressionWorkersTest, NoActiveDictMarksJobNotCompressed) {
     /* Without installing a dict, the worker must take the
-     * "compression-enabled yes but no active dict" branch (R2.1.5):
+     * "master=compression but no active dict" branch (R2.1.7):
      *   - dict_id = 0
      *   - dst = NULL, dst_len = 0
      *   - err = 1 (worker-policy sentinel, not a ZSTD error code) */

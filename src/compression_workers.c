@@ -214,8 +214,8 @@ static void *workerThreadMain(void *arg) {
         compressionDictPair *active = compressionRegistryActive();
 
         if (active == NULL) {
-            /* "compression-enabled yes but no active dict yet" state
-             * documented in R2.1.5. Mark the job as not-compressed so
+            /* "master=compression but no active dict yet" state
+             * documented in R2.1.7. Mark the job as not-compressed so
              * the drain handler can dispose without touching dst.
              * err=1 is the not-an-actual-ZSTD-error sentinel meaning
              * "worker chose not to compress"; ZSTD error codes are

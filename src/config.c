@@ -32,6 +32,7 @@
 #include "sds.h"
 #include "server.h"
 #include "cluster.h"
+#include "compression.h"
 #include "compression_workers.h"
 #include "connection.h"
 #include "bio.h"
@@ -100,6 +101,17 @@ configEnum aof_fsync_enum[] = {
     {"everysec", AOF_FSYNC_EVERYSEC},
     {"always", AOF_FSYNC_ALWAYS},
     {"no", AOF_FSYNC_NO},
+    {NULL, 0}};
+
+configEnum compression_master_switch_enum[] = {
+    {"off", COMPRESSION_MASTER_OFF},
+    {"compression", COMPRESSION_MASTER_COMPRESSION},
+    {"decompression", COMPRESSION_MASTER_DECOMPRESSION},
+    {NULL, 0}};
+
+configEnum compression_active_sweeper_enum[] = {
+    {"disabled", COMPRESSION_ACTIVE_SWEEPER_DISABLED},
+    {"enabled", COMPRESSION_ACTIVE_SWEEPER_ENABLED},
     {NULL, 0}};
 
 configEnum shutdown_on_sig_enum[] = {
@@ -3264,6 +3276,12 @@ static int applyCompressionThreads(const char **err) {
                "inconsistent state — check the server log for details.";
         return 0;
     }
+    /* Update the master+threads non-functional-state warning
+     * (R2.1.6: master=compression + threads=0 is allowed but
+     * non-functional). The detector lives in compression.c so the
+     * static prev-state cache is co-located with the master-switch
+     * apply hook. */
+    compressionAfterThreadsApplied();
     return 1;
 }
 
@@ -3531,8 +3549,10 @@ standardConfig static_configs[] = {
      * Real-time data compression knobs (design/detailed-design.md §2.12).
      * Phase 0: parsed and validated but feature-off has no effect.
      * =========================================================
-     * Primary knobs (5) */
-    createBoolConfig("compression-enabled", NULL, MODIFIABLE_CONFIG, server.compression_enabled, 0, NULL, NULL),
+     * Primary knobs (6) */
+    createEnumConfig("compression-master-switch", NULL, MODIFIABLE_CONFIG, compression_master_switch_enum, server.compression_master_switch, COMPRESSION_MASTER_OFF, NULL, applyCompressionMasterSwitch),
+    createEnumConfig("compression-active-sweeper", NULL, MODIFIABLE_CONFIG, compression_active_sweeper_enum, server.compression_active_sweeper, COMPRESSION_ACTIVE_SWEEPER_DISABLED, NULL, applyCompressionActiveSweeper),
+    createIntConfig("compression-active-sweeper-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_active_sweeper_interval, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-threads", NULL, MODIFIABLE_CONFIG, 0, 16, server.compression_threads, 1, INTEGER_CONFIG, NULL, applyCompressionThreads),
     createSizeTConfig("compression-min-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_min_value_size, 256, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("compression-max-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_max_value_size, 131072, MEMORY_CONFIG, NULL, NULL),

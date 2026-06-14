@@ -20,9 +20,11 @@
 # come from.
 
 start_server {tags {"compression"}} {
-    test {COMPRESSION STATUS returns disabled state} {
+    test {COMPRESSION STATUS reports default off / disabled state} {
         set status [r compression status]
-        assert_match "*compression_enabled:0*" $status
+        assert_match "*compression_master_switch:off*" $status
+        assert_match "*compression_active_sweeper:disabled*" $status
+        assert_match "*compression_active_sweeper_interval:0*" $status
         assert_match "*compression_state:disabled*" $status
         assert_match "*compression_active_dict_id:0*" $status
     }
@@ -69,12 +71,14 @@ start_server {tags {"compression"}} {
     test {INFO compression section renders} {
         set info [r info compression]
         assert_match "*# Compression*" $info
-        assert_match "*compression_enabled:0*" $info
+        assert_match "*compression_master_switch:off*" $info
     }
 
     test {All 18 compression config knobs are registered with documented defaults} {
-        # Primary (5) — see design/detailed-design.md §2.12
-        assert_equal [lindex [r config get compression-enabled] 1] "no"
+        # Primary (6) — see design/detailed-design.md §2.12
+        assert_equal [lindex [r config get compression-master-switch] 1] "off"
+        assert_equal [lindex [r config get compression-active-sweeper] 1] "disabled"
+        assert_equal [lindex [r config get compression-active-sweeper-interval] 1] "0"
         assert_equal [lindex [r config get compression-threads] 1] "1"
         assert_equal [lindex [r config get compression-min-value-size] 1] "256"
         assert_equal [lindex [r config get compression-max-value-size] 1] "131072"
@@ -91,6 +95,30 @@ start_server {tags {"compression"}} {
         assert_equal [lindex [r config get compression-dict-drift-ratio] 1] "70"
         assert_equal [lindex [r config get compression-dict-refresh-interval] 1] "0"
         assert_equal [lindex [r config get compression-dict-max-versions] 1] "4"
+    }
+
+    test {Master-switch enum accepts all 3 documented values} {
+        # R2.1.1: compression-master-switch is an enum (off / compression /
+        # decompression). Test runtime CONFIG SET against each value.
+        r config set compression-master-switch compression
+        assert_equal [lindex [r config get compression-master-switch] 1] "compression"
+        r config set compression-master-switch decompression
+        assert_equal [lindex [r config get compression-master-switch] 1] "decompression"
+        r config set compression-master-switch off
+        assert_equal [lindex [r config get compression-master-switch] 1] "off"
+        # Reject an invalid value.
+        catch {r config set compression-master-switch yes} err
+        assert_match "*ERR*" $err
+    }
+
+    test {Active-sweeper enum accepts both documented values} {
+        # R2.1.2: compression-active-sweeper is an enum (disabled / enabled).
+        r config set compression-active-sweeper enabled
+        assert_equal [lindex [r config get compression-active-sweeper] 1] "enabled"
+        r config set compression-active-sweeper disabled
+        assert_equal [lindex [r config get compression-active-sweeper] 1] "disabled"
+        catch {r config set compression-active-sweeper yes} err
+        assert_match "*ERR*" $err
     }
 
     test {Feature-off transparency: basic STRING round-trip is unchanged} {
@@ -122,30 +150,31 @@ start_server {tags {"compression"}} {
         assert_equal [r object encoding medium] "raw"
     }
 
-    test {Toggling compression-enabled at runtime has no observable effect in Phase 0} {
-        r config set compression-enabled yes
-        assert_equal [lindex [r config get compression-enabled] 1] "yes"
-        # Feature stays functionally disabled in Phase 0 — STATUS still
-        # reports disabled state since the worker pool is a stub.
+    test {Toggling compression-master-switch at runtime has no observable effect in Phase 0} {
+        r config set compression-master-switch compression
+        assert_equal [lindex [r config get compression-master-switch] 1] "compression"
+        # Feature stays functionally disabled in Phase 0 because the
+        # write-path hook (S2.7) hasn't been wired to gate on the new
+        # config yet — STATUS still reports state:disabled regardless
+        # of the master switch.
         set status [r compression status]
-        assert_match "*compression_enabled:0*" $status
-        r config set compression-enabled no
+        assert_match "*compression_master_switch:compression*" $status
+        r config set compression-master-switch off
     }
 
-    test {Server survives cron ticks while compression-enabled is yes} {
-        # Regression for the totalDbKeys NULL deref: the previous test
-        # toggles compression-enabled yes/no synchronously, racing past
-        # the cron tick at hz=10 (the toggle sequence runs in <10 ms;
-        # the next cron tick fires ~100 ms later). That window hid a
-        # crash where compressionTrainCron's totalDbKeys() was iterating
-        # `j < server.dbnum` without checking that `server.db[j]` is
-        # non-NULL — true for slots 1..dbnum-1 on a fresh server before
-        # they get materialized via createDatabaseIfNeeded(). To guard
-        # against future regressions, this test enables the feature
-        # then waits long enough for multiple cron ticks (default hz=10
-        # → 100 ms each) to fire while the master switch is on, then
-        # asserts the server is still alive.
-        r config set compression-enabled yes
+    test {Server survives cron ticks while compression is on (totalDbKeys NULL-guard regression)} {
+        # Regression for the totalDbKeys NULL deref: previously, toggling
+        # compression on then writing to a key would race the cron tick
+        # at hz=10 (the toggle sequence runs in <10 ms; the next cron
+        # tick fires ~100 ms later). That window hid a crash where
+        # compressionTrainCron's totalDbKeys() iterated `j < server.dbnum`
+        # without checking that `server.db[j]` is non-NULL — true for
+        # slots 1..dbnum-1 on a fresh server before they get materialized
+        # via createDatabaseIfNeeded(). To guard against future
+        # regressions, enable the feature then wait long enough for
+        # multiple cron ticks to fire while master=compression, then
+        # assert the server is still alive.
+        r config set compression-master-switch compression
         # Wait ~5 cron ticks plus margin.
         after 600
         assert_equal "PONG" [r ping]
@@ -154,7 +183,7 @@ start_server {tags {"compression"}} {
         r set keyfortrain "value"
         after 300
         assert_equal "PONG" [r ping]
-        r config set compression-enabled no
+        r config set compression-master-switch off
         r del keyfortrain
     }
 }

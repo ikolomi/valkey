@@ -117,9 +117,10 @@ compressionDictPair *compressionRegistryLookup(uint32_t dict_id);
 uint32_t compressionRegistryAdd(compressionDictPair *p, int promote);
 
 /* Marks the dict as RETIRING. A dict is freed only when its refcount
- * reaches zero, either through frame rewrites or via
- * `COMPRESSION SWEEP direction=decompress`. Returns 0 on success, -1 if
- * `dict_id` is unknown. */
+ * reaches zero, either through frame rewrites or via the
+ * `compression-master-switch decompression + compression-active-sweeper
+ * enabled` drain mode. Returns 0 on success, -1 if `dict_id` is
+ * unknown. */
 int compressionRegistryRetire(uint32_t dict_id);
 
 /* Reference counting. Callers MUST pair inc/dec calls with care —
@@ -139,8 +140,8 @@ void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *),
 
 /* Scan the Dicts array, free dicts that are safe to reclaim.
  * Called from compressionCron, after draining the worker outbox, and
- * after the COMPRESSION SWEEP command (which force-rewrites frames,
- * potentially dropping frame_refs to zero). */
+ * after a sweeper pass in master=decompression mode (which force-
+ * decompresses frames, potentially dropping frame_refs to zero). */
 void compressionRegistryTryGc(void);
 
 /* ========================================================================

@@ -33,7 +33,7 @@ extern "C" {
 class CompressionEligibilityTest : public ::testing::Test {
   protected:
     /* Saved server state so we can restore in TearDown. */
-    int saved_compression_enabled;
+    int saved_compression_master_switch;
     size_t saved_min_value_size;
     size_t saved_max_value_size;
     int saved_min_idle_seconds;
@@ -42,7 +42,7 @@ class CompressionEligibilityTest : public ::testing::Test {
 
     void SetUp() override {
         /* Snapshot. */
-        saved_compression_enabled = server.compression_enabled;
+        saved_compression_master_switch = server.compression_master_switch;
         saved_min_value_size = server.compression_min_value_size;
         saved_max_value_size = server.compression_max_value_size;
         saved_min_idle_seconds = server.compression_min_idle_seconds;
@@ -50,7 +50,7 @@ class CompressionEligibilityTest : public ::testing::Test {
         saved_maxmemory_policy = server.maxmemory_policy;
 
         /* Defaults consistent with src/config.c registration. */
-        server.compression_enabled = 1;
+        server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
         server.compression_min_value_size = 256;
         server.compression_max_value_size = 131072;
         server.compression_min_idle_seconds = 60;
@@ -61,7 +61,7 @@ class CompressionEligibilityTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        server.compression_enabled = saved_compression_enabled;
+        server.compression_master_switch = saved_compression_master_switch;
         server.compression_min_value_size = saved_min_value_size;
         server.compression_max_value_size = saved_max_value_size;
         server.compression_min_idle_seconds = saved_min_idle_seconds;
@@ -115,9 +115,19 @@ class CompressionEligibilityTest : public ::testing::Test {
  * ============================================================ */
 
 TEST_F(CompressionEligibilityTest, MasterSwitchOff) {
-    server.compression_enabled = 0;
+    server.compression_master_switch = COMPRESSION_MASTER_OFF;
     robj *o = makeRawString(1024);
     setLruIdleSecs(o, 600); /* very cold */
+    EXPECT_EQ(0, compressionIsEligible(o));
+    decrRefCount(o);
+}
+
+TEST_F(CompressionEligibilityTest, MasterSwitchDecompressionBlocksEligibility) {
+    /* In master=decompression we are draining; new compressions would
+     * defeat the purpose. (R2.1.5) */
+    server.compression_master_switch = COMPRESSION_MASTER_DECOMPRESSION;
+    robj *o = makeRawString(1024);
+    setLruIdleSecs(o, 600);
     EXPECT_EQ(0, compressionIsEligible(o));
     decrRefCount(o);
 }
