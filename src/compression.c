@@ -25,6 +25,7 @@
 #include "compression.h"
 #include "compression_header.h"
 #include "compression_registry.h"
+#include "compression_sweep.h"
 #include "compression_workers.h"
 #include "compression_train.h"
 #include "lrulfu.h"
@@ -416,6 +417,7 @@ void compressionInit(void) {
     }
     /* TODO(S1.x): compressionTrainInit(); */
     compressionTrainInit();
+    compressionSweepInit();
 
     /* Boot config has been applied by the time compressionInit runs.
      * Sync the apply-hook static caches with the boot values so any
@@ -453,6 +455,7 @@ void compressionShutdown(void) {
         transient_view_map = NULL;
     }
 
+    compressionSweepShutdown();
     compressionRegistryRelease();
 #ifdef USE_ZSTD
     if (server_dctx != NULL) {
@@ -465,7 +468,8 @@ void compressionShutdown(void) {
 void compressionCron(void) {
     /* Training: trigger evaluation, scan advancement, completion polling. */
     compressionTrainCron();
-    /* TODO(Phase 1): sweep tick + pacing. */
+    /* Sweeper: state machine + paced kvstore iteration. (R2.1.2 + R2.1.4) */
+    compressionSweepCron();
 }
 
 void compressionAfterSleep(void) {
@@ -714,6 +718,13 @@ int applyCompressionMasterSwitch(const char **err) {
               masterSwitchName(prev_master_for_apply), masterSwitchName(curr));
 
     prev_master_for_apply = curr;
+    /* Notify the sweeper of the transition. Necessary because the
+     * sweeper polls server.compression_master_switch every cron tick
+     * (~100ms); without an explicit edge signal, transitions like
+     * compression→off→compression that complete inside one tick window
+     * would be invisible to the sweeper (it only ever observes the
+     * current value, not the history). */
+    compressionSweepNotifyMasterSwitchChanged();
     maybeWarnNonFunctional();
     return 1;
 }
@@ -1260,6 +1271,7 @@ static sds compressionRenderFields(sds out) {
                         "compression_master_switch:%s\r\n"
                         "compression_active_sweeper:%s\r\n"
                         "compression_active_sweeper_interval:%d\r\n"
+                        "compression_active_sweeper_state:%s\r\n"
                         "compression_state:disabled\r\n"
                         "compression_active_dict_id:0\r\n"
                         "compression_known_dicts:0\r\n"
@@ -1283,7 +1295,8 @@ static sds compressionRenderFields(sds out) {
                         "compression_errors_total:0\r\n",
                         masterSwitchName(server.compression_master_switch),
                         activeSweeperName(server.compression_active_sweeper),
-                        server.compression_active_sweeper_interval);
+                        server.compression_active_sweeper_interval,
+                        compressionSweepStateName(compressionSweepGetState()));
 }
 
 int compressionStatus(client *c) {
@@ -1341,18 +1354,43 @@ void compressionCommand(client *c) {
 
     if (!strcasecmp(sub, "status")) {
         compressionStatus(c);
+    } else if (!strcasecmp(sub, "sweep")) {
+        /* COMPRESSION SWEEP FORCE — operator-driven one-shot pass.
+         * (R2.1.4) Direction is taken implicitly from the current
+         * master switch on every cron tick; rejected if master=off. */
+        if (c->argc != 3 ||
+            strcasecmp((const char *)objectGetVal(c->argv[2]), "FORCE") != 0) {
+            addReplyErrorFormat(c,
+                                "syntax error: COMPRESSION SWEEP FORCE "
+                                "(no other forms accepted)");
+            return;
+        }
+        int rc = compressionSweepForce();
+        if (rc == COMPRESSION_SWEEP_FORCE_REJECTED) {
+            addReplyError(c,
+                          "compression-master-switch is off; cannot sweep "
+                          "(set master to compression or decompression first)");
+            return;
+        }
+        addReply(c, shared.ok);
     } else if (!strcasecmp(sub, "help")) {
         const char *help[] = {
             "STATUS",
             "    Return the current compression state (mirrors INFO compression).",
+            "SWEEP FORCE",
+            "    Trigger a one-shot keyspace pass. Direction follows the",
+            "    current compression-master-switch (compression: enqueue",
+            "    eligible RAW values; decompression: permanently decompress",
+            "    every compressed value). Rejected if master=off. Allowed",
+            "    even when compression-active-sweeper is disabled.",
             "HELP",
             "    Print this help.",
             "",
-            "Note: SWEEP FORCE, TRAIN, and DICT LIST/DROP/EXPORT/IMPORT land in",
-            "subsequent S2 PRs. Operators set master-switch state via",
-            "'CONFIG SET compression-master-switch ...'; legacy ENABLE/DISABLE",
-            "aliases are not part of the v1 surface (the 3-state enum doesn't",
-            "map cleanly to enable/disable verbs).",
+            "Note: TRAIN and DICT LIST/DROP/EXPORT/IMPORT land in subsequent",
+            "S2 PRs. Operators set master-switch state via 'CONFIG SET",
+            "compression-master-switch ...'; legacy ENABLE/DISABLE aliases",
+            "are not part of the v1 surface (the 3-state enum doesn't map",
+            "cleanly to enable/disable verbs).",
             NULL};
         addReplyHelp(c, help);
     } else {

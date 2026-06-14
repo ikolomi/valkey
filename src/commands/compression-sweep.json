@@ -1,0 +1,32 @@
+{
+    "SWEEP": {
+        "summary": "Triggers a one-shot keyspace pass for the real-time compression sweeper.",
+        "complexity": "O(N) where N is the number of keys in the keyspace.",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": 3,
+        "container": "COMPRESSION",
+        "function": "compressionCommand",
+        "command_flags": [
+            "ADMIN",
+            "STALE",
+            "NOSCRIPT"
+        ],
+        "acl_categories": [
+            "ADMIN",
+            "SLOW",
+            "DANGEROUS"
+        ],
+        "arguments": [
+            {
+                "name": "force",
+                "type": "pure-token",
+                "token": "FORCE"
+            }
+        ],
+        "reply_schema": {
+            "description": "OK on acceptance; -ERR if compression-master-switch is off (no direction to sweep in).",
+            "type": "string"
+        }
+    }
+}

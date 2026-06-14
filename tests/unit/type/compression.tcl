@@ -186,4 +186,96 @@ start_server {tags {"compression"}} {
         r config set compression-master-switch off
         r del keyfortrain
     }
+
+    test {Sweeper state field is present in INFO and COMPRESSION STATUS} {
+        # R2.10.1: compression_active_sweeper_state reports the engine's
+        # runtime state (idle / scanning / sleeping / disabled), separate
+        # from the configured switch.
+        set status [r compression status]
+        assert_match "*compression_active_sweeper_state:*" $status
+    }
+
+    test {COMPRESSION SWEEP FORCE is rejected when master is off} {
+        r config set compression-master-switch off
+        catch {r compression sweep force} err
+        assert_match "*ERR*" $err
+        # State should remain "disabled" / "idle" — no pass triggered.
+        set status [r compression status]
+        assert_match "*compression_active_sweeper_state:disabled*" $status
+    }
+
+    test {COMPRESSION SWEEP FORCE accepted under master=compression} {
+        r config set compression-master-switch compression
+        # Default sweeper config is disabled — FORCE still works (R2.1.4).
+        assert_equal [lindex [r config get compression-active-sweeper] 1] "disabled"
+        assert_equal "OK" [r compression sweep force]
+        r config set compression-master-switch off
+    }
+
+    test {COMPRESSION SWEEP FORCE accepted under master=decompression} {
+        r config set compression-master-switch decompression
+        assert_equal "OK" [r compression sweep force]
+        r config set compression-master-switch off
+    }
+
+    test {COMPRESSION SWEEP FORCE syntax: bare SWEEP rejected} {
+        r config set compression-master-switch compression
+        # Bare "COMPRESSION SWEEP" (no FORCE) is an arity error.
+        catch {r compression sweep} err
+        assert_match "*ERR*wrong number*" $err
+        r config set compression-master-switch off
+    }
+
+    test {COMPRESSION SWEEP FORCE syntax: bogus arg rejected} {
+        r config set compression-master-switch compression
+        catch {r compression sweep wrong} err
+        assert_match "*ERR*" $err
+        r config set compression-master-switch off
+    }
+
+    test {Sweeper state transitions: master=off + sweeper=enabled => idle} {
+        r config set compression-master-switch off
+        r config set compression-active-sweeper enabled
+        # Wait one cron tick.
+        after 200
+        set status [r compression status]
+        assert_match "*compression_active_sweeper_state:idle*" $status
+        # Reset for next test.
+        r config set compression-active-sweeper disabled
+    }
+
+    test {Sweeper state transitions: enabled + master=compression runs one pass with interval=0} {
+        r config set compression-master-switch off
+        r config set compression-active-sweeper-interval 0
+        r config set compression-active-sweeper enabled
+        # Empty keyspace; pass completes in one tick.
+        r config set compression-master-switch compression
+        # Wait several cron ticks; pass should complete and state goes IDLE.
+        # (Without the fix from this PR, IDLE would loop and trigger more passes.)
+        after 600
+        set status [r compression status]
+        assert_match "*compression_active_sweeper_state:idle*" $status
+        # Reset.
+        r config set compression-master-switch off
+        r config set compression-active-sweeper disabled
+    }
+
+    test {Sweeper state transitions: interval > 0 enters sleeping after pass} {
+        r config set compression-master-switch off
+        r config set compression-active-sweeper-interval 60
+        r config set compression-active-sweeper enabled
+        r config set compression-master-switch compression
+        # Empty keyspace; pass completes immediately, then state should
+        # be SLEEPING (interval > 0). Cron at default hz=10 = 100ms tick;
+        # the per-cycle wait is generous to keep the test non-flaky.
+        wait_for_condition 50 100 {
+            [string match "*compression_active_sweeper_state:sleeping*" [r compression status]]
+        } else {
+            fail "expected sleeping; status: [r compression status]"
+        }
+        # Reset.
+        r config set compression-master-switch off
+        r config set compression-active-sweeper disabled
+        r config set compression-active-sweeper-interval 0
+    }
 }
