@@ -345,6 +345,38 @@ static inline void discardTransientEntry(compressionTransientEntry *e) {
     zfree(e);
 }
 
+/* Restore-mode finalize (used by the "slot matches" branch of
+ * compressionBeforeSleep when master ∈ {compression, off}). Pointer
+ * swap: free the temp sds, put the saved compressed buffer back as
+ * val_ptr, flip encoding back to OBJ_ENCODING_COMPRESSED, drop the pin
+ * (refcount 2→1 — the kvstore retains its reference). The compressed
+ * bytes never went away; we just had val_ptr aliased to the temp sds
+ * during the iteration. ZERO recompression cost. */
+static inline void restoreTransientEntry(compressionTransientEntry *e) {
+    robj *o = e->obj;
+    sdsfree((sds)o->val_ptr);
+    o->val_ptr = e->compressed_buffer;
+    o->encoding = OBJ_ENCODING_COMPRESSED;
+    decrRefCount(o);
+    zfree(e);
+}
+
+/* Permanent-decompress-mode finalize (used by the "slot matches"
+ * branch of compressionBeforeSleep when master == decompression).
+ * Release the saved compressed buffer (releaseCompressedBuffer
+ * handles dict frame-ref decRef and reverse install accounting); the
+ * temp sds stays installed as val_ptr; encoding stays
+ * OBJ_ENCODING_RAW. The robj is now an ordinary uncompressed string
+ * from every observer's perspective — until the master switch flips
+ * back to compression and the sweeper or write path picks it up for
+ * re-compression. Drop the pin (refcount 2→1; kvstore retains its
+ * ref). */
+static inline void permanentlyDecompressTransientEntry(compressionTransientEntry *e) {
+    releaseCompressedBuffer(e->compressed_buffer);
+    decrRefCount(e->obj);
+    zfree(e);
+}
+
 int transientViewActive(const robj *o) {
     /* Common case: no compressed value has been read in this iteration
      * (or ever). The map is NULL or empty; return 0 immediately without
@@ -462,23 +494,47 @@ void compressionAfterSleep(void) {
 }
 
 void compressionBeforeSleep(void) {
-    /* Restore transiently-decompressed values per design §2.5.7 + Appendix E.
+    /* Restore transiently-decompressed values per design §2.5.7.
      *
-     * For each entry in the side-map:
-     *   (a) Re-fetch the kvstore slot for the key (via the value robj's
-     *       embedded key sds — the pin guarantees the embedded key is
-     *       still valid memory).
-     *   (b) If the slot still points at our pinned robj: restore via
-     *       pointer swap. The compressed bytes never went away; we just
-     *       had val_ptr point at the temp sds during the iteration.
-     *       Free the temp sds, put the compressed buffer back, flip
-     *       encoding back to COMPRESSED. ZERO recompression cost.
-     *   (c) Otherwise (mutation, overwrite, expire, COW-orphaned): the
-     *       slot points elsewhere. Discard via discardTransientEntry
-     *       (frees buffers + pin + entry struct).
-     *   (d) Drop the pin in the restore branch too (decrRef may NOT
-     *       free the robj — kvstore retains its reference; refcount
-     *       goes 2→1).
+     * Drain mode is gated on the master-switch state (read once here):
+     *
+     *   - master ∈ {compression, off} → RESTORE mode: pointer-swap
+     *     back to compressed. The compressed bytes never went away;
+     *     we just had val_ptr aliased to the temp sds during the
+     *     iteration. ZERO recompression cost. Cold values stay
+     *     compressed across iterations — preserves R2.5.6.
+     *
+     *   - master == decompression → PERMANENT-DECOMPRESS mode:
+     *     release the saved compressed buffer (via
+     *     releaseCompressedBuffer — decRef the dict frame-ref, reverse
+     *     install accounting, free the buffer); leave the temp sds
+     *     installed as val_ptr; encoding stays OBJ_ENCODING_RAW. The
+     *     value is now permanently decompressed; the next read pays
+     *     no decompression cost. This is the only intentional cross-
+     *     mechanism dependency between the master switch and the
+     *     transient-view subsystem (R2.5.7).
+     *
+     *     Permanent-decompress drain matches the operator's
+     *     declared intent in master=decompression: a transient view
+     *     that restored the compressed form would oscillate every
+     *     read-touched key between compressed and uncompressed each
+     *     iteration, defeating the drain. With permanent-decompress
+     *     drain, a single sweep across the keyspace plus normal
+     *     read traffic will fully decompress the dataset.
+     *
+     * For each entry in the side-map (regardless of mode):
+     *   (a) Re-fetch the kvstore slot for the key (via the value
+     *       robj's embedded key sds — the pin guarantees the embedded
+     *       key is still valid memory).
+     *   (b) If the slot points elsewhere (mutation / overwrite /
+     *       expire / COW-orphaned): discard via discardTransientEntry.
+     *       This is identical for both drain modes — when the kvstore
+     *       no longer references our robj, the only sane action is
+     *       to free both buffers and drop the pin.
+     *   (c) If the slot still points at our pinned robj: do the
+     *       mode-specific finalize step (restore vs. permanent-
+     *       decompress) and drop the pin (refcount 2→1; kvstore
+     *       retains its ref).
      *
      * Iteration uses HASHTABLE_ITER_SAFE so we can free entry structs
      * inline without confusing the iterator (rehashing is paused for
@@ -486,6 +542,8 @@ void compressionBeforeSleep(void) {
      * pointers (entries already freed). */
     if (transient_view_map == NULL) return;
     if (hashtableSize(transient_view_map) == 0) return;
+
+    int master = server.compression_master_switch;
 
     hashtableIterator iter;
     hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
@@ -509,21 +567,26 @@ void compressionBeforeSleep(void) {
         int dict_index = getKVStoreIndexForKey(key_sds);
         void **slot = kvstoreHashtableFindRef(db->keys, dict_index, key_sds);
 
-        if (slot != NULL && *slot == o) {
-            /* Restore: pointer swap. The compressed bytes never went
-             * away; we just had val_ptr aliased to the temp sds during
-             * the iteration. Drop the pin (refcount 2→1; kvstore retains
-             * its ref). */
-            sdsfree((sds)o->val_ptr);
-            o->val_ptr = e->compressed_buffer;
-            o->encoding = OBJ_ENCODING_COMPRESSED;
-            decrRefCount(o);
-            zfree(e);
-        } else {
-            /* Discard: kvstore slot no longer points at our pinned robj
-             * (overwrite/expire/COW). Discard helper handles the buffer
-             * frees, pin decRef, and entry free. */
+        if (slot == NULL || *slot != o) {
+            /* Stale: kvstore slot no longer points at our pinned robj.
+             * discardTransientEntry handles both buffers + pin drop +
+             * entry free, regardless of drain mode. */
             discardTransientEntry(e);
+            continue;
+        }
+
+        if (master == COMPRESSION_MASTER_DECOMPRESSION) {
+            /* PERMANENT-DECOMPRESS. The robj is now an ordinary
+             * uncompressed string from every observer's perspective
+             * — until the master switch flips back to compression
+             * and the sweeper or write-path picks it up for
+             * re-compression. */
+            permanentlyDecompressTransientEntry(e);
+        } else {
+            /* RESTORE (master ∈ {compression, off}). Pointer-swap
+             * back to compressed; cold values stay compressed
+             * across iterations (preserves R2.5.6). */
+            restoreTransientEntry(e);
         }
     }
     hashtableCleanupIterator(&iter);
@@ -1326,6 +1389,48 @@ void testOnlyCompressionDrainTransientViewAsDiscard(void) {
     }
     hashtableCleanupIterator(&iter);
     hashtableEmpty(transient_view_map, NULL);
+}
+
+/* Test-only variant simulating compressionBeforeSleep's "slot matches"
+ * branch with master ∈ {compression, off}. Calls the same per-entry
+ * RESTORE finalize that production uses, but skips the kvstore lookup
+ * (always restores). Lets unit tests verify the restore-mode side
+ * effects (encoding flips back to COMPRESSED, val_ptr swaps, refcount
+ * drops, side-map empties) without setting up a populated kvstore. */
+void testOnlyCompressionDrainTransientViewAsRestore(void) {
+    if (transient_view_map == NULL) return;
+    if (hashtableSize(transient_view_map) == 0) return;
+
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
+    void *raw;
+    while (hashtableNext(&iter, &raw)) {
+        restoreTransientEntry((compressionTransientEntry *)raw);
+    }
+    hashtableCleanupIterator(&iter);
+    hashtableEmpty(transient_view_map, NULL);
+    transient_view_uncompressed_bytes = 0;
+}
+
+/* Test-only variant simulating compressionBeforeSleep's "slot matches"
+ * branch with master == decompression. Calls the same per-entry
+ * PERMANENT-DECOMPRESS finalize that production uses. The compressed
+ * buffer is released; the temp sds stays installed; encoding stays
+ * RAW. Verifies the drain mode that matches the operator's drain
+ * intent under master=decompression. */
+void testOnlyCompressionDrainTransientViewAsPermanentDecompress(void) {
+    if (transient_view_map == NULL) return;
+    if (hashtableSize(transient_view_map) == 0) return;
+
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, transient_view_map, HASHTABLE_ITER_SAFE);
+    void *raw;
+    while (hashtableNext(&iter, &raw)) {
+        permanentlyDecompressTransientEntry((compressionTransientEntry *)raw);
+    }
+    hashtableCleanupIterator(&iter);
+    hashtableEmpty(transient_view_map, NULL);
+    transient_view_uncompressed_bytes = 0;
 }
 
 /* Returns the current number of entries in the transient-view side-map,

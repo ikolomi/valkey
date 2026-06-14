@@ -55,6 +55,8 @@ extern "C" {
 /* Test-only entry points defined in compression.c. Declared locally
  * (matches the testOnly* convention; production header stays clean). */
 void testOnlyCompressionDrainTransientViewAsDiscard(void);
+void testOnlyCompressionDrainTransientViewAsRestore(void);
+void testOnlyCompressionDrainTransientViewAsPermanentDecompress(void);
 size_t testOnlyCompressionTransientViewSize(void);
 }
 
@@ -557,6 +559,155 @@ TEST_F(CompressionTransientViewTest, MemoryCapStrictlyEnforced) {
     EXPECT_EQ(0, transientViewActive(o));
     EXPECT_EQ(1, (int)o->refcount); /* no pin */
 
+    decrRefCount(o);
+}
+
+/* ============================================================
+ * PR-C2: two-mode drain dispatch (master ∈ {compression, off}
+ * → restore; master == decompression → permanent-decompress).
+ * Tests use the test-only drain helpers that simulate the
+ * "slot matches" branch of compressionBeforeSleep without
+ * requiring a populated kvstore.
+ * ============================================================ */
+
+TEST_F(CompressionTransientViewTest, RestoreDrainPutsCompressedFormBack) {
+    /* Materialize a compressed value, run the RESTORE-mode drain,
+     * verify the robj is back to OBJ_ENCODING_COMPRESSED with the
+     * original compressed buffer pointer reinstated. This is the
+     * mode used when master ∈ {compression, off} — preserves
+     * R2.5.6 (cold values stay compressed across iterations). */
+    std::string src = "{\"region\":\"us-east-1\",\"value\":42}";
+    robj *o = makeCompressedRobj(src, dict_id_);
+    ASSERT_NE(o, nullptr);
+    void *original_compressed_buffer = o->val_ptr;
+
+    compressionAccountInstall((int64_t)(1 << 20), 0);
+    EXPECT_EQ(0, compressionMaterializeTransientView(o, /*dbid=*/0));
+
+    /* Post-materialize: encoding flipped to RAW, val_ptr is the
+     * temp sds, refcount==2 (kvstore-style ref + pin). */
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)o->encoding);
+    EXPECT_NE(o->val_ptr, original_compressed_buffer);
+    EXPECT_EQ(2, (int)o->refcount);
+
+    /* Drain in RESTORE mode. */
+    testOnlyCompressionDrainTransientViewAsRestore();
+
+    /* Post-drain: side-map empty, robj fully restored to compressed,
+     * pin dropped (refcount 2→1), val_ptr is the original compressed
+     * buffer (zero recompression cost — pointer-swap only). */
+    EXPECT_EQ(0u, testOnlyCompressionTransientViewSize());
+    EXPECT_EQ(0, transientViewActive(o));
+    EXPECT_EQ(OBJ_ENCODING_COMPRESSED, (int)o->encoding);
+    EXPECT_EQ(o->val_ptr, original_compressed_buffer);
+    EXPECT_EQ(1, (int)o->refcount);
+
+    /* Test owns the only remaining ref; freeing it closes the cycle. */
+    decrRefCount(o);
+}
+
+TEST_F(CompressionTransientViewTest, PermanentDecompressDrainReleasesCompressedBuffer) {
+    /* Materialize a compressed value, run the PERMANENT-DECOMPRESS
+     * drain (master == decompression), verify the robj is
+     * permanently RAW (compressed buffer freed, temp sds remains).
+     * The next read pays no decompression cost. */
+    std::string src = "{\"region\":\"us-east-1\",\"value\":42}";
+    robj *o = makeCompressedRobj(src, dict_id_);
+    ASSERT_NE(o, nullptr);
+
+    compressionAccountInstall((int64_t)(1 << 20), 0);
+    EXPECT_EQ(0, compressionMaterializeTransientView(o, /*dbid=*/0));
+
+    sds temp_sds_at_materialize = (sds)o->val_ptr;
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)o->encoding);
+    EXPECT_EQ(2, (int)o->refcount);
+
+    /* Drain in PERMANENT-DECOMPRESS mode. */
+    testOnlyCompressionDrainTransientViewAsPermanentDecompress();
+
+    /* Post-drain: side-map empty, robj is permanently RAW, the temp
+     * sds is still installed as val_ptr (NOT freed; it IS the value
+     * now), pin dropped (refcount 2→1). The compressed buffer that
+     * was saved in the side-map entry has been released
+     * (releaseCompressedBuffer decRef'd the dict + reversed install
+     * accounting + freed the buffer). */
+    EXPECT_EQ(0u, testOnlyCompressionTransientViewSize());
+    EXPECT_EQ(0, transientViewActive(o));
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)o->encoding);
+    EXPECT_EQ((void *)o->val_ptr, (void *)temp_sds_at_materialize);
+    EXPECT_EQ(1, (int)o->refcount);
+    /* Decompressed bytes round-trip the original src. */
+    EXPECT_EQ(src.size(), sdslen((sds)o->val_ptr));
+    EXPECT_EQ(0, memcmp(src.data(), o->val_ptr, src.size()));
+
+    decrRefCount(o);
+}
+
+TEST_F(CompressionTransientViewTest, PermanentDecompressDrainHandlesMultipleEntries) {
+    /* Multiple entries in the side-map; permanent-decompress drain
+     * processes all of them. Verifies the iteration handles >1
+     * entry without leaking or confusing state. */
+    std::string s1 = "{\"region\":\"us-east-1\",\"id\":1}";
+    std::string s2 = "{\"region\":\"us-west-2\",\"id\":2}";
+    std::string s3 = "{\"region\":\"eu-west-1\",\"id\":3}";
+    robj *o1 = makeCompressedRobj(s1, dict_id_);
+    robj *o2 = makeCompressedRobj(s2, dict_id_);
+    robj *o3 = makeCompressedRobj(s3, dict_id_);
+    ASSERT_NE(o1, nullptr);
+    ASSERT_NE(o2, nullptr);
+    ASSERT_NE(o3, nullptr);
+
+    compressionAccountInstall((int64_t)(1 << 20), 0);
+    EXPECT_EQ(0, compressionMaterializeTransientView(o1, /*dbid=*/0));
+    EXPECT_EQ(0, compressionMaterializeTransientView(o2, /*dbid=*/0));
+    EXPECT_EQ(0, compressionMaterializeTransientView(o3, /*dbid=*/0));
+    EXPECT_EQ(3u, testOnlyCompressionTransientViewSize());
+
+    testOnlyCompressionDrainTransientViewAsPermanentDecompress();
+
+    EXPECT_EQ(0u, testOnlyCompressionTransientViewSize());
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)o1->encoding);
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)o2->encoding);
+    EXPECT_EQ(OBJ_ENCODING_RAW, (int)o3->encoding);
+    EXPECT_EQ(1, (int)o1->refcount);
+    EXPECT_EQ(1, (int)o2->refcount);
+    EXPECT_EQ(1, (int)o3->refcount);
+
+    decrRefCount(o1);
+    decrRefCount(o2);
+    decrRefCount(o3);
+}
+
+TEST_F(CompressionTransientViewTest, RestoreDrainResetsPerIterationBudget) {
+    /* The savings-based cap (transient_view_uncompressed_bytes) must
+     * reset to 0 at the end of every drain so the next iteration
+     * starts with the full cap available. Verify by materializing a
+     * value, draining (restore mode), then materializing again and
+     * checking it succeeds (would fall back to permanent-decompress
+     * if the budget hadn't reset and the cap was tight). */
+    std::string src = "{\"region\":\"us-east-1\",\"value\":42}";
+    robj *o = makeCompressedRobj(src, dict_id_);
+    ASSERT_NE(o, nullptr);
+
+    /* Cap exactly tight to one materialize: needs uncompressed_len
+     * bytes of headroom. With src.size() ~32 bytes and headroom
+     * just slightly larger, two consecutive materializes without
+     * a drain would fall back. With a proper drain in between, the
+     * budget resets and the second materialize succeeds. */
+    compressionAccountInstall((int64_t)src.size() + 16, 0);
+
+    EXPECT_EQ(0, compressionMaterializeTransientView(o, /*dbid=*/0));
+    EXPECT_EQ(1u, testOnlyCompressionTransientViewSize());
+
+    testOnlyCompressionDrainTransientViewAsRestore();
+    EXPECT_EQ(0u, testOnlyCompressionTransientViewSize());
+
+    /* Second materialize must succeed — budget reset by drain. */
+    EXPECT_EQ(0, compressionMaterializeTransientView(o, /*dbid=*/0));
+    EXPECT_EQ(1u, testOnlyCompressionTransientViewSize());
+
+    /* Drain again to free everything. */
+    testOnlyCompressionDrainTransientViewAsRestore();
     decrRefCount(o);
 }
 
