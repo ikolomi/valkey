@@ -1155,9 +1155,9 @@ void compressionEnqueueCandidate(robj *key, robj *value, int dbid) {
      * separate switch check needed. */
     if (!compressionIsEligible(value)) return;
 
-    /* No active dict yet (R2.1.5). The encoder's worker side would
-     * also handle this, but checking here avoids an allocator round-
-     * trip and a pin we'd immediately release. */
+    /* No active dict yet (R2.1.7 third state). The encoder's worker
+     * side would also handle this, but checking here avoids an
+     * allocator round-trip and a pin we'd immediately release. */
     if (compressionRegistryActive() == NULL) return;
 
     /* Pin the value: keeps the sds bytes immutable for the worker
@@ -1278,19 +1278,18 @@ void compressionCommand(client *c) {
 
     if (!strcasecmp(sub, "status")) {
         compressionStatus(c);
-    } else if (!strcasecmp(sub, "enable") || !strcasecmp(sub, "disable")) {
-        /* Phase 0: these are accepted but inert. */
-        addReply(c, shared.ok);
     } else if (!strcasecmp(sub, "help")) {
         const char *help[] = {
             "STATUS",
-            "    Return the current compression state.",
+            "    Return the current compression state (mirrors INFO compression).",
             "HELP",
             "    Print this help.",
             "",
-            "Note: compression is in Phase 0 (skeleton). Additional",
-            "subcommands (DICT LIST/DROP/EXPORT/IMPORT, SWEEP, TRAIN,",
-            "ENABLE, DISABLE) land in Phase 1.",
+            "Note: SWEEP FORCE, TRAIN, and DICT LIST/DROP/EXPORT/IMPORT land in",
+            "subsequent S2 PRs. Operators set master-switch state via",
+            "'CONFIG SET compression-master-switch ...'; legacy ENABLE/DISABLE",
+            "aliases are not part of the v1 surface (the 3-state enum doesn't",
+            "map cleanly to enable/disable verbs).",
             NULL};
         addReplyHelp(c, help);
     } else {

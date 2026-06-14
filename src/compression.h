@@ -296,8 +296,8 @@ int compressionIsEligible(robj *o);
  *
  * The function is a no-op when:
  *   - The value is not eligible (R2.2 predicate).
- *   - No active dictionary exists (R2.1.5 — encoder would skip anyway,
- *     but checking here saves the allocator round-trip).
+ *   - No active dictionary exists (R2.1.7 third state — encoder would
+ *     skip anyway, but checking here saves the allocator round-trip).
  *
  * On enqueue the function bumps `incrRefCount(value)` to pin the bytes
  * (R2.4.4 immutable-snapshot invariant + ABA safety for the drain

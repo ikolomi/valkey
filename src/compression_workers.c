@@ -616,7 +616,7 @@ int compressionWorkersDrainOutbox(int budget) {
                  * here in S4.1:
                  *   - job->err > 0 (worker policy, e.g. no-dict): no
                  *     INFO counter — this is a benign expected state
-                 *     (R2.1.5), tracked indirectly via
+                 *     (R2.1.7 third state), tracked indirectly via
                  *     compression_state == "active" || "idle".
                  *   - job->err < 0 (real ZSTD error): increment
                  *     compression_errors_total per R2.10.1 and emit a
