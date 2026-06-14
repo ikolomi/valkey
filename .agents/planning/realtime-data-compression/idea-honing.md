@@ -2,6 +2,13 @@
 
 _Interactive Q&A to refine the rough idea into concrete requirements. One question at a time, answers recorded verbatim (or summarised with the user's final decision) as we go._
 
+> **Status note (2026-06-14):** This document is preserved as the historical Q&A audit trail of v1 design decisions. **`design/detailed-design.md` is the source of truth for the current design.** Two areas of `idea-honing.md` were materially redesigned post-walkthrough:
+>
+> - **Q5 (master switch on/off model)** was reworked into the declarative 3-state model (`compression-master-switch: compression | decompression | off`) with a separate sweeper switch (`compression-active-sweeper: enabled | disabled`) and a manual force command (`COMPRESSION SWEEP FORCE`). See `detailed-design.md` §2.1 (R2.1.1 – R2.1.7) for the current model. The Q5 answer below describes the original `compression-enabled yes/no` bool model and is **superseded**.
+> - **Q5 (operator surface)** corollary: the `COMPRESSION ENABLE` / `COMPRESSION DISABLE` convenience aliases and the `COMPRESSION SWEEP [direction=…]` command form are NOT part of v1. Operators use `CONFIG SET compression-master-switch …` and `COMPRESSION SWEEP FORCE` instead. See `detailed-design.md` §4.5.
+>
+> Some answers in this document were also annotated inline as "superseded by review" during the PR walkthrough — those annotations are preserved alongside the original Q&A. The remaining Qs (Q1–Q4, Q6–Q16) hold up under the current design without modification.
+
 ---
 
 ## Q1. Dictionary-version cap
