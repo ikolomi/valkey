@@ -557,10 +557,10 @@ void compressionBeforeSleep(void) {
  * Stays in sync with the enum block in server.h. */
 static const char *masterSwitchName(int v) {
     switch (v) {
-    case COMPRESSION_MASTER_OFF:           return "off";
-    case COMPRESSION_MASTER_COMPRESSION:   return "compression";
+    case COMPRESSION_MASTER_OFF: return "off";
+    case COMPRESSION_MASTER_COMPRESSION: return "compression";
     case COMPRESSION_MASTER_DECOMPRESSION: return "decompression";
-    default:                               return "?";
+    default: return "?";
     }
 }
 
