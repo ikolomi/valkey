@@ -468,7 +468,9 @@ void compressionShutdown(void) {
 void compressionCron(void) {
     /* Training: trigger evaluation, scan advancement, completion polling. */
     compressionTrainCron();
-    /* Sweeper: state machine + paced kvstore iteration. (R2.1.2 + R2.1.4) */
+    /* Sweeper: paced kvstore iteration. The actual triggers come
+     * from apply hooks; this just runs whatever work is scheduled.
+     * (R2.1.2 + R2.1.4) */
     compressionSweepCron();
 }
 
@@ -718,12 +720,12 @@ int applyCompressionMasterSwitch(const char **err) {
               masterSwitchName(prev_master_for_apply), masterSwitchName(curr));
 
     prev_master_for_apply = curr;
-    /* Notify the sweeper of the transition. Necessary because the
-     * sweeper polls server.compression_master_switch every cron tick
-     * (~100ms); without an explicit edge signal, transitions like
-     * compression→off→compression that complete inside one tick window
-     * would be invisible to the sweeper (it only ever observes the
-     * current value, not the history). */
+    /* Notify the sweeper of the transition. The sweeper's apply-hook
+     * model directly mutates state from this entry point — see
+     * compression_sweep.h for the dispatch table. Apply hooks fire
+     * synchronously on CONFIG SET, so transitions faster than the
+     * cron tick (e.g., compression→off→compression inside 100ms)
+     * are observed as distinct events. */
     compressionSweepNotifyMasterSwitchChanged();
     maybeWarnNonFunctional();
     return 1;

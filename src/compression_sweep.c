@@ -54,9 +54,9 @@ typedef struct compressionSweepState {
     int enable_once;
 
     /* Iteration cursor. Both fields are reset to 0 on pass start
-     * (resetScanStateAndEnableOnce or completion). During SCANNING,
-     * current_db points at the DB whose keyspace is currently being
-     * iterated; cursor is its kvstoreScan cursor. */
+     * (resetScanStateAndEnableOnce or completion). When scan_in_progress
+     * is 1, current_db points at the DB whose keyspace is currently
+     * being iterated; cursor is its kvstoreScan cursor. */
     int current_db;
     unsigned long long cursor;
 

@@ -127,8 +127,7 @@ void compressionSweepShutdown(void);
 
 /*
  * Cron tick. Called from compressionCron once per serverCron iteration.
- * Non-blocking. See file-level docstring for the full state-machine
- * pseudocode.
+ * Non-blocking. See file-level docstring for the full pseudocode.
  */
 void compressionSweepCron(void);
 
@@ -156,13 +155,19 @@ int compressionSweepForce(void);
  * Apply-hook callbacks (called from compression.c apply hooks
  * synchronously on every CONFIG SET that changes the value):
  *
- *   compressionSweepNotifyMasterSwitchChanged(new_master)
- *     new_master == off                  -> abortScan()
- *     compression-automatic-sweeper=on   -> resetScanStateAndEnableOnce()
- *     compression-automatic-sweeper=off  -> nothing (sweeper config
- *                                          gates automatic scheduling)
+ *   compressionSweepNotifyMasterSwitchChanged()
+ *     master == off                       -> abortScan()
+ *     scan in flight (force or automatic) -> resetScanStateAndEnableOnce()
+ *     no scan, sweeper=enabled            -> resetScanStateAndEnableOnce()
+ *     no scan, sweeper=disabled           -> nothing
  *
- *   compressionSweepNotifyAutomaticSweeperChanged(new_value)
+ *     The "scan in flight" branch ensures direction changes preempt
+ *     ANY in-progress scan — including a force-pass started while
+ *     sweeper=disabled. Without it, the cron would resume the scan
+ *     under the new direction from the saved cursor, leaving the
+ *     keyspace in a half-old / half-new state.
+ *
+ *   compressionSweepNotifyAutomaticSweeperChanged()
  *     new_value == enabled, master != off -> resetScanStateAndEnableOnce()
  *     new_value == disabled               -> abortScan()
  *     new_value == enabled, master == off -> nothing (no direction)
