@@ -8,32 +8,22 @@
  * compression_sweep.c — sweeper engine.
  *
  * One file-static state struct. All entry points run on the main
- * thread (compressionCron, command handler, gtest hooks). The sweeper
- * interacts with the worker pool only through the producer-side API
- * compressionEnqueueCandidate, which itself is main-thread-only.
+ * thread (compressionCron, command handler, apply hooks, gtest
+ * helpers). The sweeper interacts with the worker pool only via
+ * compressionEnqueueCandidate (main-thread producer side) and with
+ * the registry only via compressionPermanentlyDecompress (main thread).
  *
- * Per-tick design:
- *   1. Read master switch and active-sweeper config (fresh every tick;
- *      the design says direction changes resolve at the next tick).
- *   2. Detect direction change vs. last_master_seen; if changed,
- *      reset cursor.
- *   3. Compute next state from (config, master, force_pending,
- *      current_state, interval).
- *   4. If SCANNING, do up to budget_us of work via kvstoreScan.
- *   5. If we wrapped through all dbs, mark pass complete; transition
- *      to IDLE (interval=0) or SLEEPING (interval>0).
+ * Internal model
+ * --------------
  *
- * Per-key callback dispatch:
- *   master == compression  -> compressionEnqueueCandidate (filtered
- *                             by the existing eligibility predicate;
- *                             non-RAW values fall through cheaply).
- *   master == decompression -> compressionPermanentlyDecompress for
- *                              compressed values; skip everything else.
- *
- * Non-functional state warning (R2.1.6): master=compression +
- * compression-threads=0 is allowed but pointless — every enqueue
- * drops at the producer side. The cron tick logs a rate-limited
- * warning (1/min) and skips the pass.
+ * Two booleans + one timestamp + the iteration cursor capture
+ * everything (header docstring has the full prose). Apply hooks
+ * mutate state synchronously on every CONFIG SET; the cron tick
+ * just consumes that state and runs work. There is no separate
+ * polling-based edge detector — the model that used one (an
+ * earlier 4-state machine) had a sub-tick edge bug because the
+ * cron polls at ~100ms while CONFIG SETs can run faster. The
+ * simpler apply-hook-driven model is immune by construction.
  */
 
 #include "compression_sweep.h"
@@ -49,58 +39,135 @@
  * State
  * ======================================================================== */
 
-/* All sweeper state lives in this single file-static struct. Touching
- * it requires the main thread (no locking). Init zero-fills; shutdown
- * resets to the same shape. */
+/* All sweeper state lives here. Touching it requires the main thread. */
 typedef struct compressionSweepState {
-    int state;                     /* COMPRESSION_SWEEPER_STATE_* */
-    int last_master;               /* tracked to detect master-switch changes */
-    int force_pending;             /* COMPRESSION SWEEP FORCE was requested */
-    int current_db;                /* 0..server.dbnum-1 during SCANNING */
-    unsigned long long cursor;     /* persisted across ticks within a pass */
-    mstime_t pass_started_ms;
-    mstime_t pass_completed_ms;    /* base for SLEEPING-state interval timer */
-    mstime_t last_warning_ms;      /* rate-limit for the threads=0 warning */
-    /* Counters surfaced via INFO. Reset only on init/shutdown — they
-     * are cumulative since process start. */
+    /* Mid-pass marker. Set when a pass starts; cleared on completion.
+     * Distinct from `cursor != 0` because cursor can be 0 at any
+     * intra-pass moment (kvstoreScan returns 0 between DB hand-offs);
+     * scan_in_progress reflects the user-visible "is a scan running"
+     * state without depending on the cursor's per-tick rhythm. */
+    int scan_in_progress;
+
+    /* One-shot trigger. Set by apply hooks (master change, sweeper
+     * disabled→enabled) and by FORCE. Consumed by the next cron tick
+     * that runs work. Persists across cron ticks until consumed. */
+    int enable_once;
+
+    /* Iteration cursor. Both fields are reset to 0 on pass start
+     * (resetScanStateAndEnableOnce or completion). During SCANNING,
+     * current_db points at the DB whose keyspace is currently being
+     * iterated; cursor is its kvstoreScan cursor. */
+    int current_db;
+    unsigned long long cursor;
+
+    /* mstime() of the most recent pass completion. Zero before the
+     * first pass. Used by nextIntervalElapsed() to gate periodic
+     * re-runs. */
+    mstime_t last_completion_ms;
+
+    /* Rate-limit cache for the master=compression + threads=0
+     * non-functional warning. */
+    mstime_t last_warning_ms;
+
+    /* Cumulative INFO counters (lifetime of the process). */
     uint64_t passes_completed;
     uint64_t keys_processed;
 } compressionSweepState;
 
 static compressionSweepState sweep;
 
-/* Set by compressionSweepNotifyMasterSwitchChanged() (called from the
- * master-switch apply hook) on every transition. The cron tick consumes
- * the flag — clearing it — to detect direction changes that happen
- * faster than cron polling could observe (e.g., compression→off→
- * compression within a single 100ms tick window). The cron alone
- * can't see those edges because it only ever sees the current value,
- * not the history.
- *
- * Main-thread only: apply hooks and cron both run on the main thread,
- * so a plain int suffices. */
-static int sweep_master_switch_changed = 0;
+/* ========================================================================
+ * State-mutation helpers (called from cron + apply hooks + FORCE)
+ * ======================================================================== */
+
+/* Reset cursor and arm enable_once. Aborts any in-flight pass and
+ * schedules a fresh one for the next cron tick. Called by:
+ *   - master-switch transitions to {compression, decompression} when
+ *     compression-automatic-sweeper=enabled
+ *   - compression-automatic-sweeper transitions disabled→enabled
+ *     when master ∈ {compression, decompression}
+ *   - COMPRESSION SWEEP FORCE (when master ≠ off)
+ */
+static void resetScanStateAndEnableOnce(void) {
+    sweep.cursor = 0;
+    sweep.current_db = 0;
+    sweep.scan_in_progress = 0;
+    sweep.enable_once = 1;
+}
+
+/* Abort any in-flight pass without scheduling a replacement. Called by:
+ *   - master-switch transitions to off
+ *   - compression-automatic-sweeper transitions enabled→disabled
+ */
+static void abortScan(void) {
+    sweep.cursor = 0;
+    sweep.current_db = 0;
+    sweep.scan_in_progress = 0;
+    sweep.enable_once = 0;
+}
+
+/* Decide if a periodic interval-driven re-run is due. Returns true iff:
+ *   - sweeper config = enabled, AND
+ *   - interval > 0 (interval=0 means "no periodic re-runs"), AND
+ *   - at least one pass has completed (last_completion_ms != 0), AND
+ *   - elapsed since last completion >= interval seconds. */
+static int nextIntervalElapsed(void) {
+    if (server.compression_automatic_sweeper != COMPRESSION_AUTOMATIC_SWEEPER_ENABLED) {
+        return 0;
+    }
+    int interval = server.compression_automatic_sweeper_interval;
+    if (interval <= 0) return 0;
+    if (sweep.last_completion_ms == 0) return 0;
+    mstime_t elapsed = mstime() - sweep.last_completion_ms;
+    return elapsed >= (mstime_t)interval * 1000;
+}
+
+/* ========================================================================
+ * Apply-hook callbacks
+ * ======================================================================== */
 
 void compressionSweepNotifyMasterSwitchChanged(void) {
-    sweep_master_switch_changed = 1;
+    int master = server.compression_master_switch;
+    int sweeper = server.compression_automatic_sweeper;
+
+    if (master == COMPRESSION_MASTER_OFF) {
+        /* No direction; abort any in-flight scan unconditionally. */
+        abortScan();
+        return;
+    }
+    /* Master is compression or decompression. Schedule a fresh pass
+     * iff the operator has automatic scheduling enabled. With sweeper
+     * disabled the operator wants to FORCE manually; do nothing. */
+    if (sweeper == COMPRESSION_AUTOMATIC_SWEEPER_ENABLED) {
+        resetScanStateAndEnableOnce();
+    }
 }
 
-/* Map state values to user-visible names for log lines + INFO. Stays
- * in sync with the COMPRESSION_SWEEPER_STATE_* block in the header. */
-static const char *kStateNames[] = {
-    [COMPRESSION_SWEEPER_STATE_DISABLED] = "disabled",
-    [COMPRESSION_SWEEPER_STATE_IDLE] = "idle",
-    [COMPRESSION_SWEEPER_STATE_SCANNING] = "scanning",
-    [COMPRESSION_SWEEPER_STATE_SLEEPING] = "sleeping",
-};
+void compressionSweepNotifyAutomaticSweeperChanged(void) {
+    int master = server.compression_master_switch;
+    int sweeper = server.compression_automatic_sweeper;
 
-const char *compressionSweepStateName(int state) {
-    if (state < 0 || state > COMPRESSION_SWEEPER_STATE_SLEEPING) return "?";
-    return kStateNames[state];
+    if (sweeper == COMPRESSION_AUTOMATIC_SWEEPER_DISABLED) {
+        /* Symmetric to enable: abort whatever was in flight. The
+         * operator just declared "no automatic background work". */
+        abortScan();
+        return;
+    }
+    /* Sweeper just enabled. Kick a fresh pass — but only if there's
+     * a direction. master=off + sweeper=enabled is a documented
+     * non-functional state (R2.1.6); the next master change handles
+     * scheduling. */
+    if (master != COMPRESSION_MASTER_OFF) {
+        resetScanStateAndEnableOnce();
+    }
 }
 
-int compressionSweepGetState(void) {
-    return sweep.state;
+/* ========================================================================
+ * INFO accessors
+ * ======================================================================== */
+
+int compressionSweepIsRunning(void) {
+    return sweep.scan_in_progress;
 }
 
 uint64_t compressionSweepGetPassesCompleted(void) {
@@ -117,15 +184,20 @@ uint64_t compressionSweepGetKeysProcessed(void) {
 
 void compressionSweepInit(void) {
     memset(&sweep, 0, sizeof(sweep));
-    sweep.state = COMPRESSION_SWEEPER_STATE_DISABLED;
-    sweep.last_master = COMPRESSION_MASTER_OFF;
+    /* Boot config might land in a state where the sweeper should
+     * already be scheduled (sweeper=enabled + master ∈ {compression,
+     * decompression}). The apply hook fires only on CONFIG SET, not
+     * on boot, so handle that case here — same logic as
+     * compressionSweepNotifyAutomaticSweeperChanged()'s enabled
+     * branch. */
+    if (server.compression_automatic_sweeper == COMPRESSION_AUTOMATIC_SWEEPER_ENABLED &&
+        server.compression_master_switch != COMPRESSION_MASTER_OFF) {
+        resetScanStateAndEnableOnce();
+    }
 }
 
 void compressionSweepShutdown(void) {
-    /* Same shape as init — nothing to free. The sweeper holds no
-     * heap-allocated state; it's a pure cron-driven state machine. */
     memset(&sweep, 0, sizeof(sweep));
-    sweep.state = COMPRESSION_SWEEPER_STATE_DISABLED;
 }
 
 /* ========================================================================
@@ -136,9 +208,11 @@ int compressionSweepForce(void) {
     if (server.compression_master_switch == COMPRESSION_MASTER_OFF) {
         return COMPRESSION_SWEEP_FORCE_REJECTED;
     }
-    /* Idempotent: if force is already pending or a pass is already
-     * scanning, this is a no-op. The cron tick handles transition. */
-    sweep.force_pending = 1;
+    /* FORCE preempts: any in-flight automatic scan is aborted and a
+     * fresh pass starts from cursor 0 on the next cron tick. The
+     * operator-facing semantic is "do a pass now, from scratch,
+     * regardless of what was running". */
+    resetScanStateAndEnableOnce();
     return COMPRESSION_SWEEP_FORCE_OK;
 }
 
@@ -146,10 +220,9 @@ int compressionSweepForce(void) {
  * Per-key callback
  * ======================================================================== */
 
-/* Privdata threaded through kvstoreScan to the per-key callback. */
 typedef struct sweepCbCtx {
-    int master; /* current master-switch value at tick start */
-    int dbid;   /* index into server.db[] for this scan call */
+    int master;
+    int dbid;
 } sweepCbCtx;
 
 static void sweepScanCallback(void *privdata, void *entry, int didx) {
@@ -161,13 +234,11 @@ static void sweepScanCallback(void *privdata, void *entry, int didx) {
     if (ctx->master == COMPRESSION_MASTER_COMPRESSION) {
         /* Eligibility predicate inside compressionEnqueueCandidate
          * filters non-string values, non-RAW encodings, hot keys,
-         * etc. Sweeper just hands every entry to the producer; the
-         * existing R2.2 logic decides whether to actually enqueue. */
+         * etc. Sweeper just hands every entry to the producer. */
         compressionEnqueueCandidate(NULL, val, ctx->dbid);
     } else if (ctx->master == COMPRESSION_MASTER_DECOMPRESSION) {
-        /* Drain mode. Permanently decompress every compressed value.
-         * Non-compressed values are a no-op (the helper checks the
-         * encoding and returns 0 if not COMPRESSED). */
+        /* Drain mode. Permanently decompress every compressed value;
+         * non-compressed values are a cheap no-op. */
         if (val->encoding == OBJ_ENCODING_COMPRESSED) {
             compressionPermanentlyDecompress(val);
         }
@@ -176,13 +247,10 @@ static void sweepScanCallback(void *privdata, void *entry, int didx) {
 }
 
 /* ========================================================================
- * Per-tick budget + state machine
+ * Per-tick budget + cron
  * ======================================================================== */
 
-/* Compute the wall-clock budget for this tick in microseconds, derived
- * from the cron tick interval (1/hz seconds) and the sweep-pacing
- * percent. Floor at 1ms — useful work needs at least one kvstoreScan
- * call's worth of time. */
+/* Wall-clock budget in microseconds for one cron tick. Floor at 1ms. */
 static long long tickBudgetUs(void) {
     int hz = server.hz > 0 ? server.hz : 10;
     int pct = server.compression_sweep_max_cpu_pct;
@@ -194,10 +262,9 @@ static long long tickBudgetUs(void) {
     return budget_us;
 }
 
-/* Run the sweep until the wall-clock budget expires or until the pass
- * completes (current_db wraps past dbnum). Updates sweep.cursor and
- * sweep.current_db in place. Returns 1 if the pass completed during
- * this tick, 0 otherwise. */
+/* Run kvstoreScan until the budget expires or the pass completes.
+ * Updates sweep.cursor / sweep.current_db in place. Returns 1 if the
+ * pass completed during this tick. */
 static int runSweepBudget(int master) {
     long long budget_us = tickBudgetUs();
     monotime start;
@@ -206,7 +273,6 @@ static int runSweepBudget(int master) {
     while (sweep.current_db < server.dbnum) {
         serverDb *db = server.db[sweep.current_db];
         if (db == NULL) {
-            /* Unmaterialized DB slot. Skip. */
             sweep.current_db++;
             sweep.cursor = 0;
             continue;
@@ -217,7 +283,6 @@ static int runSweepBudget(int master) {
                                    sweepScanCallback, NULL, &ctx);
 
         if (sweep.cursor == 0) {
-            /* This DB done; move on. */
             sweep.current_db++;
         }
 
@@ -225,7 +290,6 @@ static int runSweepBudget(int master) {
     }
 
     if (sweep.current_db >= server.dbnum) {
-        /* Pass complete. */
         sweep.current_db = 0;
         sweep.cursor = 0;
         return 1;
@@ -233,9 +297,8 @@ static int runSweepBudget(int master) {
     return 0;
 }
 
-/* Rate-limited warning for master=compression + threads=0. Logged
- * at most once per minute so a misconfigured operator gets a clear
- * signal but doesn't drown the log. */
+/* Rate-limited warning for master=compression + threads=0. Logged at
+ * most once per minute. */
 static void maybeWarnNoThreads(void) {
     mstime_t now = mstime();
     if (now - sweep.last_warning_ms < 60000) return;
@@ -248,144 +311,51 @@ static void maybeWarnNoThreads(void) {
 
 void compressionSweepCron(void) {
     int master = server.compression_master_switch;
-    int sweeper_cfg = server.compression_active_sweeper;
 
-    /* master=off: sweeper has no direction. Abort any in-flight scan
-     * (cursor lost) and reflect the config in state. FORCE is rejected
-     * at the command level when master=off, so we shouldn't see
-     * force_pending here, but defend anyway. */
-    if (master == COMPRESSION_MASTER_OFF) {
-        sweep.force_pending = 0;
+    /* No direction; nothing to do. The apply hook for master-switch
+     * already cleared in-flight state on the off transition. */
+    if (master == COMPRESSION_MASTER_OFF) return;
+
+    /* Determine whether to scan this tick. The trigger sources are:
+     *   - enable_once: armed by an apply hook or FORCE.
+     *   - scan_in_progress: a pass is mid-flight; keep going.
+     *   - nextIntervalElapsed(): periodic re-run is due. */
+    int interval_due = nextIntervalElapsed();
+    if (!sweep.enable_once && !sweep.scan_in_progress && !interval_due) return;
+
+    /* Consume the one-shot trigger. */
+    sweep.enable_once = 0;
+
+    /* Begin a fresh pass if we weren't mid-flight. */
+    if (!sweep.scan_in_progress) {
+        /* cursor + current_db should already be 0 (set by
+         * resetScanStateAndEnableOnce() or by the previous pass's
+         * completion). Defensive reset matches that invariant. */
         sweep.cursor = 0;
         sweep.current_db = 0;
-        sweep.state = (sweeper_cfg == COMPRESSION_ACTIVE_SWEEPER_ENABLED)
-                          ? COMPRESSION_SWEEPER_STATE_IDLE
-                          : COMPRESSION_SWEEPER_STATE_DISABLED;
-        sweep.last_master = master;
-        sweep_master_switch_changed = 0; /* consumed; nothing to scan */
-        return;
-    }
-
-    /* Direction change detection. We can't rely on
-     * (master != sweep.last_master) alone because the cron polls every
-     * ~100ms and master can flip compression→off→compression faster
-     * than that — leaving last_master==master at every observed tick.
-     * The apply hook sets sweep_master_switch_changed on every
-     * transition; we OR that with the polled comparison so neither
-     * source of edge is missed.
-     *
-     * Reset cursor on direction change AND trigger a fresh pass (if
-     * config enabled). Even mid-pass: per design, the sweeper takes
-     * its direction from the current master switch, and "any direction
-     * change with compression-active-sweeper=enabled wakes the
-     * sweeper, resets cursor, restarts pass with the new direction"
-     * (R2.1.5). */
-    int direction_changed = sweep_master_switch_changed ||
-                            (master != sweep.last_master);
-    sweep_master_switch_changed = 0;
-    sweep.last_master = master;
-    if (direction_changed && sweep.state == COMPRESSION_SWEEPER_STATE_SCANNING) {
+        sweep.scan_in_progress = 1;
         serverLog(LL_NOTICE,
-                  "Compression sweeper: direction changed mid-pass to %s, "
-                  "restarting from cursor 0.",
-                  master == COMPRESSION_MASTER_COMPRESSION ? "compression" : "decompression");
-        sweep.cursor = 0;
-        sweep.current_db = 0;
-    }
-
-    /* Decide whether to scan this tick. The triggers are:
-     *
-     *   - Already in SCANNING (committed to the pass — keep going).
-     *   - FORCE pending (operator-driven; wins over everything except
-     *     master=off, which is handled above).
-     *   - config=enabled AND (direction changed | config just
-     *     transitioned to enabled | SLEEPING with interval expired).
-     *
-     * If none of those: stay in current non-scanning state, possibly
-     * adjusting it to reflect config. */
-    int should_scan = (sweep.state == COMPRESSION_SWEEPER_STATE_SCANNING);
-
-    if (sweep.force_pending) {
-        if (!should_scan) {
-            serverLog(LL_NOTICE,
-                      "Compression sweeper: force-pass starting (master=%s).",
-                      master == COMPRESSION_MASTER_COMPRESSION ? "compression" : "decompression");
-        }
-        should_scan = 1;
-        sweep.force_pending = 0;
-    } else if (sweeper_cfg == COMPRESSION_ACTIVE_SWEEPER_ENABLED && !should_scan) {
-        if (direction_changed) {
-            should_scan = 1;
-            serverLog(LL_NOTICE,
-                      "Compression sweeper: direction changed to %s, starting pass.",
-                      master == COMPRESSION_MASTER_COMPRESSION ? "compression" : "decompression");
-        } else if (sweep.state == COMPRESSION_SWEEPER_STATE_DISABLED) {
-            should_scan = 1;
-            serverLog(LL_NOTICE,
-                      "Compression sweeper: enabled, starting pass (master=%s).",
-                      master == COMPRESSION_MASTER_COMPRESSION ? "compression" : "decompression");
-        } else if (sweep.state == COMPRESSION_SWEEPER_STATE_SLEEPING) {
-            int interval = server.compression_active_sweeper_interval;
-            if (interval > 0) {
-                mstime_t elapsed = mstime() - sweep.pass_completed_ms;
-                if (elapsed >= (mstime_t)interval * 1000) {
-                    should_scan = 1;
-                    serverLog(LL_NOTICE,
-                              "Compression sweeper: interval expired, starting pass.");
-                }
-            }
-            /* interval==0 in SLEEPING is a transitional anomaly (interval
-             * was changed to 0 while sleeping). Stay sleeping forever
-             * until direction change or FORCE; matches the
-             * "interval=0 = no periodic re-runs" semantic. */
-        }
-        /* IDLE with no direction-change/force/interval: stay idle. */
-    }
-
-    if (!should_scan) {
-        /* Reflect config in state without starting a pass. */
-        if (sweeper_cfg == COMPRESSION_ACTIVE_SWEEPER_DISABLED) {
-            sweep.state = COMPRESSION_SWEEPER_STATE_DISABLED;
-        } else if (sweep.state == COMPRESSION_SWEEPER_STATE_DISABLED) {
-            /* Config is enabled but we didn't trigger; transitional. */
-            sweep.state = COMPRESSION_SWEEPER_STATE_IDLE;
-        }
-        return;
-    }
-
-    /* SCANNING. Reset state if we're transitioning into SCANNING this
-     * tick (vs. continuing an in-flight pass). */
-    if (sweep.state != COMPRESSION_SWEEPER_STATE_SCANNING) {
-        sweep.cursor = 0;
-        sweep.current_db = 0;
-        sweep.state = COMPRESSION_SWEEPER_STATE_SCANNING;
-        sweep.pass_started_ms = mstime();
+                  "Compression sweeper: %s pass starting%s.",
+                  master == COMPRESSION_MASTER_COMPRESSION ? "compression" : "decompression",
+                  interval_due ? " (interval expired)" : "");
     }
 
     /* Non-functional state: master=compression + threads=0. The
      * worker pool refuses every enqueue, so iterating the keyspace
-     * just burns CPU. Skip the pass (state stays SCANNING; a future
-     * threads=N CONFIG SET picks up where we left off). */
+     * just burns CPU. Skip the scan with a rate-limited warning;
+     * scan_in_progress stays set so a future threads=N CONFIG SET
+     * picks up where we left off. */
     if (master == COMPRESSION_MASTER_COMPRESSION && server.compression_threads == 0) {
         maybeWarnNoThreads();
         return;
     }
 
-    /* Do work. Returns 1 if the pass completed during this tick. */
+    /* Do work. */
     int completed = runSweepBudget(master);
     if (completed) {
+        sweep.scan_in_progress = 0;
+        sweep.last_completion_ms = mstime();
         sweep.passes_completed++;
-        sweep.pass_completed_ms = mstime();
-        int interval = server.compression_active_sweeper_interval;
-        if (sweeper_cfg == COMPRESSION_ACTIVE_SWEEPER_DISABLED) {
-            /* Config flipped off during the pass (force-pass-style
-             * commitment kept us going to completion). Go DISABLED. */
-            sweep.state = COMPRESSION_SWEEPER_STATE_DISABLED;
-        } else {
-            sweep.state = (interval > 0)
-                              ? COMPRESSION_SWEEPER_STATE_SLEEPING
-                              : COMPRESSION_SWEEPER_STATE_IDLE;
-        }
         serverLog(LL_NOTICE,
                   "Compression sweeper: %s pass complete (%llu keys processed).",
                   master == COMPRESSION_MASTER_COMPRESSION ? "compression" : "decompression",

@@ -118,7 +118,7 @@ uint32_t compressionRegistryAdd(compressionDictPair *p, int promote);
 
 /* Marks the dict as RETIRING. A dict is freed only when its refcount
  * reaches zero, either through frame rewrites or via the
- * `compression-master-switch decompression + compression-active-sweeper
+ * `compression-master-switch decompression + compression-automatic-sweeper
  * enabled` drain mode. Returns 0 on success, -1 if `dict_id` is
  * unknown. */
 int compressionRegistryRetire(uint32_t dict_id);

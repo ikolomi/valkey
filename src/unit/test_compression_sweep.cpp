@@ -3,21 +3,24 @@
  * All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Tests for the compression sweeper state machine.
+ * Tests for the compression sweeper.
  *
- * The sweeper is a cron-driven state machine; we drive it from tests
- * by manipulating server.compression_master_switch /
- * compression_active_sweeper / compression_active_sweeper_interval +
- * compression_threads, then calling testOnlyCompressionSweepRunOneTick
- * once per "tick". testOnlyCompressionSweepReset resets the state
- * struct between tests.
+ * Internal model: 2 booleans (scan_in_progress, enable_once) +
+ * timestamp + cursor. Apply hooks set state synchronously; the cron
+ * tick consumes it. We drive the sweeper by manipulating
+ * server.compression_master_switch / compression_automatic_sweeper /
+ * compression_automatic_sweeper_interval / compression_threads,
+ * calling the corresponding notify* callback explicitly (mimicking
+ * what the apply hooks do in production), then calling
+ * testOnlyCompressionSweepRunOneTick once per "tick".
+ *
+ * testOnlyCompressionSweepReset resets all state between tests.
  *
  * These tests deliberately do NOT exercise the per-key callback path
  * (kvstoreScan over a populated keyspace) — the unit-test environment
- * doesn't have a real serverDb / kvstore. State-machine coverage is
- * what matters; the per-key dispatch is a one-line if/else and is
- * exercised at the integration-test level (Tcl) and in production
- * smoke runs.
+ * doesn't have a real serverDb / kvstore. State coverage is what
+ * matters here; the per-key dispatch is a one-line if/else exercised
+ * at the integration-test level (Tcl) and in production smoke runs.
  */
 
 #include "generated_wrappers.hpp"
@@ -51,18 +54,17 @@ class CompressionSweepTest : public ::testing::Test {
          * monotonicInit(). Unit tests need to call it explicitly. */
         monotonicInit();
 
-        /* Snapshot mutable server state. */
         saved_master_ = server.compression_master_switch;
-        saved_sweeper_ = server.compression_active_sweeper;
-        saved_interval_ = server.compression_active_sweeper_interval;
+        saved_sweeper_ = server.compression_automatic_sweeper;
+        saved_interval_ = server.compression_automatic_sweeper_interval;
         saved_threads_ = server.compression_threads;
         saved_pct_ = server.compression_sweep_max_cpu_pct;
         saved_dbnum_ = server.dbnum;
 
         /* Defaults consistent with src/config.c registration. */
         server.compression_master_switch = COMPRESSION_MASTER_OFF;
-        server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_DISABLED;
-        server.compression_active_sweeper_interval = 0;
+        server.compression_automatic_sweeper = COMPRESSION_AUTOMATIC_SWEEPER_DISABLED;
+        server.compression_automatic_sweeper_interval = 0;
         server.compression_threads = 1;
         server.compression_sweep_max_cpu_pct = 25;
         /* Pretend we have zero databases; runSweepBudget then sees no
@@ -77,11 +79,22 @@ class CompressionSweepTest : public ::testing::Test {
     void TearDown() override {
         testOnlyCompressionSweepReset();
         server.compression_master_switch = saved_master_;
-        server.compression_active_sweeper = saved_sweeper_;
-        server.compression_active_sweeper_interval = saved_interval_;
+        server.compression_automatic_sweeper = saved_sweeper_;
+        server.compression_automatic_sweeper_interval = saved_interval_;
         server.compression_threads = saved_threads_;
         server.compression_sweep_max_cpu_pct = saved_pct_;
         server.dbnum = saved_dbnum_;
+    }
+
+    /* Helpers that mimic what production apply hooks do: set the
+     * server-global config field, then call the notify hook. */
+    void setMaster(int v) {
+        server.compression_master_switch = v;
+        compressionSweepNotifyMasterSwitchChanged();
+    }
+    void setSweeper(int v) {
+        server.compression_automatic_sweeper = v;
+        compressionSweepNotifyAutomaticSweeperChanged();
     }
 };
 
@@ -89,103 +102,152 @@ class CompressionSweepTest : public ::testing::Test {
  * Initial state
  * ============================================================ */
 
-TEST_F(CompressionSweepTest, InitStateIsDisabled) {
-    /* After init, master=off + sweeper=disabled => DISABLED. */
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_DISABLED, compressionSweepGetState());
+TEST_F(CompressionSweepTest, InitNotRunningNoPasses) {
+    EXPECT_EQ(0, compressionSweepIsRunning());
     EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
     EXPECT_EQ(0u, compressionSweepGetKeysProcessed());
 }
 
-TEST_F(CompressionSweepTest, StateNamesAreStable) {
-    /* INFO / dashboard scrapers depend on these strings. */
-    EXPECT_STREQ("disabled", compressionSweepStateName(COMPRESSION_SWEEPER_STATE_DISABLED));
-    EXPECT_STREQ("idle", compressionSweepStateName(COMPRESSION_SWEEPER_STATE_IDLE));
-    EXPECT_STREQ("scanning", compressionSweepStateName(COMPRESSION_SWEEPER_STATE_SCANNING));
-    EXPECT_STREQ("sleeping", compressionSweepStateName(COMPRESSION_SWEEPER_STATE_SLEEPING));
-    EXPECT_STREQ("?", compressionSweepStateName(99));
+TEST_F(CompressionSweepTest, InitArmsEnableOnceWhenSweeperOnAndMasterSet) {
+    /* If boot config has sweeper=enabled and master ∈ {compression,
+     * decompression}, init arms enable_once so the first cron tick
+     * after boot runs a pass — same as the disabled→enabled apply
+     * hook at runtime. We simulate this by setting the server fields
+     * directly (no notify), then re-invoking init. */
+    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+    server.compression_automatic_sweeper = COMPRESSION_AUTOMATIC_SWEEPER_ENABLED;
+    testOnlyCompressionSweepReset(); /* re-init with new boot values */
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
+}
+
+TEST_F(CompressionSweepTest, InitDoesNotArmWhenMasterOff) {
+    server.compression_master_switch = COMPRESSION_MASTER_OFF;
+    server.compression_automatic_sweeper = COMPRESSION_AUTOMATIC_SWEEPER_ENABLED;
+    testOnlyCompressionSweepReset();
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
 }
 
 /* ============================================================
  * Master=off semantics
  * ============================================================ */
 
-TEST_F(CompressionSweepTest, MasterOffWithSweeperEnabledIsIdle) {
-    /* R2.1.6: master=off + sweeper=enabled is allowed but no-op.
-     * State should be IDLE (not DISABLED — the engine is enabled
-     * but has no direction). */
+TEST_F(CompressionSweepTest, MasterOffCronIsNoOp) {
     server.compression_master_switch = COMPRESSION_MASTER_OFF;
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_IDLE, compressionSweepGetState());
+    server.compression_automatic_sweeper = COMPRESSION_AUTOMATIC_SWEEPER_ENABLED;
+    for (int i = 0; i < 5; i++) {
+        testOnlyCompressionSweepRunOneTick();
+    }
     EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
+    EXPECT_EQ(0, compressionSweepIsRunning());
 }
 
 TEST_F(CompressionSweepTest, MasterOffRejectsForce) {
     server.compression_master_switch = COMPRESSION_MASTER_OFF;
-    int rc = compressionSweepForce();
-    EXPECT_EQ(COMPRESSION_SWEEP_FORCE_REJECTED, rc);
-    /* No pass should run on the next tick. */
+    EXPECT_EQ(COMPRESSION_SWEEP_FORCE_REJECTED, compressionSweepForce());
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
+}
+
+TEST_F(CompressionSweepTest, MasterToOffAbortsInFlightScan) {
+    /* Set up: pass just started, but mid-flight (we'd need a
+     * real kvstore to actually be mid-flight; instead we rely on
+     * the fact that with dbnum=0 the pass starts and completes in
+     * the same tick, so we can't easily test "mid-flight" abort
+     * without scaffolding. Instead test the simpler invariant:
+     * setMaster(off) clears enable_once and any in-progress flag. */
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
+    /* enable_once is now armed. setMaster(off) should abort. */
+    setMaster(COMPRESSION_MASTER_OFF);
+    /* Cron tick: should NOT run a pass because master is off. */
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
 }
 
 /* ============================================================
- * Direction-change trigger
+ * Master-switch trigger
  * ============================================================ */
 
 TEST_F(CompressionSweepTest, DirectionChangeTriggersOnePass) {
-    /* Boot with sweeper=enabled, master=off => IDLE. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_IDLE, compressionSweepGetState());
-
-    /* Flip master to compression => triggers pass; with dbnum=0 it
-     * completes in this single tick. interval=0 => state goes IDLE. */
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_IDLE, compressionSweepGetState());
+    EXPECT_EQ(0, compressionSweepIsRunning());
 }
 
-TEST_F(CompressionSweepTest, IdleWithoutDirectionChangeStaysIdle) {
-    /* The cardinal correctness property: with interval=0 and no
-     * direction change / FORCE / config flip, IDLE stays IDLE. The
-     * sweeper must NOT loop infinitely after a pass completes. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
-    server.compression_active_sweeper_interval = 0;
+TEST_F(CompressionSweepTest, NoChangeNoExtraPass) {
+    /* With interval=0 and no triggers, repeated cron ticks must NOT
+     * loop. This is the cardinal correctness property of the
+     * simplified model. */
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-
-    /* 10 more ticks without any config change — pass count must
-     * not increase. */
-    for (int i = 0; i < 10; i++) {
-        testOnlyCompressionSweepRunOneTick();
-    }
+    for (int i = 0; i < 10; i++) testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_IDLE, compressionSweepGetState());
 }
 
-TEST_F(CompressionSweepTest, EachDirectionChangeTriggersExactlyOnePass) {
-    /* off -> compression -> decompression -> compression -> off. Each
-     * non-off transition triggers exactly one pass. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
+TEST_F(CompressionSweepTest, EachDirectionChangeTriggersOnePass) {
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
 
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
 
-    server.compression_master_switch = COMPRESSION_MASTER_DECOMPRESSION;
+    setMaster(COMPRESSION_MASTER_DECOMPRESSION);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(2u, compressionSweepGetPassesCompleted());
 
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(3u, compressionSweepGetPassesCompleted());
 
-    server.compression_master_switch = COMPRESSION_MASTER_OFF;
+    setMaster(COMPRESSION_MASTER_OFF);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(3u, compressionSweepGetPassesCompleted()); /* off doesn't trigger */
+}
+
+TEST_F(CompressionSweepTest, MasterChangeWithSweeperDisabledNoTrigger) {
+    /* Sweeper config disabled: master changes do NOT auto-schedule. */
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_DISABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
+}
+
+/* ============================================================
+ * Sweeper-config trigger
+ * ============================================================ */
+
+TEST_F(CompressionSweepTest, SweeperEnabledKicksScan) {
+    setMaster(COMPRESSION_MASTER_COMPRESSION); /* no trigger; sweeper=disabled */
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
+
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
+}
+
+TEST_F(CompressionSweepTest, SweeperEnabledMasterOffNoTrigger) {
+    setMaster(COMPRESSION_MASTER_OFF);
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
+}
+
+TEST_F(CompressionSweepTest, SweeperDisabledAbortsAndDoesNotResume) {
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
+    /* Now disable BEFORE the cron runs the pass. enable_once was
+     * armed by setSweeper/setMaster, but setSweeper(disabled) calls
+     * abortScan() which clears it. */
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_DISABLED);
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
 }
 
 /* ============================================================
@@ -193,32 +255,22 @@ TEST_F(CompressionSweepTest, EachDirectionChangeTriggersExactlyOnePass) {
  * ============================================================ */
 
 TEST_F(CompressionSweepTest, ForceWithSweeperDisabledRunsOnePass) {
-    /* R2.1.4: COMPRESSION SWEEP FORCE is allowed even with
-     * compression-active-sweeper=disabled (the operator's catch-up
-     * affordance). */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_DISABLED;
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_DISABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(0u, compressionSweepGetPassesCompleted()); /* baseline: no pass */
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted()); /* no automatic */
 
-    int rc = compressionSweepForce();
-    EXPECT_EQ(COMPRESSION_SWEEP_FORCE_OK, rc);
+    EXPECT_EQ(COMPRESSION_SWEEP_FORCE_OK, compressionSweepForce());
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
 
-    /* After the FORCE pass completes, with sweeper=disabled, state
-     * should return to DISABLED (not IDLE — config wins). */
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_DISABLED, compressionSweepGetState());
-
-    /* Subsequent ticks shouldn't run more passes. */
-    for (int i = 0; i < 5; i++) {
-        testOnlyCompressionSweepRunOneTick();
-    }
+    /* No follow-up triggers; subsequent ticks don't add passes. */
+    for (int i = 0; i < 5; i++) testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
 }
 
-TEST_F(CompressionSweepTest, ForceIsIdempotentWithinOneTickWindow) {
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+TEST_F(CompressionSweepTest, ForceCollapsesWithinOneTick) {
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     EXPECT_EQ(COMPRESSION_SWEEP_FORCE_OK, compressionSweepForce());
     EXPECT_EQ(COMPRESSION_SWEEP_FORCE_OK, compressionSweepForce());
     EXPECT_EQ(COMPRESSION_SWEEP_FORCE_OK, compressionSweepForce());
@@ -231,95 +283,42 @@ TEST_F(CompressionSweepTest, ForceIsIdempotentWithinOneTickWindow) {
  * Interval semantics
  * ============================================================ */
 
-TEST_F(CompressionSweepTest, IntervalGreaterThanZeroEntersSleeping) {
-    /* With interval > 0, after pass completion state goes SLEEPING
-     * (not IDLE). The actual interval-expiry transition is timing-
-     * sensitive and harder to test without injecting a clock — the
-     * Tcl integration test covers that. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    server.compression_active_sweeper_interval = 60; /* 60 seconds */
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+TEST_F(CompressionSweepTest, IntervalZeroNoPeriodicReruns) {
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    server.compression_automatic_sweeper_interval = 0;
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_SLEEPING, compressionSweepGetState());
-
-    /* Sub-interval ticks should not trigger another pass. */
-    for (int i = 0; i < 5; i++) {
-        testOnlyCompressionSweepRunOneTick();
-    }
+    /* No periodic re-runs. */
+    for (int i = 0; i < 10; i++) testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_SLEEPING, compressionSweepGetState());
 }
 
-TEST_F(CompressionSweepTest, IntervalZeroEntersIdleNotSleeping) {
-    /* With interval=0, after pass completion state goes IDLE. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    server.compression_active_sweeper_interval = 0;
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_IDLE, compressionSweepGetState());
-}
+/* (Interval-expiry test deferred to Tcl integration test — needs
+ * real wall-clock progression that gtest can't easily inject.) */
 
 /* ============================================================
- * Non-functional state warning
+ * Non-functional state
  * ============================================================ */
 
-TEST_F(CompressionSweepTest, MasterCompressionThreadsZeroSkipsPass) {
-    /* R2.1.6: master=compression + threads=0 is allowed but the
-     * sweeper skips the pass (every enqueue would drop). */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
+TEST_F(CompressionSweepTest, MasterCompressionThreadsZeroSkipsScanWork) {
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
     server.compression_threads = 0;
     testOnlyCompressionSweepRunOneTick();
-    /* No pass completion (we returned early before runSweepBudget). */
+    /* Pass NOT completed — we returned early from the threads check.
+     * scan_in_progress stays set so a future threads>0 setting
+     * resumes the pass from cursor 0. */
     EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
-    /* State should be SCANNING — we transitioned in but skipped the
-     * actual scan; the cursor is left where it was so a future
-     * threads>0 setting picks up where we left off. */
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_SCANNING, compressionSweepGetState());
+    EXPECT_EQ(1, compressionSweepIsRunning());
 }
 
 TEST_F(CompressionSweepTest, MasterDecompressionThreadsZeroIsFunctional) {
-    /* In decompression mode the worker pool is unused, so threads=0
-     * is fine. Sweeper still runs and completes. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    server.compression_master_switch = COMPRESSION_MASTER_DECOMPRESSION;
+    /* Decompression mode doesn't use the worker pool. threads=0 OK. */
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_ENABLED);
+    setMaster(COMPRESSION_MASTER_DECOMPRESSION);
     server.compression_threads = 0;
     testOnlyCompressionSweepRunOneTick();
     EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_IDLE, compressionSweepGetState());
-}
-
-/* ============================================================
- * Config-toggle semantics
- * ============================================================ */
-
-TEST_F(CompressionSweepTest, ConfigEnabledTransitionStartsPass) {
-    /* Boot with sweeper=disabled, master=compression => DISABLED
-     * (no work). Toggle sweeper to enabled => one pass on the next
-     * tick. */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_DISABLED;
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_DISABLED, compressionSweepGetState());
-
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-}
-
-TEST_F(CompressionSweepTest, ConfigDisabledMidPassCompletesThenGoesDisabled) {
-    /* Start a pass with sweeper=enabled. With dbnum=0 the pass
-     * completes in the same tick where it started. Then flip to
-     * disabled → state should be DISABLED (pass already complete). */
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_ENABLED;
-    server.compression_master_switch = COMPRESSION_MASTER_COMPRESSION;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
-
-    server.compression_active_sweeper = COMPRESSION_ACTIVE_SWEEPER_DISABLED;
-    testOnlyCompressionSweepRunOneTick();
-    EXPECT_EQ(COMPRESSION_SWEEPER_STATE_DISABLED, compressionSweepGetState());
-    EXPECT_EQ(1u, compressionSweepGetPassesCompleted()); /* no extra pass */
+    EXPECT_EQ(0, compressionSweepIsRunning());
 }

@@ -60,7 +60,7 @@ void compressionShutdown(void);
  * ========================================================================
  *
  * Called by the config layer when `compression-master-switch` /
- * `compression-active-sweeper` is set (R2.1.1 / R2.1.2). The field
+ * `compression-automatic-sweeper` is set (R2.1.1 / R2.1.2). The field
  * `server.compression_master_switch` (resp. `..._active_sweeper`) has
  * already been written to the new value; the hook detects the
  * transition relative to its own static prior value and applies side
@@ -76,7 +76,7 @@ void compressionShutdown(void);
  * the caller does not free).
  */
 int applyCompressionMasterSwitch(const char **err);
-int applyCompressionActiveSweeper(const char **err);
+int applyCompressionAutomaticSweeper(const char **err);
 
 /* Hook called by applyCompressionThreads (in config.c) after a
  * compression-threads change has been applied. Maintains the warning

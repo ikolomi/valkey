@@ -109,9 +109,9 @@ configEnum compression_master_switch_enum[] = {
     {"decompression", COMPRESSION_MASTER_DECOMPRESSION},
     {NULL, 0}};
 
-configEnum compression_active_sweeper_enum[] = {
-    {"disabled", COMPRESSION_ACTIVE_SWEEPER_DISABLED},
-    {"enabled", COMPRESSION_ACTIVE_SWEEPER_ENABLED},
+configEnum compression_automatic_sweeper_enum[] = {
+    {"disabled", COMPRESSION_AUTOMATIC_SWEEPER_DISABLED},
+    {"enabled", COMPRESSION_AUTOMATIC_SWEEPER_ENABLED},
     {NULL, 0}};
 
 configEnum shutdown_on_sig_enum[] = {
@@ -3551,8 +3551,8 @@ standardConfig static_configs[] = {
      * =========================================================
      * Primary knobs (6) */
     createEnumConfig("compression-master-switch", NULL, MODIFIABLE_CONFIG, compression_master_switch_enum, server.compression_master_switch, COMPRESSION_MASTER_OFF, NULL, applyCompressionMasterSwitch),
-    createEnumConfig("compression-active-sweeper", NULL, MODIFIABLE_CONFIG, compression_active_sweeper_enum, server.compression_active_sweeper, COMPRESSION_ACTIVE_SWEEPER_DISABLED, NULL, applyCompressionActiveSweeper),
-    createIntConfig("compression-active-sweeper-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_active_sweeper_interval, 0, INTEGER_CONFIG, NULL, NULL),
+    createEnumConfig("compression-automatic-sweeper", NULL, MODIFIABLE_CONFIG, compression_automatic_sweeper_enum, server.compression_automatic_sweeper, COMPRESSION_AUTOMATIC_SWEEPER_DISABLED, NULL, applyCompressionAutomaticSweeper),
+    createIntConfig("compression-automatic-sweeper-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_automatic_sweeper_interval, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-threads", NULL, MODIFIABLE_CONFIG, 0, 16, server.compression_threads, 1, INTEGER_CONFIG, NULL, applyCompressionThreads),
     createSizeTConfig("compression-min-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_min_value_size, 256, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("compression-max-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_max_value_size, 131072, MEMORY_CONFIG, NULL, NULL),

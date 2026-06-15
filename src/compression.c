@@ -631,8 +631,8 @@ static const char *masterSwitchName(int v) {
     }
 }
 
-static const char *activeSweeperName(int v) {
-    return v == COMPRESSION_ACTIVE_SWEEPER_ENABLED ? "enabled" : "disabled";
+static const char *automaticSweeperName(int v) {
+    return v == COMPRESSION_AUTOMATIC_SWEEPER_ENABLED ? "enabled" : "disabled";
 }
 
 /* Warn once on transition INTO the `master=compression + threads=0`
@@ -651,7 +651,7 @@ static int prev_threads_for_warning = 1;
  * transition (because the static was initialized to the default,
  * not synced with the boot value). */
 static int prev_master_for_apply = COMPRESSION_MASTER_OFF;
-static int prev_active_sweeper_for_apply = COMPRESSION_ACTIVE_SWEEPER_DISABLED;
+static int prev_active_sweeper_for_apply = COMPRESSION_AUTOMATIC_SWEEPER_DISABLED;
 
 static void maybeWarnNonFunctional(void) {
     int curr_master = server.compression_master_switch;
@@ -678,7 +678,7 @@ static void maybeWarnNonFunctional(void) {
  * (apply hooks don't fire during boot-time config load). */
 static void syncApplyHookCaches(void) {
     prev_master_for_apply = server.compression_master_switch;
-    prev_active_sweeper_for_apply = server.compression_active_sweeper;
+    prev_active_sweeper_for_apply = server.compression_automatic_sweeper;
     /* Force the warning detector to emit if boot landed in the
      * non-functional state. We do this by leaving the warning's prev
      * values at their defaults (OFF, 1) and letting maybeWarnNonFunctional
@@ -729,17 +729,19 @@ int applyCompressionMasterSwitch(const char **err) {
     return 1;
 }
 
-int applyCompressionActiveSweeper(const char **err) {
-    /* C1 minimal: log the transition. Engine wiring (cron-tick driver,
-     * pass scheduling, sleep-between-passes, force-pass) lands in C3. */
-    int curr = server.compression_active_sweeper;
+int applyCompressionAutomaticSweeper(const char **err) {
+    int curr = server.compression_automatic_sweeper;
     UNUSED(err);
 
     if (prev_active_sweeper_for_apply == curr) return 1;
     serverLog(LL_NOTICE,
-              "Compression: active-sweeper %s -> %s.",
-              activeSweeperName(prev_active_sweeper_for_apply), activeSweeperName(curr));
+              "Compression: automatic-sweeper %s -> %s.",
+              automaticSweeperName(prev_active_sweeper_for_apply), automaticSweeperName(curr));
     prev_active_sweeper_for_apply = curr;
+    /* Notify the sweeper engine. The hook resets cursor + arms
+     * enable_once on disabled→enabled (when master ≠ off), and
+     * aborts any in-flight scan on enabled→disabled. */
+    compressionSweepNotifyAutomaticSweeperChanged();
     return 1;
 }
 
@@ -1269,9 +1271,9 @@ static const char *kDisabledReply =
 static sds compressionRenderFields(sds out) {
     return sdscatprintf(out,
                         "compression_master_switch:%s\r\n"
-                        "compression_active_sweeper:%s\r\n"
-                        "compression_active_sweeper_interval:%d\r\n"
-                        "compression_active_sweeper_state:%s\r\n"
+                        "compression_automatic_sweeper:%s\r\n"
+                        "compression_automatic_sweeper_interval:%d\r\n"
+                        "compression_sweeper_running:%d\r\n"
                         "compression_state:disabled\r\n"
                         "compression_active_dict_id:0\r\n"
                         "compression_known_dicts:0\r\n"
@@ -1294,9 +1296,9 @@ static sds compressionRenderFields(sds out) {
                         "compression_training_last_sample_count:0\r\n"
                         "compression_errors_total:0\r\n",
                         masterSwitchName(server.compression_master_switch),
-                        activeSweeperName(server.compression_active_sweeper),
-                        server.compression_active_sweeper_interval,
-                        compressionSweepStateName(compressionSweepGetState()));
+                        automaticSweeperName(server.compression_automatic_sweeper),
+                        server.compression_automatic_sweeper_interval,
+                        compressionSweepIsRunning());
 }
 
 int compressionStatus(client *c) {
@@ -1382,7 +1384,7 @@ void compressionCommand(client *c) {
             "    current compression-master-switch (compression: enqueue",
             "    eligible RAW values; decompression: permanently decompress",
             "    every compressed value). Rejected if master=off. Allowed",
-            "    even when compression-active-sweeper is disabled.",
+            "    even when compression-automatic-sweeper is disabled.",
             "HELP",
             "    Print this help.",
             "",

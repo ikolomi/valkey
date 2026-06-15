@@ -144,7 +144,7 @@ uint32_t compressionRegistryAdd(compressionDictPair *p, int promote) {
     if (registry.count >= server.compression_dict_max_versions) {
         serverLog(LL_WARNING,
                   "Compression: dictionary registry cap reached (%d). "
-                  "Set compression-master-switch=decompression and compression-active-sweeper=enabled "
+                  "Set compression-master-switch=decompression and compression-automatic-sweeper=enabled "
                   "to drain compressed frames, COMPRESSION DICT DROP a specific dict, or raise "
                   "compression-dict-max-versions.",
                   server.compression_dict_max_versions);
