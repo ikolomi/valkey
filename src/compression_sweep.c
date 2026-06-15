@@ -135,10 +135,22 @@ void compressionSweepNotifyMasterSwitchChanged(void) {
         abortScan();
         return;
     }
-    /* Master is compression or decompression. Schedule a fresh pass
-     * iff the operator has automatic scheduling enabled. With sweeper
-     * disabled the operator wants to FORCE manually; do nothing. */
-    if (sweeper == COMPRESSION_AUTOMATIC_SWEEPER_ENABLED) {
+    /* Direction change to a productive direction. Two sub-cases:
+     *
+     *   - A scan is already in flight (force-pass or automatic).
+     *     Reset cursor + reschedule so the in-flight pass restarts
+     *     from the top with the new direction. Otherwise the scan
+     *     would yield half-old-direction / half-new-direction work,
+     *     inconsistent with the operator's declared state.
+     *
+     *   - No scan in flight. Schedule a fresh pass iff sweeper=enabled
+     *     (the design's automatic trigger). With sweeper=disabled and
+     *     no in-flight scan, the operator hasn't asked for any work —
+     *     direction change is just configuration; FORCE will schedule
+     *     when they're ready.
+     */
+    if (sweep.scan_in_progress ||
+        sweeper == COMPRESSION_AUTOMATIC_SWEEPER_ENABLED) {
         resetScanStateAndEnableOnce();
     }
 }

@@ -218,6 +218,44 @@ TEST_F(CompressionSweepTest, MasterChangeWithSweeperDisabledNoTrigger) {
     EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
 }
 
+TEST_F(CompressionSweepTest, ForcePassInFlightDirectionChangeRestarts) {
+    /* Bug fix: sweeper=disabled + FORCE pass in flight + master
+     * changes to a different productive direction. The in-flight
+     * scan must be aborted and restarted from cursor 0 with the new
+     * direction; otherwise the keyspace ends up in a mixed state
+     * (DBs scanned before the change got the old direction's work,
+     * DBs after the change got the new direction's work).
+     *
+     * To leave scan_in_progress=1 across cron ticks (needed to
+     * simulate "force pass in flight"), we use the master=compression
+     * + threads=0 path: the cron sets scan_in_progress=1 when entering
+     * the pass, then short-circuits at the threads=0 check without
+     * completing. The flag persists. */
+    setSweeper(COMPRESSION_AUTOMATIC_SWEEPER_DISABLED);
+    setMaster(COMPRESSION_MASTER_COMPRESSION);
+    server.compression_threads = 0;
+    EXPECT_EQ(COMPRESSION_SWEEP_FORCE_OK, compressionSweepForce());
+    testOnlyCompressionSweepRunOneTick();
+    /* Force pass armed but threads=0 short-circuited completion;
+     * scan_in_progress is set, no pass yet. */
+    EXPECT_EQ(1, compressionSweepIsRunning());
+    EXPECT_EQ(0u, compressionSweepGetPassesCompleted());
+
+    /* Direction change while the force pass is in flight. The notify
+     * hook must reset cursor + clear scan_in_progress + arm
+     * enable_once, even though sweeper=disabled. */
+    setMaster(COMPRESSION_MASTER_DECOMPRESSION);
+    EXPECT_EQ(0, compressionSweepIsRunning());
+
+    /* With threads restored, the next cron tick should run a fresh
+     * pass with direction=decompression. Decompression doesn't need
+     * the worker pool, so threads=0 is OK in that direction — but
+     * restore for clarity. */
+    server.compression_threads = 1;
+    testOnlyCompressionSweepRunOneTick();
+    EXPECT_EQ(1u, compressionSweepGetPassesCompleted());
+}
+
 /* ============================================================
  * Sweeper-config trigger
  * ============================================================ */
