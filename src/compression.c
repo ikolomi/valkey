@@ -1243,16 +1243,21 @@ void compressionEnqueueCandidate(robj *key, robj *value, int dbid) {
      * pointer-equality stale-check is ABA-safe. */
     incrRefCount(value);
 
-    if (compressionWorkersEnqueue(value, dbid) != 0) {
-        /* Pool refused (not started, or future-S2.11 inbox full).
-         * Release the pin and drop the candidate; the next sweep
-         * (S2.10) will rediscover the value.
-         *
-         * TODO(S4.1): compression_candidates_dropped_total++ when
-         * the bounded inbox lands (S2.11). Pool-not-started today
-         * doesn't increment this counter — it's a configuration
-         * state, not back-pressure. */
-        decrRefCount(value);
+    int rc = compressionWorkersEnqueue(value, dbid);
+    if (rc == COMPRESSION_ENQUEUE_OK) return;
+
+    /* Failed enqueue. Release the pin we took above; the next sweep
+     * pass (when the inbox drains) will rediscover this value. */
+    decrRefCount(value);
+
+    /* Distinguish DISABLED (configuration: pool not running, or
+     * compression-threads=0) from FULL (back-pressure: inbox at cap).
+     * Only FULL increments the candidates-dropped counter — DISABLED
+     * is the operator's declared state, not an error condition. The
+     * separation matches §2.10 R2.10.4's remediation table:
+     * candidates_dropped climbing → raise compression-threads. */
+    if (rc == COMPRESSION_ENQUEUE_FULL) {
+        compressionWorkersIncrCandidatesDropped();
     }
 }
 
@@ -1287,10 +1292,10 @@ static sds compressionRenderFields(sds out) {
                         "compression_live_ratio_10m:0\r\n"
                         "compression_net_saved_bytes:0\r\n"
                         "compression_candidates_pending:0\r\n"
-                        "compression_candidates_dropped_total:0\r\n"
-                        "compression_sweep_backpressure_total:0\r\n"
-                        "compression_sweep_pacing_sleeps_total:0\r\n"
-                        "compression_outbox_backpressure_total:0\r\n"
+                        "compression_candidates_dropped_total:%llu\r\n"
+                        "compression_sweep_backpressure_total:%llu\r\n"
+                        "compression_sweep_pacing_sleeps_total:%llu\r\n"
+                        "compression_outbox_backpressure_total:%llu\r\n"
                         "compression_compressions_per_sec:0\r\n"
                         "compression_decompressions_per_sec:0\r\n"
                         "compression_skipped_incompressible:0\r\n"
@@ -1300,7 +1305,11 @@ static sds compressionRenderFields(sds out) {
                         masterSwitchName(server.compression_master_switch),
                         automaticSweeperName(server.compression_automatic_sweeper),
                         server.compression_automatic_sweeper_interval,
-                        compressionSweepIsRunning());
+                        compressionSweepIsRunning(),
+                        (unsigned long long)compressionWorkersGetCandidatesDropped(),
+                        (unsigned long long)compressionSweepGetBackpressureTotal(),
+                        (unsigned long long)compressionSweepGetPacingSleepsTotal(),
+                        (unsigned long long)compressionWorkersGetOutboxBackpressure());
 }
 
 int compressionStatus(client *c) {

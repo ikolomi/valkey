@@ -163,11 +163,44 @@ void compressionWorkersWakeAll(void);
  * the worker after compression, so it can be carried into the
  * compressed-frame header on the outbox side.
  *
- * Returns 0 on success, -1 if the pool is uninitialized, has zero
- * workers, or (future S2.11) the inbox is full. On -1 the caller
- * retains the pin and is responsible for releasing it.
+ * Returns COMPRESSION_ENQUEUE_OK (0) on success.
+ * Returns COMPRESSION_ENQUEUE_DISABLED if the pool is uninitialized
+ *   or has zero workers (configuration state, not back-pressure).
+ * Returns COMPRESSION_ENQUEUE_FULL if the bounded inbox is at
+ *   capacity (`max(256, 128 * compression-threads)`); this is
+ *   back-pressure — the caller is expected to drop the candidate
+ *   AND increment the appropriate per-caller counter
+ *   (`compression_candidates_dropped_total` for write-path drops,
+ *   `compression_sweep_backpressure_total` for sweeper pauses).
+ *   The pool itself does NOT increment any counter on full — the
+ *   distinction matters to operators (different remediations per
+ *   §2.10 R2.10.4).
+ *
+ * On any non-zero return the caller retains the pin and is
+ * responsible for releasing it.
  */
+#define COMPRESSION_ENQUEUE_OK 0
+#define COMPRESSION_ENQUEUE_DISABLED -1
+#define COMPRESSION_ENQUEUE_FULL -2
 int compressionWorkersEnqueue(robj *value, int dbid);
+
+/* Returns 1 iff the inbox is at or above its soft cap (used by the
+ * sweeper for pre-check before kvstoreScan, so the sweeper can pause
+ * cleanly at a bucket boundary instead of dropping mid-callback).
+ * Returns 0 if pool is uninitialized (no enqueue path active). */
+int compressionWorkersInboxIsFull(void);
+
+/* INFO accessors. All four counters are zeroed at pool start; reset
+ * on a fresh pool start (resize via stop+start does NOT reset, since
+ * §2.10 R2.10.4 says "cumulative since process start" semantically;
+ * resize is rare and operators reading these expect monotonic). */
+uint64_t compressionWorkersGetCandidatesDropped(void);
+uint64_t compressionWorkersGetOutboxBackpressure(void);
+
+/* Increment the candidates-dropped counter. Called from the write
+ * path (compression.c) when compressionWorkersEnqueue returns
+ * COMPRESSION_ENQUEUE_FULL. Main-thread only; not atomic. */
+void compressionWorkersIncrCandidatesDropped(void);
 
 /* Test-only / introspection accessor: returns the current pool size
  * (0 if uninitialized). Used by unit tests to verify Resize actually

@@ -105,6 +105,28 @@ static struct {
     /* Set by Stop, read by workers each loop iteration. Atomic because
      * worker may be parked on the inbox cond_var when we set it. */
     _Atomic(int) shutdown_requested;
+
+    /* S2.11: bounded-inbox back-pressure (§2.10 R2.10.4 + §4.6).
+     *
+     * The mutexQueue is structurally unbounded, so we self-impose a
+     * soft cap. Producer side checks length-vs-cap; since the inbox
+     * is SPMC (single-producer = main thread), the check is racefree
+     * w.r.t. simultaneous producers, and workers can only DECREASE
+     * length between Length() and Add(). Hard bound at cap from the
+     * producer's perspective.
+     *
+     * inbox_cap is set at Start time as max(256, 128*n_threads) per
+     * design §4.6, and recomputed on resize.
+     *
+     * candidates_dropped_total is a main-thread-only counter, plain
+     * uint64_t. Incremented by callers (compression.c write-path) on
+     * COMPRESSION_ENQUEUE_FULL.
+     *
+     * outbox_backpressure_total is multi-writer (any worker that
+     * loops on mpscEnqueue retry); _Atomic with relaxed ordering. */
+    int inbox_cap;
+    uint64_t candidates_dropped_total;
+    _Atomic(uint64_t) outbox_backpressure_total;
 } pool;
 
 /* ========================================================================
@@ -302,7 +324,11 @@ static void *workerThreadMain(void *arg) {
         while (!mpscEnqueue(&pool.outbox, job, &ticket)) {
             /* Back-pressure: outbox is full. Brief yield, then retry.
              * The `ticket` reservation persists across retries (per
-             * mpscEnqueue contract in queues.h). */
+             * mpscEnqueue contract in queues.h). Increment the
+             * back-pressure counter so operators can observe steady-
+             * state main-loop slowness via INFO (§2.10 R2.10.4). */
+            atomic_fetch_add_explicit(&pool.outbox_backpressure_total, 1,
+                                      memory_order_relaxed);
             usleep(100); /* 100 µs */
             atomic_thread_fence(memory_order_acquire);
             if (atomic_load(&pool.shutdown_requested)) {
@@ -350,6 +376,14 @@ int compressionWorkersStart(int n_threads) {
     mpscInit(&pool.outbox);
     atomic_store(&pool.shutdown_requested, 0);
     pool.n_threads = n_threads;
+
+    /* Inbox soft cap (S2.11): max(256, 128 * n_threads) per design §4.6.
+     * Floor of 256 absorbs single-thread burst; the *128 scaling matches
+     * a worker's per-tick output rate so 16 workers don't starve.
+     * Counters reset on a fresh pool start (Stop+Start path). */
+    pool.inbox_cap = n_threads > 2 ? 128 * n_threads : 256;
+    pool.candidates_dropped_total = 0;
+    atomic_store_explicit(&pool.outbox_backpressure_total, 0, memory_order_relaxed);
 
     for (int i = 0; i < n_threads; i++) {
         pool.worker_ids[i] = i;
@@ -480,8 +514,18 @@ int compressionWorkersGetThreadCount(void) {
 }
 
 int compressionWorkersEnqueue(robj *value, int dbid) {
-    if (!pool.initialized || pool.n_threads == 0) return -1;
+    if (!pool.initialized || pool.n_threads == 0) return COMPRESSION_ENQUEUE_DISABLED;
     serverAssert(value != NULL);
+
+    /* S2.11 soft cap: drop if the inbox is at capacity. SPMC inbox
+     * (single producer = main thread), so this length-then-add
+     * sequence is racefree from the producer's perspective —
+     * workers can only DECREASE length between the two calls. The
+     * caller is responsible for incrementing the appropriate
+     * per-caller back-pressure counter (§2.10 R2.10.4). */
+    if ((int)mutexQueueLength(pool.inbox) >= pool.inbox_cap) {
+        return COMPRESSION_ENQUEUE_FULL;
+    }
 
     compressionJob *job = zmalloc(sizeof(*job));
     job->value = value;
@@ -493,7 +537,25 @@ int compressionWorkersEnqueue(robj *value, int dbid) {
     job->err = 0;
 
     mutexQueueAdd(pool.inbox, job);
-    return 0;
+    return COMPRESSION_ENQUEUE_OK;
+}
+
+int compressionWorkersInboxIsFull(void) {
+    if (!pool.initialized) return 0;
+    return (int)mutexQueueLength(pool.inbox) >= pool.inbox_cap;
+}
+
+uint64_t compressionWorkersGetCandidatesDropped(void) {
+    return pool.candidates_dropped_total;
+}
+
+uint64_t compressionWorkersGetOutboxBackpressure(void) {
+    return atomic_load_explicit(&pool.outbox_backpressure_total, memory_order_relaxed);
+}
+
+void compressionWorkersIncrCandidatesDropped(void) {
+    /* Main-thread only — write path is single-threaded. No atomic. */
+    pool.candidates_dropped_total++;
 }
 
 /* Test-only. Lets gtest enqueue a job from a raw sds without a real
@@ -504,7 +566,11 @@ int compressionWorkersEnqueue(robj *value, int dbid) {
  * compressionWorkersDrainOutbox runs (otherwise the drain's
  * value!=NULL serverAssert would fire). */
 int testOnlyCompressionWorkersEnqueueRaw(sds src, int dbid) {
-    if (!pool.initialized || pool.n_threads == 0) return -1;
+    if (!pool.initialized || pool.n_threads == 0) return COMPRESSION_ENQUEUE_DISABLED;
+
+    if ((int)mutexQueueLength(pool.inbox) >= pool.inbox_cap) {
+        return COMPRESSION_ENQUEUE_FULL;
+    }
 
     compressionJob *job = zmalloc(sizeof(*job));
     job->value = NULL; /* test sentinel */
@@ -516,7 +582,7 @@ int testOnlyCompressionWorkersEnqueueRaw(sds src, int dbid) {
     job->err = 0;
 
     mutexQueueAdd(pool.inbox, job);
-    return 0;
+    return COMPRESSION_ENQUEUE_OK;
 }
 
 /* Install a worker-produced compressed buffer into the kvstore on the

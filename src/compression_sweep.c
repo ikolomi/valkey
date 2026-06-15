@@ -29,6 +29,7 @@
 #include "compression_sweep.h"
 #include "compression.h"
 #include "compression_registry.h"
+#include "compression_workers.h"
 #include "kvstore.h"
 #include "server.h"
 
@@ -72,6 +73,20 @@ typedef struct compressionSweepState {
     /* Cumulative INFO counters (lifetime of the process). */
     uint64_t passes_completed;
     uint64_t keys_processed;
+
+    /* S2.11 back-pressure counters (§2.10 R2.10.4):
+     *
+     *   backpressure_total  ticks where we found compressionWorkersInboxIsFull()
+     *                       at a bucket boundary and paused the scan instead
+     *                       of advancing. Distinct remediation from pacing.
+     *
+     *   pacing_sleeps_total ticks where the per-tick CPU budget was exhausted
+     *                       before the pass completed (the existing pacing
+     *                       break in runSweepBudget).
+     *
+     * Main-thread only; plain uint64. */
+    uint64_t backpressure_total;
+    uint64_t pacing_sleeps_total;
 } compressionSweepState;
 
 static compressionSweepState sweep;
@@ -190,6 +205,14 @@ uint64_t compressionSweepGetKeysProcessed(void) {
     return sweep.keys_processed;
 }
 
+uint64_t compressionSweepGetBackpressureTotal(void) {
+    return sweep.backpressure_total;
+}
+
+uint64_t compressionSweepGetPacingSleepsTotal(void) {
+    return sweep.pacing_sleeps_total;
+}
+
 /* ========================================================================
  * Lifecycle
  * ======================================================================== */
@@ -290,6 +313,19 @@ static int runSweepBudget(int master) {
             continue;
         }
 
+        /* S2.11 inbox-full pre-check (compression direction only —
+         * decompression sweep doesn't enqueue to the worker pool).
+         * Pause cleanly at this bucket boundary if the inbox is at
+         * cap; the pass resumes on a future tick after the worker
+         * pool drains. We DON'T advance the cursor here: cursor +
+         * current_db are still pointing at the next bucket to scan,
+         * so the next tick picks up exactly where we paused. */
+        if (master == COMPRESSION_MASTER_COMPRESSION &&
+            compressionWorkersInboxIsFull()) {
+            sweep.backpressure_total++;
+            return 0;
+        }
+
         sweepCbCtx ctx = {.master = master, .dbid = sweep.current_db};
         sweep.cursor = kvstoreScan(db->keys, sweep.cursor, -1,
                                    sweepScanCallback, NULL, &ctx);
@@ -298,7 +334,12 @@ static int runSweepBudget(int master) {
             sweep.current_db++;
         }
 
-        if ((long long)elapsedUs(start) >= budget_us) break;
+        if ((long long)elapsedUs(start) >= budget_us) {
+            /* CPU-pacing pause; distinct from inbox back-pressure
+             * (different remediation per §2.10 R2.10.4). */
+            sweep.pacing_sleeps_total++;
+            break;
+        }
     }
 
     if (sweep.current_db >= server.dbnum) {

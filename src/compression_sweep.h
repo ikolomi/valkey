@@ -188,10 +188,25 @@ void compressionSweepNotifyAutomaticSweeperChanged(void);
  *                                 (rendered as compression_sweeper_running).
  *   compressionSweepGetPassesCompleted()  cumulative completed passes.
  *   compressionSweepGetKeysProcessed()    cumulative keys scanned.
+ *
+ *   S2.11 back-pressure counters (§2.10 R2.10.4; cumulative since
+ *   process start):
+ *
+ *   compressionSweepGetBackpressureTotal()  ticks where the sweeper
+ *       paused at a bucket boundary because the worker-pool inbox
+ *       was at cap. Distinct from pacing-sleeps — same effect (the
+ *       sweep didn't progress) but different remediation
+ *       (raise compression-threads, not compression-sweep-max-cpu-pct).
+ *
+ *   compressionSweepGetPacingSleepsTotal()  ticks where the per-tick
+ *       CPU budget was exhausted before the pass completed (normal
+ *       operation; the sweep is paced).
  */
 int compressionSweepIsRunning(void);
 uint64_t compressionSweepGetPassesCompleted(void);
 uint64_t compressionSweepGetKeysProcessed(void);
+uint64_t compressionSweepGetBackpressureTotal(void);
+uint64_t compressionSweepGetPacingSleepsTotal(void);
 
 /*
  * Test-only accessors. Declared here (not behind an ifdef) so unit

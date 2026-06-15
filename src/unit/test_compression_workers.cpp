@@ -247,8 +247,10 @@ TEST_F(CompressionWorkersTest, SingleJobRoundTrip) {
 }
 
 TEST_F(CompressionWorkersTest, BurstOf256JobsOneWorker) {
-    /* Stress the inbox a bit; mutexQueue is unbounded so enqueue
-     * always succeeds, but the worker is single-threaded. */
+    /* Stress the inbox a bit; mutexQueue is structurally unbounded
+     * but S2.11 imposes a soft cap of max(256, 128*n_threads) which
+     * is exactly 256 for n_threads=1. Use the retry-on-FULL pattern
+     * (matches a real producer's sweep-cursor-pause + retry). */
     ASSERT_EQ(0, compressionWorkersStart(1));
 
     constexpr int kCount = 256;
@@ -257,7 +259,12 @@ TEST_F(CompressionWorkersTest, BurstOf256JobsOneWorker) {
     for (int i = 0; i < kCount; i++) {
         keys[i] = sdsnew("k");
         vals[i] = sdsnew("v");
-        EXPECT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
+        int rc;
+        while ((rc = testOnlyCompressionWorkersEnqueueRaw(vals[i], 0)) ==
+               COMPRESSION_ENQUEUE_FULL) {
+            usleep(100);
+        }
+        ASSERT_EQ(COMPRESSION_ENQUEUE_OK, rc);
     }
 
     EXPECT_EQ(kCount, drainUntil(kCount, /*deadline_ms=*/2000));
@@ -279,10 +286,21 @@ TEST_F(CompressionWorkersTest, BurstOf1024JobsFourWorkers) {
     constexpr int kCount = 1024;
     sds keys[kCount];
     sds vals[kCount];
+    /* Bounded inbox cap (S2.11) is max(256, 128*n_threads) = 512 for
+     * n_threads=4. A producer-as-fast-as-possible burst of 1024 will
+     * legitimately hit FULL backpressure. The right test pattern is
+     * "enqueue with retry on FULL so the burst eventually drains" —
+     * matches what a real producer (sweep cursor pause + retry) does. */
     for (int i = 0; i < kCount; i++) {
         keys[i] = sdsnew("k");
         vals[i] = sdsnew("v");
-        EXPECT_EQ(0, testOnlyCompressionWorkersEnqueueRaw(vals[i], 0));
+        int rc;
+        while ((rc = testOnlyCompressionWorkersEnqueueRaw(vals[i], 0)) ==
+               COMPRESSION_ENQUEUE_FULL) {
+            /* Yield to let workers drain. */
+            usleep(100);
+        }
+        ASSERT_EQ(COMPRESSION_ENQUEUE_OK, rc);
     }
 
     EXPECT_EQ(kCount, drainUntil(kCount, /*deadline_ms=*/3000));
@@ -413,6 +431,71 @@ TEST_F(CompressionWorkersTest, ResizeAcrossEnqueuedJobs) {
     }
     compressionWorkersStop();
 }
+
+/* ========================================================================
+ * S2.11 — Bounded inbox + back-pressure counters
+ *
+ * These tests don't need zstd; they exercise the queue plumbing and
+ * counter accounting only.
+ * ======================================================================== */
+
+TEST_F(CompressionWorkersTest, EnqueueReturnsDisabledWhenPoolNotStarted) {
+    sds val = sdsnew("v");
+    EXPECT_EQ(COMPRESSION_ENQUEUE_DISABLED,
+              testOnlyCompressionWorkersEnqueueRaw(val, 0));
+    sdsfree(val);
+}
+
+TEST_F(CompressionWorkersTest, CountersStartAtZeroBeforeAndAfterStart) {
+    EXPECT_EQ(0u, compressionWorkersGetCandidatesDropped());
+    EXPECT_EQ(0u, compressionWorkersGetOutboxBackpressure());
+    ASSERT_EQ(0, compressionWorkersStart(1));
+    EXPECT_EQ(0u, compressionWorkersGetCandidatesDropped());
+    EXPECT_EQ(0u, compressionWorkersGetOutboxBackpressure());
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, IncrCandidatesDroppedAdvancesCounter) {
+    /* Production-style increment from compression.c's write path. */
+    ASSERT_EQ(0, compressionWorkersStart(1));
+    EXPECT_EQ(0u, compressionWorkersGetCandidatesDropped());
+    compressionWorkersIncrCandidatesDropped();
+    EXPECT_EQ(1u, compressionWorkersGetCandidatesDropped());
+    compressionWorkersIncrCandidatesDropped();
+    compressionWorkersIncrCandidatesDropped();
+    EXPECT_EQ(3u, compressionWorkersGetCandidatesDropped());
+    compressionWorkersStop();
+    /* Counters reset on a fresh start. */
+    ASSERT_EQ(0, compressionWorkersStart(1));
+    EXPECT_EQ(0u, compressionWorkersGetCandidatesDropped());
+    compressionWorkersStop();
+}
+
+TEST_F(CompressionWorkersTest, InboxIsFullReportsFalseBeforeStart) {
+    /* Before pool start: false. The sweeper pre-check shouldn't pause
+     * for back-pressure that literally cannot exist. */
+    EXPECT_EQ(0, compressionWorkersInboxIsFull());
+}
+
+TEST_F(CompressionWorkersTest, InboxIsFullReportsFalseAfterStartUnderLoad) {
+    /* With n_threads=1, default cap is 256 (the floor). A single
+     * enqueue is far under cap → InboxIsFull returns false. */
+    ASSERT_EQ(0, compressionWorkersStart(1));
+    sds val = sdsnew("v");
+    EXPECT_EQ(COMPRESSION_ENQUEUE_OK,
+              testOnlyCompressionWorkersEnqueueRaw(val, 0));
+    EXPECT_EQ(0, compressionWorkersInboxIsFull());
+    sdsfree(val);
+    compressionWorkersStop();
+}
+
+/* (Saturating the inbox to verify InboxIsFull→1 + Enqueue→FULL is
+ * raceful in a unit-test setting because the worker thread pops
+ * concurrently with the test's pushes. The pre-check itself is a
+ * single mutexQueueLength() comparison — its correctness is exercised
+ * at the integration level via INFO counter assertions in the Tcl
+ * test compression-tcl, where saturation is observed under real
+ * load.) */
 
 #ifdef USE_ZSTD
 /* ========================================================================
