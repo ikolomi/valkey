@@ -5,20 +5,28 @@
  */
 
 /*
- * compression.c — Phase 0 stub.
+ * compression.c — public entry points for the real-time in-memory
+ * value compression feature.
  *
- * All public entry points currently return feature-disabled defaults.
- * Real implementations land in Phase 1 (see plan.md §5).
+ * Active surfaces (other modules linked in by the Makefile under
+ * BUILD_ZSTD=yes):
+ *   - compression_header.{c,h}     per-value frame header encode/decode
+ *   - compression_registry.{c,h}   QSBR-based dict lifecycle
+ *   - compression_workers.{c,h}    SPMC inbox / MPSC outbox + worker pool
+ *   - compression_sweep.{c,h}      background sweeper engine
+ *   - compression_train.{c,h}      bio training harness (in progress, S1.x)
  *
- * Order of operations for future work:
- *   - compressionInit wires worker pool + registry + training hooks
- *   - objectGetUncompressedView is the hot-path decompress seam
- *   - compressionEnqueueCandidate wires into dbAdd/dbSetValue
- *   - compressionCron runs the sweep tick and drift-retrain trigger
- *   - compressionAfterSleep drains the worker outbox
+ * Hot-path entry points exposed here:
+ *   - objectGetUncompressedView    main-thread sync decompress (R2.5.2)
+ *   - compressionEnqueueCandidate  write-path producer (R2.4.1)
+ *   - compressionInit / Cron       lifecycle + tick handlers
+ *   - compressionAfterSleep        outbox drain into kvstore (R2.4.3)
+ *   - compressionCommand           top-level COMPRESSION dispatcher
+ *   - compressionDictImport        operator-facing preshared dict (R2.3.10)
  *
- * DO NOT call any ZSTD API from this file directly until BUILD_ZSTD
- * linkage lands (see plan §6 milestone M0 exit criteria).
+ * BUILD_ZSTD=no: every public entry point still compiles but returns
+ * feature-disabled stubs (kDisabledReply); see the lower section of
+ * this file. ZSTD-dependent code is gated by `#ifdef USE_ZSTD`.
  */
 
 #include "server.h"
@@ -64,7 +72,80 @@ static ZSTD_DCtx *compressionGetDCtx(void) {
     }
     return server_dctx;
 }
-#endif
+
+#endif /* USE_ZSTD — DCtx accessor */
+
+/* ========================================================================
+ * Base64 decode — used by COMPRESSION DICT-IMPORT.
+ * ========================================================================
+ *
+ * Standard alphabet [A-Za-z0-9+/], padding '=' optional but tolerated.
+ * Whitespace inside the payload is rejected — callers (commands, RDB
+ * load, etc.) never receive whitespace-formatted base64 so adding
+ * tolerance would only hide bugs.
+ *
+ * Returns the decoded length on success, -1 on malformed input. The
+ * caller provides the destination buffer of at least
+ * base64DecodeMaxLen(src_len) bytes — the decoded output is at most
+ * 3/4 of input size; the upper-bound helper just returns src_len
+ * which is always ≥ 3*src_len/4.
+ *
+ * Private to compression.c; if a second caller appears we'll move it
+ * to util.c. */
+static size_t base64DecodeMaxLen(size_t src_len) {
+    return src_len; /* loose upper bound; actual decoded size ≤ 3*src_len/4 */
+}
+
+/* Single-char decode. Returns the 6-bit value for valid alphabet
+ * members, -1 for any other byte. */
+static int base64CharValue(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static ssize_t base64Decode(const char *src, size_t src_len, unsigned char *dst) {
+    /* Trim trailing '=' padding (max 2). */
+    size_t pad = 0;
+    while (src_len > 0 && src[src_len - 1] == '=' && pad < 2) {
+        src_len--;
+        pad++;
+    }
+    /* No more '=' allowed in the body. */
+    ssize_t out = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < src_len; i++) {
+        int v = base64CharValue((unsigned char)src[i]);
+        if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            dst[out++] = (unsigned char)((acc >> bits) & 0xFF);
+        }
+    }
+    /* Validate padding consistency. The leftover `bits` after the
+     * decode loop must match the trailing '=' count.
+     *
+     *   N input bytes → encoding length pattern:
+     *     N = 3k   → 4k base64 chars, pad=0, leftover bits=0
+     *     N = 3k+1 → 4k base64 chars + 2 chars + "==", pad=2,
+     *                3 base64 chars trimmed (the 2 + 1 'A'-padded out)...
+     *                actually: pad=2 means 1 trailing data byte →
+     *                2 chars after trim → 12 bits, drop 8, leftover=4.
+     *     N = 3k+2 → 4k base64 chars + 3 chars + "=", pad=1,
+     *                3 chars after trim → 18 bits, drop 16, leftover=2.
+     *
+     * Anything else means truncated/extra characters. */
+    if (pad == 0 && bits != 0) return -1;
+    if (pad == 1 && bits != 2) return -1;
+    if (pad == 2 && bits != 4) return -1;
+    return out;
+}
 
 /* ========================================================================
  * Read path — transient-view side-map
@@ -1272,18 +1353,28 @@ static const char *kDisabledReply =
  * lines into `out`. Shared between COMPRESSION STATUS and
  * genValkeyInfoString's # Compression section so the two can never
  * diverge (§4.5: "COMPRESSION STATUS returns the INFO compression
- * section as a flat structured reply"). C1 reflects the live master-
- * switch and active-sweeper config values; the other fields stay 0 /
- * "disabled" until later S2 PRs land their counters. */
+ * section as a flat structured reply"). The active-dict / registry-
+ * state / back-pressure-counter fields are live; the other fields
+ * (compressed_objects, ratio, decompressions_per_sec, training_*)
+ * stay 0 until later S2 PRs land their counters — wiring those is
+ * gated by the encode path landing real frames at scale, which
+ * depends on S1.x's training implementation. */
 static sds compressionRenderFields(sds out) {
+    /* Active-dict / registry-state fields go live as soon as a dict
+     * is installed (via COMPRESSION DICT-IMPORT or, once S1.x lands,
+     * via in-server training). Other fields (compressed_objects,
+     * ratio, etc.) stay 0 until later S2 PRs land their counters. */
+    compressionDictPair *active = compressionRegistryActive();
+    uint32_t active_dict_id = active ? active->dict_id : 0;
+    int known_dicts = compressionRegistryGetKnownCount();
     return sdscatprintf(out,
                         "compression_master_switch:%s\r\n"
                         "compression_automatic_sweeper:%s\r\n"
                         "compression_automatic_sweeper_interval:%d\r\n"
                         "compression_sweeper_running:%d\r\n"
                         "compression_state:disabled\r\n"
-                        "compression_active_dict_id:0\r\n"
-                        "compression_known_dicts:0\r\n"
+                        "compression_active_dict_id:%u\r\n"
+                        "compression_known_dicts:%d\r\n"
                         "compression_dict_cap_reached:0\r\n"
                         "compression_compressed_objects:0\r\n"
                         "compression_total_uncompressed_bytes:0\r\n"
@@ -1306,6 +1397,8 @@ static sds compressionRenderFields(sds out) {
                         automaticSweeperName(server.compression_automatic_sweeper),
                         server.compression_automatic_sweeper_interval,
                         compressionSweepIsRunning(),
+                        active_dict_id,
+                        known_dicts,
                         (unsigned long long)compressionWorkersGetCandidatesDropped(),
                         (unsigned long long)compressionSweepGetBackpressureTotal(),
                         (unsigned long long)compressionSweepGetPacingSleepsTotal(),
@@ -1313,10 +1406,11 @@ static sds compressionRenderFields(sds out) {
 }
 
 int compressionStatus(client *c) {
-    /* Phase 0: return a static INFO-style bulk string.
-     * The field set matches §2.10 R2.10.1 so callers wiring dashboards
-     * against Phase 0 servers can do so without waiting for the
-     * feature-on observability implementation. */
+    /* Mirrors the # Compression section of `INFO compression`. The
+     * field set is fixed by §2.10 R2.10.1; the renderer is shared
+     * between this command and `genValkeyInfoString` so the two can
+     * never diverge (§4.5: "COMPRESSION STATUS returns the INFO
+     * compression section as a flat structured reply"). */
     sds s = compressionRenderFields(sdsempty());
     addReplyVerbatim(c, s, sdslen(s), "txt");
     sdsfree(s);
@@ -1347,10 +1441,81 @@ int compressionDictExport(client *c, uint32_t dict_id) {
 }
 
 int compressionDictImport(client *c, const unsigned char *bytes, size_t len) {
+#ifdef USE_ZSTD
+    /* R2.3.10: install a preshared dictionary via the same promotion
+     * path as a trained dict. The caller (dispatcher) has already
+     * base64-decoded the operator's input; `bytes`/`len` are the raw
+     * dictionary contents. We do not take ownership — we memcpy into
+     * the registry's own buffer.
+     *
+     * Reject anything that doesn't start with ZSTD_MAGIC_DICTIONARY.
+     * ZSTD's createCDict / createDDict accept arbitrary bytes (treats
+     * them as a raw content prefix) and never returns NULL on garbage.
+     * Operators expect IMPORT to validate "is this a real trained
+     * dict"; require the standard magic header (0xEC30A437 little-
+     * endian = bytes 0x37 0xA4 0x30 0xEC). Raw-content prefixes — an
+     * exotic ZSTD feature distinct from trained dictionaries — are not
+     * supported via this command. */
+    static const unsigned char ZSTD_DICT_MAGIC[4] = {0x37, 0xA4, 0x30, 0xEC};
+    if (len < sizeof(ZSTD_DICT_MAGIC) ||
+        memcmp(bytes, ZSTD_DICT_MAGIC, sizeof(ZSTD_DICT_MAGIC)) != 0) {
+        addReplyError(c,
+                      "not a trained ZSTD dictionary "
+                      "(missing magic 0xEC30A437 — use ZDICT_trainFromBuffer "
+                      "or COMPRESSION DICT-EXPORT to produce one)");
+        return C_ERR;
+    }
+
+    /* zmalloc our own copy — registry takes ownership of the bytes. */
+    unsigned char *registry_bytes = (unsigned char *)zmalloc(len);
+    memcpy(registry_bytes, bytes, len);
+
+    ZSTD_CDict *cdict = ZSTD_createCDict(registry_bytes, len, ZSTD_CLEVEL_DEFAULT);
+    if (!cdict) {
+        zfree(registry_bytes);
+        addReplyError(c, "ZSTD_createCDict failed (invalid dictionary or out of memory)");
+        return C_ERR;
+    }
+    ZSTD_DDict *ddict = ZSTD_createDDict(registry_bytes, len);
+    if (!ddict) {
+        ZSTD_freeCDict(cdict);
+        zfree(registry_bytes);
+        addReplyError(c, "ZSTD_createDDict failed (invalid dictionary or out of memory)");
+        return C_ERR;
+    }
+
+    /* Build the registry entry. The other fields (dict_id, frame_refs,
+     * state, promoted_at_ms, retire_*) are populated by Add. */
+    compressionDictPair *pair = (compressionDictPair *)zcalloc(sizeof(*pair));
+    pair->bytes = registry_bytes;
+    pair->bytes_len = len;
+    pair->cdict = cdict;
+    pair->ddict = ddict;
+
+    uint32_t dict_id = compressionRegistryAdd(pair, /*promote=*/1);
+    if (dict_id == COMPRESSION_DICT_ID_NONE) {
+        /* Cap reached. Free our pair (Add did not take ownership). */
+        ZSTD_freeCDict(cdict);
+        ZSTD_freeDDict(ddict);
+        zfree(registry_bytes);
+        zfree(pair);
+        addReplyError(c,
+                      "compression dictionary registry is full "
+                      "(compression-dict-max-versions reached) — drop a dict or raise the cap");
+        return C_ERR;
+    }
+
+    serverLog(LL_NOTICE,
+              "Compression: dictionary %u imported via COMPRESSION DICT-IMPORT (%zu bytes).",
+              dict_id, len);
+    addReplyLongLong(c, dict_id);
+    return C_OK;
+#else
     UNUSED(bytes);
     UNUSED(len);
     addReplyError(c, kDisabledReply);
     return C_ERR;
+#endif
 }
 
 int compressionDictDrop(client *c, uint32_t dict_id) {
@@ -1386,6 +1551,32 @@ void compressionCommand(client *c) {
             return;
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(sub, "dict-import")) {
+        /* COMPRESSION DICT-IMPORT <base64-bytes> — install a preshared
+         * dict (R2.3.10). Reply is the new dict_id (positive integer)
+         * or an error.
+         *
+         * The space-saving "DICT IMPORT" hierarchical notation in the
+         * design is rendered as a single hyphenated subcommand for
+         * RESP — same precedent as CLUSTER COUNT-FAILURE-REPORTS.
+         * EXPORT/LIST/DROP land later under the same naming scheme. */
+        if (c->argc != 3) {
+            addReplyErrorFormat(c,
+                                "syntax error: COMPRESSION DICT-IMPORT <base64-bytes>");
+            return;
+        }
+        sds b64 = (sds)objectGetVal(c->argv[2]);
+        size_t b64_len = sdslen(b64);
+        size_t cap = base64DecodeMaxLen(b64_len);
+        unsigned char *raw = (unsigned char *)zmalloc(cap > 0 ? cap : 1);
+        ssize_t raw_len = base64Decode(b64, b64_len, raw);
+        if (raw_len < 0) {
+            zfree(raw);
+            addReplyError(c, "invalid base64-encoded dictionary bytes");
+            return;
+        }
+        compressionDictImport(c, raw, (size_t)raw_len);
+        zfree(raw);
     } else if (!strcasecmp(sub, "help")) {
         const char *help[] = {
             "STATUS",
@@ -1396,10 +1587,14 @@ void compressionCommand(client *c) {
             "    eligible RAW values; decompression: permanently decompress",
             "    every compressed value). Rejected if master=off. Allowed",
             "    even when compression-automatic-sweeper is disabled.",
+            "DICT-IMPORT <base64-bytes>",
+            "    Install a preshared ZSTD dictionary as the new active",
+            "    dict (R2.3.10). Replies with the assigned dict ID or an",
+            "    error if the registry is full or the bytes are invalid.",
             "HELP",
             "    Print this help.",
             "",
-            "Note: TRAIN and DICT LIST/DROP/EXPORT/IMPORT land in subsequent",
+            "Note: TRAIN and DICT EXPORT/LIST/DROP land in subsequent",
             "S2 PRs. Operators set master-switch state via 'CONFIG SET",
             "compression-master-switch ...'; legacy ENABLE/DISABLE aliases",
             "are not part of the v1 surface (the 3-state enum doesn't map",

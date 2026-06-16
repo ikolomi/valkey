@@ -280,4 +280,106 @@ start_server {tags {"compression"}} {
         r config set compression-automatic-sweeper disabled
         r config set compression-automatic-sweeper-interval 0
     }
+
+    # ---------------------------------------------------------------
+    # COMPRESSION DICT-IMPORT (R2.3.10)
+    # ---------------------------------------------------------------
+    # Test infrastructure (design §7.6): the helper-dependent tests
+    # below generate samples + train a dict at test time via the
+    # external `tests/helpers/gen-zstd-dict` binary, base64-encode,
+    # and import via the operator surface. This avoids baking static
+    # dict fixtures into the repo and lets us produce drifted /
+    # per-shape dicts on demand for downstream tests. See
+    # tests/support/compression-helpers.tcl.
+    test {COMPRESSION DICT-IMPORT rejects malformed base64} {
+        # The dispatcher base64-decodes BEFORE calling compressionDictImport,
+        # so this validation works in any build.
+        catch {r compression dict-import "NotValidBase64!@#$"} err
+        assert_match "*invalid base64*" $err
+    }
+
+    test {COMPRESSION DICT-IMPORT rejects valid base64 without ZSTD magic} {
+        # Magic validation is inside compressionDictImport's USE_ZSTD
+        # path; under BUILD_ZSTD=no the function returns the
+        # "compression not enabled in this build" reply before getting
+        # to magic validation. Skip in that mode.
+        if {![file exists "tests/helpers/gen-zstd-dict"]} {
+            skip "BUILD_ZSTD=no — magic validation gated behind USE_ZSTD"
+        }
+        # "hello world" is valid base64 but doesn't start with 0xEC30A437.
+        catch {r compression dict-import "aGVsbG8gd29ybGQ="} err
+        assert_match "*not a trained ZSTD dictionary*" $err
+    }
+
+    test {COMPRESSION DICT-IMPORT rejects payload smaller than the magic header} {
+        if {![file exists "tests/helpers/gen-zstd-dict"]} {
+            skip "BUILD_ZSTD=no — magic validation gated behind USE_ZSTD"
+        }
+        catch {r compression dict-import "YWJj"} err
+        assert_match "*not a trained ZSTD dictionary*" $err
+    }
+
+    test {COMPRESSION DICT-IMPORT rejects garbled syntax} {
+        # Arity is enforced at the command table level (arity=3 in
+        # the JSON spec); dispatcher's argc check is defense-in-depth.
+        # Works in any build.
+        catch {r compression dict-import} err
+        assert_match "*wrong number of arguments*" $err
+        catch {r compression dict-import "x" "extra"} err
+        assert_match "*wrong number of arguments*" $err
+    }
+
+    test {COMPRESSION DICT-IMPORT installs a real trained dict} {
+        # Skip when BUILD_ZSTD=no — the gen-zstd-dict helper is built
+        # only with BUILD_ZSTD=yes (Makefile gates it under the same
+        # ifeq block that pulls in libzstd.a). Without it, training is
+        # impossible and the server's DICT-IMPORT path returns the
+        # "compression unavailable" stub anyway.
+        if {![file exists "tests/helpers/gen-zstd-dict"]} {
+            skip "BUILD_ZSTD=no — gen-zstd-dict helper not built"
+        }
+        # Generate a small kv-shaped sample set at runtime, train a
+        # ZSTD dict via the external gen-zstd-dict helper, and import.
+        # This avoids baking static dict fixtures into the repo and
+        # lets us produce drifted/per-shape dicts on demand for
+        # downstream tests. See tests/support/compression-helpers.tcl.
+        set samples [gen_kv_samples 200 42]
+        set id1 [import_dict $samples]
+        assert {$id1 > 0}
+        set status [r compression status]
+        assert_match "*compression_active_dict_id:$id1*" $status
+        assert_match "*compression_known_dicts:1*" $status
+        # Second import → new dict_id, registry has both (previous
+        # active is now retiring).
+        set id2 [import_dict $samples]
+        assert {$id2 > $id1}
+        set status [r compression status]
+        assert_match "*compression_active_dict_id:$id2*" $status
+        assert_match "*compression_known_dicts:2*" $status
+    }
+
+    test {gen_drifted_samples mixes shapes per drift fraction} {
+        # Pure A → all kv-shaped. Pure B → all log-shaped. drift=0.5 → mix.
+        # Smoke test the helper itself; downstream tests rely on it.
+        set pure_a [gen_drifted_samples 100 1 kv log 0.0]
+        set pure_b [gen_drifted_samples 100 1 kv log 1.0]
+        set mixed  [gen_drifted_samples 100 1 kv log 0.5]
+        # kv samples contain `=` and `;`; log samples contain `[` and ` action=`.
+        set a_kv_marks 0
+        foreach s $pure_a { if {[string match "*=*;*" $s]} {incr a_kv_marks} }
+        set b_log_marks 0
+        foreach s $pure_b { if {[string match "*\\\[*\\\]*action=*" $s]} {incr b_log_marks} }
+        # Sanity: pure A is mostly kv-shaped; pure B is mostly log-shaped.
+        assert {$a_kv_marks >= 90}
+        assert {$b_log_marks >= 90}
+        # Mixed has some of each.
+        set mixed_kv 0
+        set mixed_log 0
+        foreach s $mixed {
+            if {[string match "*=*;*" $s]} {incr mixed_kv}
+            if {[string match "*\\\[*\\\]*action=*" $s]} {incr mixed_log}
+        }
+        assert {$mixed_kv > 30 && $mixed_kv < 70}
+        assert {$mixed_log > 30 && $mixed_log < 70}
+    }
 }

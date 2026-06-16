@@ -210,6 +210,10 @@ void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *),
     }
 }
 
+int compressionRegistryGetKnownCount(void) {
+    return registry.count;
+}
+
 /* ========================================================================
  * QSBR grace-period GC
  * ======================================================================== */

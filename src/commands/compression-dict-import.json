@@ -1,0 +1,32 @@
+{
+    "DICT-IMPORT": {
+        "summary": "Installs a preshared ZSTD dictionary as the new active dict.",
+        "complexity": "O(N) where N is the dictionary size in bytes (digesting CDict/DDict).",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": 3,
+        "container": "COMPRESSION",
+        "function": "compressionCommand",
+        "command_flags": [
+            "ADMIN",
+            "STALE",
+            "NOSCRIPT"
+        ],
+        "acl_categories": [
+            "ADMIN",
+            "SLOW",
+            "DANGEROUS"
+        ],
+        "arguments": [
+            {
+                "name": "dictionary-bytes-base64",
+                "type": "string",
+                "summary": "Base64-encoded raw dictionary bytes (as produced by ZDICT_trainFromBuffer or by COMPRESSION DICT-EXPORT)."
+            }
+        ],
+        "reply_schema": {
+            "description": "Integer dict ID assigned by the registry on success; -ERR on malformed base64, invalid dictionary bytes, or registry full.",
+            "type": "integer"
+        }
+    }
+}

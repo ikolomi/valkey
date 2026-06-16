@@ -7527,6 +7527,28 @@ struct COMMAND_STRUCT COMMANDLOG_Subcommands[] = {
 #define COMMANDLOG_Keyspecs NULL
 #endif
 
+/********** COMPRESSION DICT_IMPORT ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* COMPRESSION DICT_IMPORT history */
+#define COMPRESSION_DICT_IMPORT_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* COMPRESSION DICT_IMPORT tips */
+#define COMPRESSION_DICT_IMPORT_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* COMPRESSION DICT_IMPORT key specs */
+#define COMPRESSION_DICT_IMPORT_Keyspecs NULL
+#endif
+
+/* COMPRESSION DICT_IMPORT argument table */
+struct COMMAND_ARG COMPRESSION_DICT_IMPORT_Args[] = {
+{MAKE_ARG("dictionary-bytes-base64",ARG_TYPE_STRING,-1,NULL,"Base64-encoded raw dictionary bytes (as produced by ZDICT_trainFromBuffer or by COMPRESSION DICT-EXPORT).",NULL,CMD_ARG_NONE,0,NULL)},
+};
+
 /********** COMPRESSION HELP ********************/
 
 #ifndef SKIP_CMD_HISTORY_TABLE
@@ -7585,6 +7607,7 @@ struct COMMAND_ARG COMPRESSION_SWEEP_Args[] = {
 
 /* COMPRESSION command table */
 struct COMMAND_STRUCT COMPRESSION_Subcommands[] = {
+{MAKE_CMD("dict-import","Installs a preshared ZSTD dictionary as the new active dict.","O(N) where N is the dictionary size in bytes (digesting CDict/DDict).","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_DICT_IMPORT_History,0,COMPRESSION_DICT_IMPORT_Tips,0,compressionCommand,3,CMD_ADMIN|CMD_STALE|CMD_NOSCRIPT,ACL_CATEGORY_ADMIN|ACL_CATEGORY_SLOW|ACL_CATEGORY_DANGEROUS,NULL,COMPRESSION_DICT_IMPORT_Keyspecs,0,NULL,1),.args=COMPRESSION_DICT_IMPORT_Args},
 {MAKE_CMD("help","Returns helpful text about the different COMPRESSION subcommands.","O(1)","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_HELP_History,0,COMPRESSION_HELP_Tips,0,compressionCommand,2,CMD_LOADING|CMD_STALE,ACL_CATEGORY_SLOW,NULL,COMPRESSION_HELP_Keyspecs,0,NULL,0)},
 {MAKE_CMD("status","Returns the current state of the real-time compression feature.","O(1)","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_STATUS_History,0,COMPRESSION_STATUS_Tips,0,compressionCommand,2,CMD_LOADING|CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_SLOW,NULL,COMPRESSION_STATUS_Keyspecs,0,NULL,0)},
 {MAKE_CMD("sweep","Triggers a one-shot keyspace pass for the real-time compression sweeper.","O(N) where N is the number of keys in the keyspace.","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,COMPRESSION_SWEEP_History,0,COMPRESSION_SWEEP_Tips,0,compressionCommand,3,CMD_ADMIN|CMD_STALE|CMD_NOSCRIPT,ACL_CATEGORY_ADMIN|ACL_CATEGORY_SLOW|ACL_CATEGORY_DANGEROUS,NULL,COMPRESSION_SWEEP_Keyspecs,0,NULL,1),.args=COMPRESSION_SWEEP_Args},

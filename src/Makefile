@@ -386,6 +386,12 @@ ifeq ($(BUILD_ZSTD),yes)
 	DEPENDENCY_TARGETS+= zstd
 	FINAL_CFLAGS+=-DUSE_ZSTD=$(BUILD_YES) -I../deps/zstd
 	FINAL_LIBS+=../deps/zstd/libzstd.a
+	# Test-only helper: trains a ZSTD dict from samples piped on
+	# stdin. Used by integration tests to avoid baking static dict
+	# fixtures into the repo. Lives outside src/ to keep it explicit
+	# that this is NOT SUT code (see tests/helpers/gen-zstd-dict.c
+	# header for the rationale).
+	TEST_ZSTD_HELPER=../tests/helpers/gen-zstd-dict
 endif
 
 RDMA_LIBS=
@@ -670,12 +676,23 @@ endif
 
 DEPENDENCY_TARGETS+= gtest-parallel
 
-ALL_BUILD_PREREQUISITES=$(SERVER_NAME) $(ENGINE_SENTINEL_NAME) $(ENGINE_CLI_NAME) $(ENGINE_BENCHMARK_NAME) $(ENGINE_CHECK_RDB_NAME) $(ENGINE_CHECK_AOF_NAME) $(TLS_MODULE) $(RDMA_MODULE)
+ALL_BUILD_PREREQUISITES=$(SERVER_NAME) $(ENGINE_SENTINEL_NAME) $(ENGINE_CLI_NAME) $(ENGINE_BENCHMARK_NAME) $(ENGINE_CHECK_RDB_NAME) $(ENGINE_CHECK_AOF_NAME) $(TLS_MODULE) $(RDMA_MODULE) $(TEST_ZSTD_HELPER)
 
 all: $(ALL_BUILD_PREREQUISITES)
 	@echo ""
 	@echo "Hint: It's a good idea to run 'make test' ;)"
 	@echo ""
+
+# Build rule for the ZSTD dict-training test helper. Built only when
+# BUILD_ZSTD=yes (otherwise TEST_ZSTD_HELPER is empty and this rule is
+# unreferenced). Links against the same vendored libzstd.a as
+# valkey-server, so ZDICT API calls go through the version we ship.
+# Depends on .make-prerequisites so deps/zstd is built first (same
+# trigger valkey-server's compile uses).
+ifeq ($(BUILD_ZSTD),yes)
+$(TEST_ZSTD_HELPER): ../tests/helpers/gen-zstd-dict.c .make-prerequisites
+	$(SERVER_LD) -o $@ -I../deps/zstd $< ../deps/zstd/libzstd.a
+endif
 
 Makefile.dep:
 	-$(SERVER_CC) -MM $(ALL_SOURCES) > Makefile.dep 2> /dev/null || true
@@ -792,7 +809,7 @@ endif
 commands.c: $(COMMANDS_DEF_FILENAME).def
 
 clean:
-	rm -rf $(SERVER_NAME) $(ENGINE_SENTINEL_NAME) $(ENGINE_CLI_NAME) $(ENGINE_BENCHMARK_NAME) $(ENGINE_CHECK_RDB_NAME) $(ENGINE_CHECK_AOF_NAME) $(ENGINE_UNIT_GTESTS) $(ENGINE_LIB_NAME) trace/*.o trace/*.d *.o *.gcda *.gcno *.gcov valkey.info lcov-html Makefile.dep *.so
+	rm -rf $(SERVER_NAME) $(ENGINE_SENTINEL_NAME) $(ENGINE_CLI_NAME) $(ENGINE_BENCHMARK_NAME) $(ENGINE_CHECK_RDB_NAME) $(ENGINE_CHECK_AOF_NAME) $(ENGINE_UNIT_GTESTS) $(ENGINE_LIB_NAME) $(TEST_ZSTD_HELPER) trace/*.o trace/*.d *.o *.gcda *.gcno *.gcov valkey.info lcov-html Makefile.dep *.so
 	rm -f $(DEP)
 	-(cd modules/lua && $(MAKE) clean)
 

@@ -134,6 +134,11 @@ void compressionRegistryDecRef(uint32_t dict_id);
  * entries. Must not modify the registry from inside the callback. */
 void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *), void *ctx);
 
+/* Returns the number of dict entries currently held in the registry,
+ * including ACTIVE and RETIRING (but not yet GC'd) entries. Surfaced
+ * via INFO compression as compression_known_dicts (R2.10.1). */
+int compressionRegistryGetKnownCount(void);
+
 /* ========================================================================
  * QSBR grace-period GC
  * ======================================================================== */

@@ -971,6 +971,55 @@ A `tests/compression/benchmarks/run.sh` driver runs each scenario under both `co
 
 CI runs only `baseline-uniform-1k` on every PR (cheap, seconds). The full suite runs nightly / on release candidates.
 
+### 7.6 Runtime dict-generation test infrastructure
+
+Integration tests need a way to install a ZSTD dictionary against a server-under-test (SUT) so the eligibility predicate has an active dict to gate against, the encoder has a CDict to use, and the decoder has a DDict to look up. Two non-options were rejected before settling on the design that landed:
+
+- **Static dict fixtures under `tests/assets/`** — would not scale. Drift / retraining tests need different dicts per workload shape; shipping multiple ~10 KiB binaries inflates the repo and still doesn't cover the drift case (the dict needs to be trained from samples that match the test's chosen distribution).
+- **Server-side test command** (e.g. `DEBUG COMPRESSION TRAIN-FROM-BYTES`) — would be inside the SUT. A bug in valkey-server's training code would show up in BOTH the production path AND the test fixture's training path, masking itself; the integration test that should have caught the regression instead silently uses the same broken code to construct its setup. Test infrastructure that exercises the SUT must not be part of the SUT.
+
+**Solution: external standalone helper binary that links against vendored libzstd.a only.**
+
+```mermaid
+flowchart LR
+    subgraph Tcl["Tcl test (in-process)"]
+        SAMP[gen_&lt;shape&gt;_samples]
+        WRAP[train_dict_from_samples]
+        IMP[import_dict]
+    end
+    subgraph Helper["gen-zstd-dict<br/>(tests/helpers/, separate process)"]
+        ZDICT[ZDICT_trainFromBuffer]
+    end
+    subgraph Server["valkey-server (SUT)"]
+        CMD[COMPRESSION DICT-IMPORT]
+    end
+    SAMP --> WRAP
+    WRAP -. stdin: 4-byte len + N bytes per sample .-> ZDICT
+    ZDICT -. writes dict bytes to argv[1] .-> WRAP
+    WRAP --> IMP
+    IMP -. base64-encoded dict bytes .-> CMD
+```
+
+**Components.**
+
+- `tests/helpers/gen-zstd-dict.c` — small standalone binary (~200 LOC). Reads samples from stdin in a binary protocol (4-byte big-endian length prefix + N bytes per sample, repeated until EOF), trains a ZSTD dictionary via `ZDICT_trainFromBuffer`, writes the trained dict bytes to a path passed on argv. Built only when `BUILD_ZSTD=yes` (no compression feature → no test infrastructure needed). Links against the same vendored `deps/zstd/libzstd.a` as `valkey-server` to ensure ZDICT API behaviour matches production, but runs in a separate process with no shared memory or globals with the SUT.
+
+- `tests/support/compression-helpers.tcl` — Tcl-side wrappers. Provides three sample-shape generators chosen to model the most common compression-interesting workloads (additional shapes can be added as test demand emerges):
+
+  | Generator | Models |
+  |---|---|
+  | `gen_kv_samples count seed` | flat semicolon-delimited `key=value` records (session/user data) |
+  | `gen_json_samples count seed` | small JSON-shaped objects (DTO-style cached responses) |
+  | `gen_log_samples count seed` | timestamped log-line shapes |
+
+  All generators are reproducible per seed — they use an isolated LCG (not Tcl's global `rand`) so test ordering doesn't shift outputs. A `gen_drifted_samples count seed shape_a shape_b drift` mixer accepts `drift ∈ [0,1]` = fraction of samples drawn from `shape_b` instead of `shape_a`, used by drift / retraining tests. `train_dict_from_samples` pipes samples through `gen-zstd-dict` and returns raw dict bytes; `import_dict` is the convenience wrapper that trains + base64-encodes + sends `COMPRESSION DICT-IMPORT`.
+
+**Why this matches the §7.1 / §7.2 testing strategy.** Tier 2 tests (§7.2) are feature-specific and need to install a dict to exercise the encode/decode/sweep paths. Without the helper they can't run end-to-end before S1.x training lands. Tier 1 transparency mode (§7.1, planned) will eventually use the same `import_dict` helper from a global setup fixture so the entire existing Tcl corpus runs against a server with an active dict.
+
+**Why operator-facing `COMPRESSION DICT-IMPORT` plus this helper, instead of two separate test-only paths.** The operator command (R2.3.10) and the test-time training were collapsed into one flow on purpose. Tests `import_dict` → server's production `COMPRESSION DICT-IMPORT` → registry's `compressionRegistryAdd` — the same path operators take to install a preshared dict. Tests exercise real production code, not a parallel surface that could drift.
+
+**`BUILD_ZSTD=no` behaviour.** The helper binary is gated by the same Makefile ifeq block as the feature itself; without it, `tests/helpers/gen-zstd-dict` simply doesn't exist. The Tcl test framework detects this via a `file exists` check and skips helper-dependent tests with a clear message; tests that exercise dispatcher-level validation (arity, base64 decoding) continue to run because they don't require a working compression backend.
+
 ---
 
 ## Appendix A — Technology choices

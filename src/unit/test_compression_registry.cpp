@@ -198,3 +198,27 @@ TEST_F(CompressionRegistryTest, EndToEndLifecycle) {
     compressionRegistryDecRef(id);                     /* triggers GC, freed */
     ASSERT_EQ(compressionRegistryLookup(id), nullptr);
 }
+
+TEST_F(CompressionRegistryTest, GetKnownCountTracksAddsAndCapEnforcement) {
+    /* Empty registry → 0. */
+    ASSERT_EQ(0, compressionRegistryGetKnownCount());
+
+    /* Each promote=1 Add increments the count (each retires the
+     * previous active but workers haven't reported quiescent so GC
+     * can't reclaim — count grows monotonically up to the cap). */
+    for (int i = 0; i < server.compression_dict_max_versions; i++) {
+        uint32_t id = compressionRegistryAdd(makeFakeDictPair(), /*promote=*/1);
+        ASSERT_NE(id, (uint32_t)COMPRESSION_DICT_ID_NONE);
+        ASSERT_EQ(i + 1, compressionRegistryGetKnownCount());
+    }
+
+    /* Cap reached → rejected add does NOT bump the count. */
+    int at_cap = compressionRegistryGetKnownCount();
+    compressionDictPair *rejected = makeFakeDictPair();
+    ASSERT_EQ(compressionRegistryAdd(rejected, /*promote=*/1),
+              (uint32_t)COMPRESSION_DICT_ID_NONE);
+    ASSERT_EQ(at_cap, compressionRegistryGetKnownCount());
+    /* Caller still owns on rejection — free it. */
+    zfree(rejected->bytes);
+    zfree(rejected);
+}
