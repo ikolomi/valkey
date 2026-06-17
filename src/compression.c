@@ -1314,6 +1314,29 @@ void compressionEnqueueCandidate(robj *key, robj *value, int dbid) {
      * separate switch check needed. */
     if (!compressionIsEligible(value)) return;
 
+    /* Skip values currently in transient-view state (R2.5.7).
+     *
+     * Trigger: the SWEEPER. The sweeper iterates the kvstore directly
+     * and feeds every val robj here. If a value is in transient-view
+     * state — encoding=RAW because a GET earlier in the same event-
+     * loop iteration materialized into a temp uncompressed sds — the
+     * eligibility predicate above happily accepts it and we'd capture
+     * `job->src = temp_sds`. restoreTransientEntry frees that sds at
+     * the next beforeSleep, leaving the worker's job->src dangling.
+     * ASan caught this on PR-B's first sanitizer run.
+     *
+     * The write/modify path is NOT a trigger: writes go through
+     * lookupKeyWrite → compressionPermanentlyDecompress, which
+     * eliminates the transient view before the mutation runs, and the
+     * subsequent signalModifiedKey enqueues the post-COW robj (fresh
+     * sds, never temp_sds).
+     *
+     * Why skipping is safe: a value in transient view is already
+     * compressed (the original frame is saved in the side-map and
+     * will be restored at beforeSleep). Re-compressing it would be
+     * discarded work; skipping is functionally identical. */
+    if (transientViewActive(value)) return;
+
     /* No active dict yet (R2.1.7 third state). The encoder's worker
      * side would also handle this, but checking here avoids an
      * allocator round-trip and a pin we'd immediately release. */
