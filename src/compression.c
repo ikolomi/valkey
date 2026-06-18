@@ -1496,60 +1496,67 @@ static sds compressionRenderFields(sds out) {
                        ? 0.0
                        : (double)total_compressed / (double)total_uncompressed;
 
-    return sdscatprintf(out,
-                        "compression_master_switch:%s\r\n"
-                        "compression_automatic_sweeper:%s\r\n"
-                        "compression_automatic_sweeper_interval:%d\r\n"
-                        "compression_sweeper_running:%d\r\n"
-                        "compression_state:%s\r\n"
-                        "compression_active_dict_id:%u\r\n"
-                        "compression_known_dicts:%d\r\n"
-                        "compression_dict_cap_reached:%d\r\n"
-                        "compression_compressed_objects:%llu\r\n"
-                        "compression_total_uncompressed_bytes:%zu\r\n"
-                        "compression_total_compressed_bytes:%zu\r\n"
-                        "compression_ratio:%.4f\r\n"
-                        /* TODO(S4.x): live_ratio_10m needs rolling-EMA
-                         * machinery (10 min window with rejected ratios
-                         * folded in per R2.3.5 drift trigger). Stays at
-                         * 0 until that lands. */
-                        "compression_live_ratio_10m:0\r\n"
-                        "compression_net_saved_bytes:%zu\r\n"
-                        "compression_candidates_pending:%lu\r\n"
-                        "compression_candidates_dropped_total:%llu\r\n"
-                        "compression_sweep_backpressure_total:%llu\r\n"
-                        "compression_sweep_pacing_sleeps_total:%llu\r\n"
-                        "compression_outbox_backpressure_total:%llu\r\n"
-                        /* TODO(S4.x): per-sec rates need rolling-window
-                         * machinery; stays at 0 until that lands. */
-                        "compression_compressions_per_sec:0\r\n"
-                        "compression_decompressions_per_sec:0\r\n"
-                        "compression_skipped_incompressible:%llu\r\n"
-                        "compression_training_last_duration_ms:%lld\r\n"
-                        "compression_training_last_sample_count:%d\r\n"
-                        "compression_errors_total:%llu\r\n",
-                        masterSwitchName(server.compression_master_switch),
-                        automaticSweeperName(server.compression_automatic_sweeper),
-                        server.compression_automatic_sweeper_interval,
-                        compressionSweepIsRunning(),
-                        state,
-                        active_dict_id,
-                        known_dicts,
-                        dict_cap_reached,
-                        (unsigned long long)compressionGetCompressedObjects(),
-                        total_uncompressed,
-                        total_compressed,
-                        ratio,
-                        compressionGetSavingsBytes(),
-                        compressionWorkersGetCandidatesPending(),
-                        (unsigned long long)compressionWorkersGetCandidatesDropped(),
-                        (unsigned long long)compressionSweepGetBackpressureTotal(),
-                        (unsigned long long)compressionSweepGetPacingSleepsTotal(),
-                        (unsigned long long)compressionWorkersGetOutboxBackpressure(),
-                        (unsigned long long)compressionGetSkippedIncompressible(),
-                        (long long)compressionTrainGetLastDurationMs(),
-                        compressionTrainGetLastSampleCount(),
-                        (unsigned long long)compressionGetErrorsTotal());
+    out = sdscatprintf(out,
+                       "compression_master_switch:%s\r\n"
+                       "compression_automatic_sweeper:%s\r\n"
+                       "compression_automatic_sweeper_interval:%d\r\n"
+                       "compression_sweeper_running:%d\r\n"
+                       "compression_state:%s\r\n"
+                       "compression_active_dict_id:%u\r\n"
+                       "compression_known_dicts:%d\r\n"
+                       "compression_dict_cap_reached:%d\r\n"
+                       "compression_compressed_objects:%llu\r\n"
+                       "compression_total_uncompressed_bytes:%zu\r\n"
+                       "compression_total_compressed_bytes:%zu\r\n"
+                       "compression_ratio:%.4f\r\n"
+                       /* TODO(S4.x): live_ratio_10m needs rolling-EMA
+                        * machinery (10 min window with rejected ratios
+                        * folded in per R2.3.5 drift trigger). Stays at
+                        * 0 until that lands. */
+                       "compression_live_ratio_10m:0\r\n"
+                       "compression_net_saved_bytes:%zu\r\n"
+                       "compression_candidates_pending:%lu\r\n"
+                       "compression_candidates_dropped_total:%llu\r\n"
+                       "compression_sweep_backpressure_total:%llu\r\n"
+                       "compression_sweep_pacing_sleeps_total:%llu\r\n"
+                       "compression_outbox_backpressure_total:%llu\r\n"
+                       /* TODO(S4.x): per-sec rates need rolling-window
+                        * machinery; stays at 0 until that lands. */
+                       "compression_compressions_per_sec:0\r\n"
+                       "compression_decompressions_per_sec:0\r\n"
+                       "compression_skipped_incompressible:%llu\r\n"
+                       "compression_training_last_duration_ms:%lld\r\n"
+                       "compression_training_last_sample_count:%d\r\n"
+                       "compression_errors_total:%llu\r\n",
+                       masterSwitchName(server.compression_master_switch),
+                       automaticSweeperName(server.compression_automatic_sweeper),
+                       server.compression_automatic_sweeper_interval,
+                       compressionSweepIsRunning(),
+                       state,
+                       active_dict_id,
+                       known_dicts,
+                       dict_cap_reached,
+                       (unsigned long long)compressionGetCompressedObjects(),
+                       total_uncompressed,
+                       total_compressed,
+                       ratio,
+                       compressionGetSavingsBytes(),
+                       compressionWorkersGetCandidatesPending(),
+                       (unsigned long long)compressionWorkersGetCandidatesDropped(),
+                       (unsigned long long)compressionSweepGetBackpressureTotal(),
+                       (unsigned long long)compressionSweepGetPacingSleepsTotal(),
+                       (unsigned long long)compressionWorkersGetOutboxBackpressure(),
+                       (unsigned long long)compressionGetSkippedIncompressible(),
+                       (long long)compressionTrainGetLastDurationMs(),
+                       compressionTrainGetLastSampleCount(),
+                       (unsigned long long)compressionGetErrorsTotal());
+    /* Training-subsystem lifecycle metrics (PR #40): state, scan/
+     * success/failure counters, cooldown, current scan DB, dicts
+     * retired, and the debug frame-ref gauge. These are additive to
+     * the fields above and do not duplicate them (last_duration_ms /
+     * last_sample_count are rendered above). */
+    compressionTrainRenderInfo(&out);
+    return out;
 }
 
 int compressionStatus(client *c) {

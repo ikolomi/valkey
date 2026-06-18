@@ -139,6 +139,11 @@ void compressionRegistryForEach(void (*cb)(const compressionDictPair *, void *),
  * via INFO compression as compression_known_dicts (R2.10.1). */
 int compressionRegistryGetKnownCount(void);
 
+/* Returns the total number of dicts that completed the full lifecycle
+ * (ACTIVE → RETIRING → freed by GC). Surfaced via INFO compression
+ * as compression_training_dicts_retired. */
+long long compressionRegistryGetDictsRetired(void);
+
 /* ========================================================================
  * QSBR grace-period GC
  * ======================================================================== */

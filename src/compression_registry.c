@@ -31,6 +31,7 @@ static struct {
     int count;                                        /* number of valid entries in dicts[] */
     _Atomic(compressionDictPair *) active;            /* current dict for new compressions; atomic for worker reads */
     uint32_t next_id;                                 /* next dict_id to assign (monotonic, starts at 1) */
+    long long dicts_retired;                          /* total dicts that completed lifecycle (freed by GC) */
 } registry;
 
 /* QSBR per-worker quiescent generation counters. Sized by the worker
@@ -236,6 +237,10 @@ int compressionRegistryGetKnownCount(void) {
     return registry.count;
 }
 
+long long compressionRegistryGetDictsRetired(void) {
+    return registry.dicts_retired;
+}
+
 /* ========================================================================
  * QSBR grace-period GC
  * ======================================================================== */
@@ -248,6 +253,7 @@ void compressionRegistryTryGc(void) {
             dict->state = COMPRESSION_DICT_STATE_RETIRED;
             removeFromDicts(dict);
             dictPairFree(dict);
+            registry.dicts_retired++;
         } else if (blockedOnWorkerGen(dict)) {
             gen_blocked = 1;
         }

@@ -69,7 +69,6 @@ typedef struct compressionTrainState {
     int sample_count;          /* Eligible samples collected. */
     size_t buffer_used;        /* Bytes written into buffer. */
     mstime_t cooldown_until;   /* Timestamp when cooldown expires. */
-
     /* INFO compression observability — captured at the start of the
      * scan and snapshotted on completion (success or failure). The
      * "last_*" fields surface via INFO via compressionGetLastTraining*
@@ -92,6 +91,14 @@ typedef struct compressionTrainState {
     mstime_t scan_start_ms;
     mstime_t last_duration_ms;
     int last_sample_count;
+
+    /* Additional lifecycle counters (PR #40).
+     *   scans_started — total training scans initiated.
+     *   successes     — total successful dict promotions.
+     *   failures      — total aborts (insufficient samples + ZSTD errors). */
+    long long scans_started;
+    long long successes;
+    long long failures;
 } compressionTrainState;
 
 /* File-scoped training state — single instance. */
@@ -286,6 +293,7 @@ static void advanceScan(compressionTrainState *ts) {
          * giving up" and "how close did it get". */
         ts->last_duration_ms = mstime() - ts->scan_start_ms;
         ts->last_sample_count = ts->sample_count;
+        ts->failures++;
         enterCooldown(ts);
     }
 }
@@ -369,17 +377,20 @@ void compressionTrainCron(void) {
 #endif
                 zfree(pair->bytes);
                 zfree(pair);
+                ts->failures++;
             } else {
                 serverLog(LL_NOTICE,
                           "Compression training: new dictionary promoted "
                           "(samples=%d, dict_size=%zu).",
                           ts->sample_count, result->dict_bytes_len);
+                ts->successes++;
             }
         } else {
             serverLog(LL_WARNING,
                       "Compression training: ZSTD training failed "
                       "(error=%zu).",
                       result->error_code);
+            ts->failures++;
         }
 
         zfree(result);
@@ -406,12 +417,46 @@ void compressionTrainCron(void) {
         allocTrainingBuffers(ts);
         ts->scan_start_ms = mstime();
         ts->state = TRAIN_SCANNING;
+        ts->scans_started++;
     }
 
     /* Phase 3: advance scan. */
     if (ts->state == TRAIN_SCANNING) {
         advanceScan(ts);
     }
+}
+
+/* ========================================================================
+ * Metrics — exposed via INFO compression
+ * ======================================================================== */
+
+static const char *trainStateString(trainState s) {
+    switch (s) {
+    case TRAIN_IDLE: return "idle";
+    case TRAIN_SCANNING: return "scanning";
+    case TRAIN_SUBMITTED: return "submitted";
+    case TRAIN_COOLDOWN: return "cooldown";
+    }
+    return "unknown";
+}
+
+void compressionTrainRenderInfo(sds *info) {
+    compressionTrainState *ts = &train_state;
+    *info = sdscatprintf(*info,
+                         "compression_training_state:%s\r\n"
+                         "compression_training_scans_started:%lld\r\n"
+                         "compression_training_successes:%lld\r\n"
+                         "compression_training_failures:%lld\r\n"
+                         "compression_training_cooldown_until_ms:%lld\r\n"
+                         "compression_training_current_db:%d\r\n"
+                         "compression_training_dicts_retired:%lld\r\n",
+                         trainStateString(ts->state),
+                         ts->scans_started,
+                         ts->successes,
+                         ts->failures,
+                         (long long)ts->cooldown_until,
+                         ts->current_db,
+                         compressionRegistryGetDictsRetired());
 }
 
 /* Called from bio thread after training completes.

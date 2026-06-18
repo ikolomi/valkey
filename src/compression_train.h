@@ -78,6 +78,9 @@ int compressionTrainMaybeTrigger(int reason);
  */
 void compressionTrainCron(void);
 
+/* Append training metrics to the INFO compression output buffer. */
+void compressionTrainRenderInfo(sds *info);
+
 /* Legacy API — kept for interface compatibility. Scanning is now driven
  * internally by compressionTrainCron. */
 int compressionTrainAdvanceSampling(int budget);
