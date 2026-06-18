@@ -20,10 +20,6 @@
  *   - Synchronous decompression on the main thread.
  *   - One trained ZSTD dictionary "active"; zero or more "retiring" for
  *     existing frames. Lifecycle in compression_registry.h.
- *
- * Phase 0 status: every function below is a feature-disabled stub. Real
- * implementations land in Phase 1 (dictionary lifecycle + compression
- * hot path).
  */
 
 #include "server.h"
@@ -262,6 +258,32 @@ size_t compressionGetTotalUncompressedBytes(void);
 size_t compressionGetTotalCompressedBytes(void);
 size_t compressionGetSavingsBytes(void); /* derived: unc - comp */
 size_t compressionGetTransientViewCappedTotal(void);
+
+/* S4.1 observability counters — wired into `INFO compression` via
+ * compressionRenderFields.
+ *
+ *   compressed_objects   — count of robjs currently holding a compressed
+ *                          frame. Rises in lockstep with the byte counters
+ *                          above (one increment per createCompressedObject,
+ *                          one decrement per freeCompressedObject /
+ *                          compressionPermanentlyDecompress).
+ *   skipped_incompressible — monotonic counter of post-compression net-
+ *                            savings-guard rejections (R2.4.3 / §6.6).
+ *                            Bumped by the worker drain handler when
+ *                            `compressed_size + header >= uncompressed *
+ *                            (1 - savings_ratio)`.
+ *   errors_total         — monotonic counter of decode / decompress / worker
+ *                          errors (R6.1 / R6.2). Bumped on the main thread
+ *                          by every ZSTD-error / corruption-class failure
+ *                          and by the worker drain handler on real ZSTD
+ *                          worker errors (job->err < 0). */
+void compressionIncrCompressedObjects(void);
+void compressionDecrCompressedObjects(void);
+size_t compressionGetCompressedObjects(void);
+void compressionIncrSkippedIncompressible(void);
+uint64_t compressionGetSkippedIncompressible(void);
+void compressionIncrErrorsTotal(void);
+uint64_t compressionGetErrorsTotal(void);
 
 /* ========================================================================
  * Hot path — write / eligibility

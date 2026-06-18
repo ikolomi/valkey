@@ -96,4 +96,13 @@ int compressionTrainAdvanceSampling(int budget);
 void compressionTrainCompleteFromBio(compressionDictPair *new_pair,
                                      sds err);
 
+/* Observability accessors — INFO compression fields per R2.10.1.
+ *
+ * Both return 0 until the first training run completes (success or
+ * abort-on-insufficient-samples). Persist across cycles; only
+ * overwritten on the next run. Read-only for callers; main-thread
+ * only (the cron is single-threaded). */
+mstime_t compressionTrainGetLastDurationMs(void);
+int compressionTrainGetLastSampleCount(void);
+
 #endif /* __COMPRESSION_TRAIN_H */

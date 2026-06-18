@@ -121,6 +121,7 @@ robj *createCompressedObject(int type, void *buffer, size_t buffer_len) {
      * them under their canonical INFO field names. */
     compressionAccountInstall((int64_t)h.uncompressed_len,
                               (int64_t)h.compressed_len + COMPRESSION_HEADER_SIZE);
+    compressionIncrCompressedObjects();
 
     return o;
 }
@@ -146,6 +147,7 @@ void freeCompressedObject(robj *o) {
      * (lazyfree); compressionAccountInstall is atomic. */
     compressionAccountInstall(-(int64_t)h.uncompressed_len,
                               -((int64_t)h.compressed_len + COMPRESSION_HEADER_SIZE));
+    compressionDecrCompressedObjects();
 
     zfree(buffer);
 }

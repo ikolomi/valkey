@@ -69,6 +69,29 @@ typedef struct compressionTrainState {
     int sample_count;          /* Eligible samples collected. */
     size_t buffer_used;        /* Bytes written into buffer. */
     mstime_t cooldown_until;   /* Timestamp when cooldown expires. */
+
+    /* INFO compression observability — captured at the start of the
+     * scan and snapshotted on completion (success or failure). The
+     * "last_*" fields surface via INFO via compressionGetLastTraining*
+     * and answer "what happened on the most recent training run?"
+     * They persist across cycles (only overwritten on the next run).
+     *
+     *   scan_start_ms        — wall-clock when the scan began. Used
+     *                          to compute last_duration_ms on
+     *                          completion. Set when state transitions
+     *                          IDLE → SCANNING; cleared on completion.
+     *   last_duration_ms     — wall-clock duration of the most recent
+     *                          training run (scan + bio). Includes
+     *                          aborted-on-insufficient-samples runs;
+     *                          0 until the first run completes.
+     *   last_sample_count    — samples collected by the most recent
+     *                          training run. Includes aborted runs
+     *                          (the count at abort time tells the
+     *                          operator how close we got). 0 until
+     *                          the first run completes. */
+    mstime_t scan_start_ms;
+    mstime_t last_duration_ms;
+    int last_sample_count;
 } compressionTrainState;
 
 /* File-scoped training state — single instance. */
@@ -257,6 +280,12 @@ static void advanceScan(compressionTrainState *ts) {
                   ts->sample_count,
                   server.compression_dict_min_training_keys,
                   TRAIN_COOLDOWN_MS);
+        /* Snapshot observability metrics for INFO. R2.10.1: "Duration
+         * of most recent training job" includes aborted runs — the
+         * operator wants to know "how long did the scan take before
+         * giving up" and "how close did it get". */
+        ts->last_duration_ms = mstime() - ts->scan_start_ms;
+        ts->last_sample_count = ts->sample_count;
         enterCooldown(ts);
     }
 }
@@ -354,6 +383,12 @@ void compressionTrainCron(void) {
         }
 
         zfree(result);
+        /* Snapshot observability metrics for INFO. Duration covers
+         * scan_start → bio_complete (the full training run from the
+         * operator's perspective). sample_count is captured before
+         * the state reset clobbers it. */
+        ts->last_duration_ms = mstime() - ts->scan_start_ms;
+        ts->last_sample_count = ts->sample_count;
         ts->state = TRAIN_IDLE;
         ts->sample_count = 0;
         ts->buffer_used = 0;
@@ -369,6 +404,7 @@ void compressionTrainCron(void) {
         ts->current_db = 0;
         ts->cursor = 0;
         allocTrainingBuffers(ts);
+        ts->scan_start_ms = mstime();
         ts->state = TRAIN_SCANNING;
     }
 
@@ -400,4 +436,15 @@ void compressionTrainCompleteFromBio(compressionDictPair *new_pair, sds err) {
         if (err) sdsfree(err);
     }
     atomic_store_explicit(&train_result, result, memory_order_release);
+}
+
+/* Observability accessors — INFO compression fields per R2.10.1.
+ * Both reflect the most recent training run (success or
+ * abort-on-insufficient-samples); 0 until the first run completes. */
+mstime_t compressionTrainGetLastDurationMs(void) {
+    return train_state.last_duration_ms;
+}
+
+int compressionTrainGetLastSampleCount(void) {
+    return train_state.last_sample_count;
 }

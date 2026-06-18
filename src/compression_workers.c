@@ -8,12 +8,12 @@
  * compression_workers.c — pool plumbing for background compression.
  *
  * Implements design §2.11 (concurrency invariants) and §4.6 (queue
- * primitives + worker contract). The per-job payload is a placeholder
- * pass-through in S2.4 — the worker accepts a job, does NO compression
- * yet, and posts an empty result back to the outbox so the
- * end-to-end plumbing can be exercised. ZSTD_compress_usingCDict
- * integration lands in S2.5; the pool plumbing in this file is stable
- * across S2.4 → S2.5 → S2.7.
+ * primitives + worker contract). Workers dequeue a job, compress the
+ * value bytes with the active dict's CDict (ZSTD_compress_usingCDict),
+ * and post the flat result buffer back to the outbox; the main thread
+ * runs the net-savings guard and installs (compressionInstall). The
+ * pool plumbing in this file has been stable since S2.4; the encoder
+ * body landed in S2.5 and the install path in S2.7.
  *
  * Threading model:
  *   - One inbox (mutexQueue): main thread is the producer, N workers
@@ -26,7 +26,7 @@
  *
  * Lifecycle invariant for the registry's QSBR contract (§4.4):
  *   - Workers call compressionWorkerReportQuiescent(worker_id) after
- *     every job, regardless of success / error / placeholder. The
+ *     every job, regardless of success or error. The
  *     registry's per-worker quiescent_gen counter is monotonic; missed
  *     reports delay reclamation but do not cause use-after-free.
  *   - On Stop, all workers are joined BEFORE compressionRegistryRelease
@@ -37,6 +37,7 @@
 #include "compression_workers.h"
 #include "compression_header.h"
 #include "compression_registry.h"
+#include "compression.h" /* compressionIncr{ErrorsTotal,SkippedIncompressible}() */
 #include "mutexqueue.h"
 
 #ifdef USE_ZSTD
@@ -545,6 +546,14 @@ int compressionWorkersInboxIsFull(void) {
     return (int)mutexQueueLength(pool.inbox) >= pool.inbox_cap;
 }
 
+unsigned long compressionWorkersGetCandidatesPending(void) {
+    /* Current depth of the SPMC inbox. Cheap O(1) read under the
+     * mutexQueue's internal mutex; safe to call from any thread.
+     * Returns 0 before pool init (no inbox to query). */
+    if (!pool.initialized) return 0;
+    return mutexQueueLength(pool.inbox);
+}
+
 uint64_t compressionWorkersGetCandidatesDropped(void) {
     return pool.candidates_dropped_total;
 }
@@ -678,17 +687,22 @@ int compressionWorkersDrainOutbox(int budget) {
                 /* Worker chose not to compress (no active dict yet) or
                  * ZSTD reported an error.
                  *
-                 * TODO(S4.1): two distinct counter contributions feed
-                 * here in S4.1:
+                 * Two distinct conditions per the err sentinel
+                 * convention (compression_workers.c top-of-file):
                  *   - job->err > 0 (worker policy, e.g. no-dict): no
                  *     INFO counter — this is a benign expected state
                  *     (R2.1.7 third state), tracked indirectly via
                  *     compression_state == "active" || "idle".
                  *   - job->err < 0 (real ZSTD error): increment
-                 *     compression_errors_total per R2.10.1 and emit a
-                 *     rate-limited LL_WARNING per R6.1.
-                 * No live_ratio contribution — no compression actually
-                 * ran, so there's no measured ratio to fold in. */
+                 *     compression_errors_total per R2.10.1.
+                 *
+                 * TODO(S4.1): emit a rate-limited LL_WARNING per R6.1
+                 * here when the rate-limiting infrastructure lands;
+                 * for now the counter alone is the operator signal
+                 * (climbing => something's wrong with the encoder). */
+                if (job->err < 0) {
+                    compressionIncrErrorsTotal();
+                }
                 if (job->dst != NULL) zfree(job->dst);
             } else {
                 /* Net-savings guard (R2.4.3 / R2.2 second block):
@@ -709,17 +723,20 @@ int compressionWorkersDrainOutbox(int budget) {
                     /* No useful saving — discard the compressed form,
                      * leave the value uncompressed.
                      *
-                     * TODO(S4.1): two contributions here in S4.1:
-                     *   - compression_skipped_incompressible++ per
-                     *     R2.10.1.
-                     *   - Fold the actual measured ratio
-                     *     (job->dst_len / uncompressed_len) into the
-                     *     EMA compression_live_ratio_10m per R2.3.5
-                     *     ("rejections contribute their actual
-                     *     measured ratio, typically in [0.9, 1.05]").
-                     *     Sustained high rejection rate inflates the
-                     *     metric and naturally trips the drift
-                     *     threshold → drives retraining. */
+                     * TODO(S4.1): one remaining contribution to fold
+                     * in here: the actual measured ratio
+                     * (job->dst_len / uncompressed_len) needs to feed
+                     * the EMA compression_live_ratio_10m per R2.3.5
+                     * ("rejections contribute their actual measured
+                     * ratio, typically in [0.9, 1.05]"). Sustained
+                     * high rejection rate inflates the metric and
+                     * naturally trips the drift threshold → drives
+                     * retraining. The rolling-window machinery lands
+                     * with the rate-based metrics (compressions_per_sec,
+                     * decompressions_per_sec) in a follow-up; the
+                     * count-based skipped_incompressible counter is
+                     * already live below. */
+                    compressionIncrSkippedIncompressible();
                     zfree(job->dst);
                 }
                 /* Net-savings guard accepted: install. compressionInstall

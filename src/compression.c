@@ -331,6 +331,57 @@ size_t compressionGetTransientViewCappedTotal(void) {
     return compression_transient_view_capped_total;
 }
 
+/* ============================================================================
+ * S4.1 observability counters — count of compressed robjs, post-compression
+ * net-savings-guard rejections, and decode/encode errors. Wired into
+ * `INFO compression` via compressionRenderFields.
+ *
+ * compressed_objects rises and falls in lockstep with the install / free /
+ * permanent-decompress paths that already update the byte counters above; it's
+ * a third counter on the same lifecycle. _Atomic for the same reason —
+ * freeCompressedObject can run on a bio thread via lazyfree.
+ *
+ * skipped_incompressible and errors_total are monotonic; bumped on the main
+ * thread by the worker drain handler (net-savings guard rejection / real ZSTD
+ * worker error) and on the main thread by the decoder (corruption-class
+ * failures). _Atomic so the renderer can sample without coordination.
+ *
+ * compression_live_ratio_10m, compressions_per_sec, decompressions_per_sec
+ * still need rolling-window machinery — deferred to a follow-up PR; the
+ * existing TODO(S4.x) annotations stay in place at the relevant sites. */
+static _Atomic(size_t) compression_compressed_objects = 0;
+static _Atomic(uint64_t) compression_skipped_incompressible = 0;
+static _Atomic(uint64_t) compression_errors_total = 0;
+
+void compressionIncrCompressedObjects(void) {
+    atomic_fetch_add_explicit(&compression_compressed_objects, 1, memory_order_relaxed);
+}
+
+void compressionDecrCompressedObjects(void) {
+    size_t before = atomic_fetch_sub_explicit(&compression_compressed_objects, 1, memory_order_relaxed);
+    serverAssert(before >= 1);
+}
+
+size_t compressionGetCompressedObjects(void) {
+    return atomic_load_explicit(&compression_compressed_objects, memory_order_relaxed);
+}
+
+void compressionIncrSkippedIncompressible(void) {
+    atomic_fetch_add_explicit(&compression_skipped_incompressible, 1, memory_order_relaxed);
+}
+
+uint64_t compressionGetSkippedIncompressible(void) {
+    return atomic_load_explicit(&compression_skipped_incompressible, memory_order_relaxed);
+}
+
+void compressionIncrErrorsTotal(void) {
+    atomic_fetch_add_explicit(&compression_errors_total, 1, memory_order_relaxed);
+}
+
+uint64_t compressionGetErrorsTotal(void) {
+    return atomic_load_explicit(&compression_errors_total, memory_order_relaxed);
+}
+
 static inline void transientViewMapEnsure(void) {
     if (transient_view_map == NULL) {
         transient_view_map = hashtableCreate(&transientViewMapType);
@@ -395,6 +446,7 @@ static void releaseCompressedBuffer(void *compressed_buffer) {
      * compression_header.c). */
     compressionAccountInstall(-(int64_t)hdr.uncompressed_len,
                               -((int64_t)hdr.compressed_len + COMPRESSION_HEADER_SIZE));
+    compressionDecrCompressedObjects();
     zfree(compressed_buffer);
 }
 
@@ -476,7 +528,7 @@ int transientViewActive(const robj *o) {
 }
 
 /* ========================================================================
- * Lifecycle stubs
+ * Lifecycle
  * ======================================================================== */
 
 /* Forward declaration: defined later, near the apply hooks block.
@@ -553,6 +605,17 @@ void compressionCron(void) {
      * from apply hooks; this just runs whatever work is scheduled.
      * (R2.1.2 + R2.1.4) */
     compressionSweepCron();
+    /* Registry GC: reclaim retiring dicts whose frame_refs have
+     * drained to 0 and whose QSBR grace period has elapsed (R2.3.4).
+     * Without a periodic driver, retired dicts are only reclaimed on
+     * the next promote/retire — so after a full decompression drain
+     * `compression_known_dicts` would stay pinned at its peak and
+     * `compression_dict_cap_reached` could never recover. Running GC
+     * here keeps both INFO fields honest and lets the dict registry
+     * shrink back to zero once a drain completes. Cheap: scans at most
+     * COMPRESSION_DICT_MAX (16) slots and is a no-op when nothing is
+     * retiring. */
+    compressionRegistryTryGc();
 }
 
 void compressionAfterSleep(void) {
@@ -844,10 +907,11 @@ void compressionAfterThreadsApplied(void) {
  * values. The encoder (S2.5) produces the buffers this function consumes.
  * compressionIsEligible implements the R2.2 predicate.
  *
- * The decoder is not yet wired into any read path (`getCommand`, the
- * replication feed, etc.) — that's S2.8. This PR delivers the helper
- * and its gtest coverage so S2.8 can plumb it in without touching the
- * decompression logic itself.
+ * The decoder is reached from the read path via the transient-view
+ * model (S2.8): lookupKey* materializes a temporary uncompressed view
+ * and restores the compressed form at the next event-loop boundary.
+ * A few out-of-process / bypass paths (AOF rewrite child, RDB save for
+ * replication full-sync) call this helper directly.
  */
 
 robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
@@ -884,7 +948,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
         serverLog(LL_WARNING,
                   "Compression: compressed value has unknown algorithm "
                   "magic (corrupt)");
-        /* TODO(S4.1): compression_errors_total++ */
+        compressionIncrErrorsTotal();
         return NULL;
     }
 
@@ -916,7 +980,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
                   "Compression: dict_id %u not found in registry (frame "
                   "references retired or never-loaded dictionary)",
                   hdr.alg_meta);
-        /* TODO(S4.1): compression_errors_total++ */
+        compressionIncrErrorsTotal();
         return NULL;
     }
 
@@ -924,7 +988,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
     ZSTD_DCtx *dctx = compressionGetDCtx();
     if (dctx == NULL) {
         serverLog(LL_WARNING, "Compression: ZSTD_createDCtx() failed (OOM?)");
-        /* TODO(S4.1): compression_errors_total++ */
+        compressionIncrErrorsTotal();
         return NULL;
     }
 
@@ -956,7 +1020,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
         serverLog(LL_WARNING,
                   "Compression: ZSTD_decompress_usingDDict failed: %s",
                   ZSTD_getErrorName(got));
-        /* TODO(S4.1): compression_errors_total++ */
+        compressionIncrErrorsTotal();
         return NULL;
     }
 
@@ -968,7 +1032,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch, robj *view_out) {
                   "Compression: decompressed size %zu does not match "
                   "header uncompressed_len %u",
                   got, hdr.uncompressed_len);
-        /* TODO(S4.1): compression_errors_total++ */
+        compressionIncrErrorsTotal();
         return NULL;
     }
 
@@ -1376,56 +1440,116 @@ static const char *kDisabledReply =
  * lines into `out`. Shared between COMPRESSION STATUS and
  * genValkeyInfoString's # Compression section so the two can never
  * diverge (§4.5: "COMPRESSION STATUS returns the INFO compression
- * section as a flat structured reply"). The active-dict / registry-
- * state / back-pressure-counter fields are live; the other fields
- * (compressed_objects, ratio, decompressions_per_sec, training_*)
- * stay 0 until later S2 PRs land their counters — wiring those is
- * gated by the encode path landing real frames at scale, which
- * depends on S1.x's training implementation. */
+ * section as a flat structured reply"). Nearly all fields are wired
+ * to live state; only the three rolling-window rate/ratio fields
+ * (compression_live_ratio_10m, compression_compressions_per_sec,
+ * compression_decompressions_per_sec) remain stubbed at 0 pending the
+ * EMA / per-second-rate machinery — each carries a TODO(S4.x) at its
+ * emit site below. */
 static sds compressionRenderFields(sds out) {
-    /* Active-dict / registry-state fields go live as soon as a dict
-     * is installed (via COMPRESSION DICT-IMPORT or, once S1.x lands,
-     * via in-server training). Other fields (compressed_objects,
-     * ratio, etc.) stay 0 until later S2 PRs land their counters. */
+    /* Most fields below are now wired to live state. The remaining
+     * stubs carry a TODO comment in this function:
+     *   - compression_live_ratio_10m, compressions_per_sec,
+     *     decompressions_per_sec → S4.x rolling-window machinery. */
     compressionDictPair *active = compressionRegistryActive();
     uint32_t active_dict_id = active ? active->dict_id : 0;
     int known_dicts = compressionRegistryGetKnownCount();
+    int dict_cap_reached =
+        (known_dicts >= server.compression_dict_max_versions) ? 1 : 0;
+
+    /* compression_state — derived from master_switch + presence of
+     * an active dict (R2.10.1 enum: idle / training / active / disabled).
+     * "training" is reserved for an in-progress training run and lands
+     * with S1.x; until then we never enter it.
+     *
+     * Map:
+     *   off                    → "disabled"
+     *   compression + dict     → "active"
+     *   compression + no dict  → "idle"   (R2.1.7 third state)
+     *   decompression          → "idle"   (active dict was retired
+     *                                       per R2.1.5; reads still work
+     *                                       via retiring dicts in the
+     *                                       registry) */
+    const char *state;
+    switch (server.compression_master_switch) {
+    case COMPRESSION_MASTER_OFF:
+        state = "disabled";
+        break;
+    case COMPRESSION_MASTER_COMPRESSION:
+        state = (active != NULL) ? "active" : "idle";
+        break;
+    case COMPRESSION_MASTER_DECOMPRESSION:
+        state = "idle";
+        break;
+    default:
+        state = "unknown";
+        break;
+    }
+
+    /* compression_ratio = compressed / uncompressed. Sits in
+     * [0.0, ~2.0] in practice; renders as 0 when no compressed frame
+     * has ever been installed (uncompressed total is zero). 4 decimal
+     * digits is enough to distinguish a 1.0% delta. */
+    size_t total_uncompressed = compressionGetTotalUncompressedBytes();
+    size_t total_compressed = compressionGetTotalCompressedBytes();
+    double ratio = (total_uncompressed == 0)
+                       ? 0.0
+                       : (double)total_compressed / (double)total_uncompressed;
+
     return sdscatprintf(out,
                         "compression_master_switch:%s\r\n"
                         "compression_automatic_sweeper:%s\r\n"
                         "compression_automatic_sweeper_interval:%d\r\n"
                         "compression_sweeper_running:%d\r\n"
-                        "compression_state:disabled\r\n"
+                        "compression_state:%s\r\n"
                         "compression_active_dict_id:%u\r\n"
                         "compression_known_dicts:%d\r\n"
-                        "compression_dict_cap_reached:0\r\n"
-                        "compression_compressed_objects:0\r\n"
-                        "compression_total_uncompressed_bytes:0\r\n"
-                        "compression_total_compressed_bytes:0\r\n"
-                        "compression_ratio:0\r\n"
+                        "compression_dict_cap_reached:%d\r\n"
+                        "compression_compressed_objects:%llu\r\n"
+                        "compression_total_uncompressed_bytes:%zu\r\n"
+                        "compression_total_compressed_bytes:%zu\r\n"
+                        "compression_ratio:%.4f\r\n"
+                        /* TODO(S4.x): live_ratio_10m needs rolling-EMA
+                         * machinery (10 min window with rejected ratios
+                         * folded in per R2.3.5 drift trigger). Stays at
+                         * 0 until that lands. */
                         "compression_live_ratio_10m:0\r\n"
-                        "compression_net_saved_bytes:0\r\n"
-                        "compression_candidates_pending:0\r\n"
+                        "compression_net_saved_bytes:%zu\r\n"
+                        "compression_candidates_pending:%lu\r\n"
                         "compression_candidates_dropped_total:%llu\r\n"
                         "compression_sweep_backpressure_total:%llu\r\n"
                         "compression_sweep_pacing_sleeps_total:%llu\r\n"
                         "compression_outbox_backpressure_total:%llu\r\n"
+                        /* TODO(S4.x): per-sec rates need rolling-window
+                         * machinery; stays at 0 until that lands. */
                         "compression_compressions_per_sec:0\r\n"
                         "compression_decompressions_per_sec:0\r\n"
-                        "compression_skipped_incompressible:0\r\n"
-                        "compression_training_last_duration_ms:0\r\n"
-                        "compression_training_last_sample_count:0\r\n"
-                        "compression_errors_total:0\r\n",
+                        "compression_skipped_incompressible:%llu\r\n"
+                        "compression_training_last_duration_ms:%lld\r\n"
+                        "compression_training_last_sample_count:%d\r\n"
+                        "compression_errors_total:%llu\r\n",
                         masterSwitchName(server.compression_master_switch),
                         automaticSweeperName(server.compression_automatic_sweeper),
                         server.compression_automatic_sweeper_interval,
                         compressionSweepIsRunning(),
+                        state,
                         active_dict_id,
                         known_dicts,
+                        dict_cap_reached,
+                        (unsigned long long)compressionGetCompressedObjects(),
+                        total_uncompressed,
+                        total_compressed,
+                        ratio,
+                        compressionGetSavingsBytes(),
+                        compressionWorkersGetCandidatesPending(),
                         (unsigned long long)compressionWorkersGetCandidatesDropped(),
                         (unsigned long long)compressionSweepGetBackpressureTotal(),
                         (unsigned long long)compressionSweepGetPacingSleepsTotal(),
-                        (unsigned long long)compressionWorkersGetOutboxBackpressure());
+                        (unsigned long long)compressionWorkersGetOutboxBackpressure(),
+                        (unsigned long long)compressionGetSkippedIncompressible(),
+                        (long long)compressionTrainGetLastDurationMs(),
+                        compressionTrainGetLastSampleCount(),
+                        (unsigned long long)compressionGetErrorsTotal());
 }
 
 int compressionStatus(client *c) {

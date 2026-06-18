@@ -64,17 +64,19 @@ static void dictPairFree(compressionDictPair *p) {
     zfree(p);
 }
 
-static int canFree(compressionDictPair *dict) {
-    if (dict->state != COMPRESSION_DICT_STATE_RETIRING) return 0;
-    if (dict->frame_refs > 0) return 0;
-    /* Only check slots that BOTH had a worker at retire time AND have
-     * a worker now. See dict->retire_n_workers in compression_registry.h
-     * for the rationale. The min() handles both directions cleanly:
-     *   - resize-up after retire: new slot didn't observe this dict,
-     *     so its gen doesn't constrain us.
-     *   - resize-down after retire: dead-slot worker is joined, so
-     *     it can't hold a pointer.
-     */
+/* Returns 1 iff every worker that could have observed `dict` before it
+ * retired has since advanced its quiescent generation past the
+ * retirement snapshot — i.e. the QSBR grace period has elapsed.
+ *
+ * Only checks slots that BOTH had a worker at retire time AND have a
+ * worker now. See dict->retire_n_workers in compression_registry.h for
+ * the rationale. The min() handles both resize directions cleanly:
+ *   - resize-up after retire: new slot didn't observe this dict, so
+ *     its gen doesn't constrain us.
+ *   - resize-down after retire: dead-slot worker is joined, so it
+ *     can't hold a pointer.
+ */
+static int workersQuiescedPastRetire(const compressionDictPair *dict) {
     int n = dict->retire_n_workers;
     if (server.compression_threads < n) n = server.compression_threads;
     for (int i = 0; i < n; i++) {
@@ -82,6 +84,26 @@ static int canFree(compressionDictPair *dict) {
         if (gen <= dict->retire_worker_gen[i]) return 0;
     }
     return 1;
+}
+
+static int canFree(compressionDictPair *dict) {
+    if (dict->state != COMPRESSION_DICT_STATE_RETIRING) return 0;
+    if (dict->frame_refs > 0) return 0;
+    return workersQuiescedPastRetire(dict);
+}
+
+/* Returns 1 iff `dict` is retiring, has no remaining frame references,
+ * and is held back from reclamation ONLY because the QSBR grace period
+ * has not yet elapsed (a worker hasn't advanced its quiescent
+ * generation past the retirement snapshot). This is exactly the
+ * complement of workersQuiescedPastRetire() for a frame-free retiring
+ * dict — the condition the cron GC nudges below. It is distinct from
+ * "blocked because frames still reference the dict" (frame_refs > 0),
+ * which a nudge cannot help. */
+static int blockedOnWorkerGen(compressionDictPair *dict) {
+    if (dict->state != COMPRESSION_DICT_STATE_RETIRING) return 0;
+    if (dict->frame_refs > 0) return 0;
+    return !workersQuiescedPastRetire(dict);
 }
 
 static void startRetirement(compressionDictPair *dict) {
@@ -219,14 +241,39 @@ int compressionRegistryGetKnownCount(void) {
  * ======================================================================== */
 
 void compressionRegistryTryGc(void) {
+    int gen_blocked = 0;
     for (int i = registry.count - 1; i >= 0; i--) {
         compressionDictPair *dict = registry.dicts[i];
         if (canFree(dict)) {
             dict->state = COMPRESSION_DICT_STATE_RETIRED;
             removeFromDicts(dict);
             dictPairFree(dict);
+        } else if (blockedOnWorkerGen(dict)) {
+            gen_blocked = 1;
         }
     }
+
+    /* Self-healing QSBR nudge. A retiring, frame-ref-free dict that is
+     * held up only because a worker hasn't advanced its quiescent
+     * generation past the retirement snapshot needs the worker to wake
+     * and report quiescent. startRetirement() issues a one-shot
+     * wake-all, but on a fully-idle worker pool that broadcast can be
+     * lost — a worker that is not parked in pthread_cond_wait at the
+     * broadcast instant never sees it, and with no compression jobs
+     * arriving there is nothing to advance its generation naturally.
+     * The dict would then never be reclaimed (known_dicts and
+     * dict_cap_reached would stay pinned forever, and an operator who
+     * drains via master=decompression could never reclaim dict memory
+     * or get back under the version cap).
+     *
+     * Re-broadcasting here, from the compression cron, closes that
+     * hole: every tick that a gen-blocked dict remains, we wake the
+     * pool again, so the broadcast eventually lands while the worker
+     * is parked. The worker advances its generation and the dict is
+     * reclaimed on a subsequent tick. The nudge stops automatically
+     * once no gen-blocked dict remains, so it is a no-op in steady
+     * state. */
+    if (gen_blocked) compressionWorkersWakeAll();
 }
 
 /* ========================================================================

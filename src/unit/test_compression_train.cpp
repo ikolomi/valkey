@@ -310,6 +310,12 @@ TEST_F(CompressionTrainTest, BioEndToEnd) {
     server.compression_min_value_size = 50;
     server.compression_dict_min_training_keys = 100;
 
+    /* S4.1 observability precondition: on a fresh server (gtest gives
+     * each test an isolated server) no training has run yet, so both
+     * training-observability fields must read 0 before we trigger. */
+    EXPECT_EQ(compressionTrainGetLastDurationMs(), 0);
+    EXPECT_EQ(compressionTrainGetLastSampleCount(), 0);
+
     for (int i = 0; i < 500; i++) {
         char keybuf[64];
         snprintf(keybuf, sizeof(keybuf), "k:%06d", i);
@@ -335,5 +341,15 @@ TEST_F(CompressionTrainTest, BioEndToEnd) {
 
     compressionDictPair *active = compressionRegistryActive();
     ASSERT_NE(active, nullptr);
+
+    /* S4.1: training observability — last_duration_ms and
+     * last_sample_count are snapshotted at completion.
+     * sample_count is exact: all 500 keys are RAW and ≥50 bytes
+     * (the min-value-size set above), and the per-scan cap
+     * (compression_dict_max_training_keys == 10000 from SetUp) is
+     * far above 500, so the scan collects all 500. duration spans
+     * scan-start → bio-completion and is strictly positive. */
+    EXPECT_EQ(compressionTrainGetLastSampleCount(), 500);
+    EXPECT_GT(compressionTrainGetLastDurationMs(), 0);
 }
 #endif /* USE_ZSTD */

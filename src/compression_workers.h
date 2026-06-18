@@ -30,14 +30,10 @@
  *     On-demand jobs (training promotion, multi-key compress) are not
  *     paced; they are arrival-bounded.
  *
- * Phase 1 status (S2.4):
- *   The pool, queues, and worker thread loop are real. The per-job
- *   payload is a placeholder pass-through — the worker accepts a job,
- *   does no compression yet, and posts the (empty) result back.
- *   `ZSTD_compress_usingCDict` integration lands in S2.5 (encoder
- *   path); robj installation lands with it. The pool plumbing in this
- *   file is stable across S2.4 → S2.5 → S2.7; only the worker's per-
- *   job body and the outbox drain's install-into-robj logic change.
+ * The pool, queues, and worker thread loop landed in S2.4; the worker's
+ * ZSTD_compress_usingCDict encoder body in S2.5; and the outbox-drain
+ * install-into-robj path in S2.7. The pool plumbing here has been
+ * stable across all three.
  */
 
 #include "server.h"
@@ -190,6 +186,12 @@ int compressionWorkersEnqueue(robj *value, int dbid);
  * Returns 0 if pool is uninitialized (no enqueue path active). */
 int compressionWorkersInboxIsFull(void);
 
+/* Current depth of the SPMC inbox — sampled gauge for
+ * `compression_candidates_pending` in INFO (§2.10 R2.10.1). Cheap
+ * O(1) under the mutexQueue's internal mutex. Returns 0 before pool
+ * init. */
+unsigned long compressionWorkersGetCandidatesPending(void);
+
 /* INFO accessors. All four counters are zeroed at pool start; reset
  * on a fresh pool start (resize via stop+start does NOT reset, since
  * §2.10 R2.10.4 says "cumulative since process start" semantically;
@@ -219,10 +221,6 @@ int compressionWorkersGetThreadCount(void);
  * produced by the worker; see compression_header.h for the zero-copy
  * contract) and running the net-savings guard (§2.4 R2.4.3). Returns
  * the number of results processed.
- *
- * Phase 1 status: drain currently frees jobs without installing — the
- * S2.5 encoder PR replaces the placeholder body with the real install
- * path.
  */
 int compressionWorkersDrainOutbox(int budget);
 

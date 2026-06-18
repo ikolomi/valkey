@@ -19,14 +19,10 @@
 #   §2.1 (master switch + sweeper mechanics)
 #   §2.4–§2.5 (write/read path)
 
-# TODO(S4.x): assert_no_compression_errors is currently vacuous —
-# `compression_errors_total` is hardcoded to 0 in compressionRenderFields
-# (the comment there says "stays 0 until later S2 PRs land their
-# counters"). Until that wiring lands, this helper only catches the
-# pathological case where the field disappears entirely from INFO.
-# The intent is preserved so each test calls it as a final gate;
-# when the counter is wired, this becomes a real correctness assertion
-# without test code changes.
+# Asserts that `compression_errors_total` (R2.10.1) is 0 — i.e. no
+# decode/decompress/worker errors occurred during the test. Real gate
+# now that S4.1 wired the counter to live state (the renderer reads
+# compressionGetErrorsTotal()).
 proc assert_no_compression_errors {} {
     set status [r compression status]
     if {![regexp {compression_errors_total:(\d+)} $status _ errs]} {
@@ -42,11 +38,11 @@ proc assert_no_compression_errors {} {
 # gives the server's event loop time to drain the worker outbox and
 # run afterSleep / cron between observations.
 #
-# TODO(S4.x): used in lieu of a per-server compressed-object counter
-# (`compression_compressed_objects` in INFO is hardcoded to 0 until
-# that S4.x ticket wires it). When the counter goes live we can keep
-# this helper for per-key truth or migrate to a counter-based wait
-# for population-level assertions.
+# Per-key truth via OBJECT ENCODING (rather than the population-level
+# `compression_compressed_objects` counter) — for these tests we want
+# to assert "this specific key reached state X", not "≥N keys are
+# compressed". The counter does exist in INFO post-S4.1 and could
+# back a population-level wait helper if a future test needs it.
 proc wait_for_encoding {key expected_encoding {maxtries 200} {delay 50}} {
     wait_for_condition $maxtries $delay {
         [r object encoding $key] eq $expected_encoding
@@ -87,6 +83,56 @@ proc wait_for_at_most_n_keys_with_encoding {keys target encoding {maxtries 200} 
     } else {
         set actual [count_keys_with_encoding $keys $encoding]
         fail "$actual of [llength $keys] keys still at encoding '$encoding' (max-target $target)"
+    }
+}
+
+# Parse a single numeric INFO-compression field. Fails if absent.
+proc compression_info_int {field} {
+    set status [r compression status]
+    if {![regexp [format {%s:(\-?\d+)} $field] $status _ v]} {
+        fail "$field missing from COMPRESSION STATUS"
+    }
+    return $v
+}
+
+# Parse a single string INFO-compression field. Fails if absent.
+proc compression_info_str {field} {
+    set status [r compression status]
+    if {![regexp [format {%s:([^\r\n]+)} $field] $status _ v]} {
+        fail "$field missing from COMPRESSION STATUS"
+    }
+    return $v
+}
+
+# Reliably reach "no active dict" with room in the registry for a new
+# one. This is the precondition for the first-training auto-trigger and
+# for any test that wants to install a fresh dict from a known state.
+#
+# Mechanic:
+#   1. flushall — drops all keys, so every compressed frame is gone and
+#      the frame counters (compressed_objects, total_*_bytes) read 0.
+#   2. compression-dict-max-versions = 16 — guarantees headroom so a
+#      subsequent train/import is never refused by the registry cap,
+#      regardless of how many dicts prior tests left behind.
+#   3. master=decompression — auto-retires the active dict (R2.1.5), so
+#      compression_active_dict_id converges to 0. (Retiring dicts that
+#      are still frame-referenced, or awaiting QSBR reclamation, may
+#      linger in known_dicts; we deliberately do NOT depend on the
+#      registry draining all the way to empty — only on the active
+#      pointer clearing, which is reliable.)
+#
+# Reliable in --external shared-server mode: it depends only on the
+# active-pointer-clears-on-decompression invariant, not on prior state.
+proc compression_clear_active_dict {} {
+    r flushall
+    r config set compression-dict-max-versions 16
+    r config set compression-master-switch decompression
+    r config set compression-automatic-sweeper enabled
+    r config set compression-sweep-max-cpu-pct 100
+    wait_for_condition 200 50 {
+        [compression_info_int compression_active_dict_id] == 0
+    } else {
+        fail "active dict did not clear after master=decompression (active=[compression_info_int compression_active_dict_id])"
     }
 }
 
@@ -451,6 +497,331 @@ start_server {tags {"compression"}} {
         r compression sweep force
         wait_for_encoding "ineligible:control" compressed
         assert_equal $eligible_value [r get "ineligible:control"]
+        assert_no_compression_errors
+    }
+
+    test {INFO compression fields reflect live state through compress / decompress lifecycle} {
+        # Deterministic clean baseline: empty registry, no active dict.
+        # (Reliable in --external shared-server mode too — see
+        # compression_clear_active_dict.) Then install exactly one dict so
+        # the productive-state assertions below have something to
+        # compress against.
+        compression_clear_active_dict
+        set did [import_dict [gen_kv_samples 200 42]]
+        if {$did <= 0} { fail "import_dict returned non-positive id ($did)" }
+
+        # ---- Baseline: master=off → state==disabled, no frames yet ----
+        r flushall
+        r config set compression-master-switch off
+        r config set compression-automatic-sweeper disabled
+        assert_equal "disabled" [compression_info_str compression_state]
+        assert_equal 0 [compression_info_int compression_compressed_objects]
+        assert_equal 0 [compression_info_int compression_total_uncompressed_bytes]
+        assert_equal 0 [compression_info_int compression_total_compressed_bytes]
+        assert_equal 0 [compression_info_int compression_net_saved_bytes]
+
+        # ---- Populate compressible content + flip to compression ----
+        set N 50
+        set base "session=anonymous;ip=127.0.0.1;cookie=blank;ua=tcl-test;trace=info-fields;path=/index/page/section;"
+        for {set i 0} {$i < $N} {incr i} {
+            r set "ifk$i" "$base;index=$i;hash=[string repeat x [expr {64 + $i % 16}]]"
+        }
+
+        r config set compression-master-switch compression
+        r config set compression-min-value-size 32
+        r config set compression-max-value-size 0
+        r config set compression-min-idle-seconds 0
+        r config set compression-sweep-max-cpu-pct 100
+        r config set compression-automatic-sweeper enabled
+
+        # Wait for population to compress, then verify the fields.
+        set keys {}
+        for {set i 0} {$i < $N} {incr i} { lappend keys "ifk$i" }
+        wait_for_at_least_n_keys_with_encoding $keys $N compressed
+
+        # State == "active" (master=compression + active dict).
+        assert_equal "active" [compression_info_str compression_state]
+
+        # Every one of the N keys is compressed → counter == N exactly.
+        assert_equal $N [compression_info_int compression_compressed_objects]
+        set unc [compression_info_int compression_total_uncompressed_bytes]
+        set comp [compression_info_int compression_total_compressed_bytes]
+        if {$unc <= 0} { fail "compression_total_uncompressed_bytes=$unc not > 0" }
+        if {$comp <= 0} { fail "compression_total_compressed_bytes=$comp not > 0" }
+        if {$comp >= $unc} { fail "compressed ($comp) should be < uncompressed ($unc)" }
+
+        # net_saved = unc - comp, exact relation.
+        set net_saved [compression_info_int compression_net_saved_bytes]
+        assert_equal [expr {$unc - $comp}] $net_saved
+
+        # compression_ratio = compressed/uncompressed, rendered as a
+        # 4-decimal float. For our compressible kv-shaped content it is
+        # strictly in (0, 1): it can only be 0 when there are no
+        # compressed frames (total_uncompressed == 0, the divide-by-zero
+        # guard in the renderer), which is not the case here since we
+        # just confirmed N frames exist; and it is < 1 because the
+        # net-savings guard rejects anything that doesn't actually save.
+        set status [r compression status]
+        if {![regexp {compression_ratio:([0-9.]+)} $status _ ratio_str]} {
+            fail "compression_ratio missing from COMPRESSION STATUS"
+        }
+        if {$ratio_str <= 0.0 || $ratio_str >= 1.0} {
+            fail "compression_ratio=$ratio_str outside (0, 1) for compressible content"
+        }
+
+        # candidates_pending is a sampled gauge whose exact value races
+        # with the worker drain — there is no reliable way to pin it to
+        # a specific number from the client without synchronization the
+        # server doesn't expose. We assert only that the field is
+        # present and non-negative (its lifecycle is covered by the
+        # back-pressure gtests in src/unit/).
+        if {![regexp {compression_candidates_pending:([0-9]+)} $status _ pending]} {
+            fail "compression_candidates_pending missing from COMPRESSION STATUS"
+        }
+
+        assert_equal 0 [compression_info_int compression_errors_total]
+
+        # ---- Flip to decompression: state → idle; sweep drains ----
+        # State transitions to idle (active dict was retired per R2.1.5).
+        r config set compression-master-switch decompression
+        wait_for_condition 50 50 {
+            [compression_info_str compression_state] eq "idle"
+        } else {
+            fail "state did not transition to idle after master=decompression"
+        }
+
+        # Wait for drain — every key back to RAW.
+        wait_for_at_most_n_keys_with_encoding $keys 0 compressed
+
+        # All compressed buffers released → counters back to zero.
+        wait_for_condition 50 50 {
+            [compression_info_int compression_compressed_objects] == 0
+        } else {
+            fail "compression_compressed_objects did not return to 0 after drain"
+        }
+        assert_equal 0 [compression_info_int compression_total_uncompressed_bytes]
+        assert_equal 0 [compression_info_int compression_total_compressed_bytes]
+        assert_equal 0 [compression_info_int compression_net_saved_bytes]
+        assert_equal 0 [compression_info_int compression_errors_total]
+    }
+
+    test {compression_skipped_incompressible counts net-savings-guard rejections} {
+        # Deterministic precondition: clean registry, then install
+        # exactly one dict so the worker has something to compress
+        # against (the net-savings guard only runs after a compression
+        # attempt, which requires an active dict).
+        compression_clear_active_dict
+        set did [import_dict [gen_kv_samples 200 42]]
+        if {$did <= 0} { fail "import_dict returned non-positive id ($did)" }
+
+        r flushall
+        set before [compression_info_int compression_skipped_incompressible]
+
+        r config set compression-master-switch compression
+        r config set compression-min-value-size 256
+        r config set compression-max-value-size 0
+        r config set compression-min-idle-seconds 0
+        r config set compression-sweep-max-cpu-pct 100
+        r config set compression-automatic-sweeper enabled
+
+        # Generate high-entropy bytes deterministically from
+        # /dev/urandom (available on every CI host we target).
+        # 30 keys × 1 KB each; each blob has zero patterns so ZSTD
+        # with a dict can't beat the default 10% net-savings ratio →
+        # every one is rejected by the post-compression guard.
+        # NB: max-value-size is set to 0 (unbounded) above because a
+        # prior test in this shared server may have lowered it below
+        # 1 KB, which would make these keys ineligible (too large).
+        set rng [open "/dev/urandom" rb]
+        set N 30
+        for {set i 0} {$i < $N} {incr i} {
+            r set "rng:$i" [read $rng 1024]
+        }
+        close $rng
+
+        # The sweeper attempts all N keys; each rejection increments
+        # the counter. Wait until it has risen by at least N (every
+        # key rejected). Using ">= before+N" rather than just
+        # "> before" makes the assertion exact about the expected
+        # number of rejections, not merely "something was rejected".
+        wait_for_condition 200 50 {
+            [compression_info_int compression_skipped_incompressible] >= ($before + $N)
+        } else {
+            set now [compression_info_int compression_skipped_incompressible]
+            fail "compression_skipped_incompressible=$now, expected >= [expr {$before + $N}] ($N rejections on top of baseline $before)"
+        }
+
+        # Every rng:* key must remain RAW (rejection leaves the value
+        # uncompressed).
+        for {set i 0} {$i < $N} {incr i} {
+            assert_equal "raw" [r object encoding "rng:$i"]
+        }
+
+        assert_no_compression_errors
+    }
+    } ;# end if helper exists
+}
+
+# ============================================================================
+# Tests for fields that need controlled registry state
+# ----------------------------------------------------------------------------
+# These two fields need a deterministic registry baseline:
+#   - compression_training_last_duration_ms / _sample_count → need NO active
+#     dict so the first-training auto-trigger can fire.
+#   - compression_dict_cap_reached → needs a known, stable dict count.
+#
+# Both reach their preconditions via compression_clear_active_dict (drain to
+# empty) rather than depending on a fresh process — so they're deterministic
+# in --external shared-server mode too.
+# ============================================================================
+
+start_server {tags {"compression"}} {
+    if {![file exists "tests/helpers/gen-zstd-dict"]} {
+        test {compression INFO controlled-state tests skipped under BUILD_ZSTD=no} {
+            skip "BUILD_ZSTD=no — gen-zstd-dict helper not built"
+        }
+    } else {
+    test {compression_training_last_*: populated after an auto-training run} {
+        # The first-training auto-trigger (evaluateTriggers in
+        # compression_train.c) fires when ALL hold:
+        #   1. master=compression
+        #   2. no active dict (compressionRegistryActive() == NULL)
+        #   3. totalDbKeys() >= compression-dict-min-training-keys
+        #   4. registry has room (count < compression-dict-max-versions)
+        #
+        # compression_clear_active_dict guarantees (2) and (4) by draining
+        # the registry to empty — reliable regardless of prior tests
+        # (including --external shared-server mode). We then satisfy
+        # (1) and (3) and wait for the promotion.
+        compression_clear_active_dict
+
+        # Lower the training-keys threshold so we needn't populate
+        # 1000 keys; lower min-value-size so all our values qualify.
+        r config set compression-dict-min-training-keys 50
+        r config set compression-dict-max-training-keys 200
+        r config set compression-min-value-size 32
+        r config set compression-max-value-size 0
+        r config set compression-min-idle-seconds 0
+
+        # Exactly 100 compressible kv-style values, each ≥256 bytes →
+        # guaranteed RAW (not EMBSTR; shouldEmbedStringObject in
+        # object.c embeds when robj+key+sds total ≤128 bytes). flushall
+        # already ran inside compression_clear_active_dict, so these are
+        # the only keys → the training scan collects exactly 100.
+        set N 100
+        for {set i 0} {$i < $N} {incr i} {
+            set v "session=anonymous;ip=127.0.0.1;cookie=blank;trace=train-test;index=$i;hash=[string repeat x 200]"
+            r set "tk:$i" $v
+        }
+
+        r config set compression-master-switch compression
+        r config set compression-automatic-sweeper enabled
+        r config set compression-sweep-max-cpu-pct 100
+
+        # Wait for training to complete. The completion path registers
+        # a fresh dict via compressionRegistryAdd → active pointer
+        # swap, then snapshots last_duration_ms / last_sample_count,
+        # all in one main-thread cron tick.
+        wait_for_condition 200 100 {
+            [compression_info_int compression_active_dict_id] > 0
+        } else {
+            # Surface registry state so a regression is self-diagnosing.
+            set m [compression_info_str compression_master_switch]
+            set st [compression_info_str compression_state]
+            set kd [compression_info_int compression_known_dicts]
+            fail "training did not produce an active dict within timeout (master=$m state=$st known=$kd dbsize=[r dbsize])"
+        }
+
+        # sample_count is exact: we populated exactly 100 eligible keys
+        # and the per-scan cap (200) is well above that, so the scan
+        # collects all 100.
+        assert_equal 100 [compression_info_int compression_training_last_sample_count]
+
+        # duration spans scan-start → bio-completion (a bio round trip
+        # across at least one cron cycle), so it is strictly positive.
+        set dur [compression_info_int compression_training_last_duration_ms]
+        if {$dur <= 0} {
+            fail "compression_training_last_duration_ms=$dur not > 0 after training"
+        }
+
+        assert_no_compression_errors
+    }
+
+    test {compression_dict_cap_reached: reflects known_dicts vs cap, both directions} {
+        # compression_dict_cap_reached is a pure derived boolean:
+        # (known_dicts >= compression-dict-max-versions). We verify the
+        # relationship in both directions by reading the live
+        # known_dicts and moving the cap around it — rather than
+        # assuming a specific count, which isn't controllable in
+        # --external shared-server mode where prior tests leave dicts
+        # behind.
+        #
+        # We first guarantee at least 2 stable, non-reclaimable dicts so
+        # the count can't drain out from under the assertions:
+        #   - dict A made active, then pinned by compressing frames that
+        #     reference it (frame_refs > 0 → never GC'd while the frames
+        #     live);
+        #   - dict B imported on top, so A retires but stays pinned and
+        #     B is the (never-GC'd) active dict.
+        compression_clear_active_dict
+
+        r config set compression-min-value-size 32
+        r config set compression-max-value-size 0
+        r config set compression-min-idle-seconds 0
+        r config set compression-sweep-max-cpu-pct 100
+        r config set compression-dict-max-versions 16
+
+        # dict A, then pin it with compressed frames.
+        set a [import_dict [gen_kv_samples 200 11]]
+        if {$a <= 0} { fail "import dict A returned non-positive id ($a)" }
+        r config set compression-master-switch compression
+        r config set compression-automatic-sweeper enabled
+        set keys {}
+        for {set i 0} {$i < 20} {incr i} {
+            r set "capk$i" "kv;k=$i;data=[string repeat a 200]"
+            lappend keys "capk$i"
+        }
+        wait_for_at_least_n_keys_with_encoding $keys 20 compressed
+
+        # dict B — A retires (pinned, won't drain), B active.
+        set b [import_dict [gen_kv_samples 200 22]]
+        if {$b <= 0} { fail "import dict B returned non-positive id ($b)" }
+
+        # Let known_dicts settle: any reclaimable leftover dicts drain
+        # via the cron GC; the pinned A + active B (and any genuinely
+        # stuck residue) remain. "Settled" == 3 consecutive equal reads.
+        set prev -1
+        set stable 0
+        for {set t 0} {$t < 100 && $stable < 3} {incr t} {
+            after 50
+            set k [compression_info_int compression_known_dicts]
+            if {$k == $prev} { incr stable } else { set stable 0; set prev $k }
+        }
+        set K [compression_info_int compression_known_dicts]
+        if {$K < 2} {
+            fail "expected known_dicts >= 2 after pinning A + active B, got $K"
+        }
+        # The cap config maxes out at 16; to exercise the "below cap"
+        # direction we need headroom above K. K > 15 would mean the
+        # registry is nearly full of un-reclaimable dicts — a real
+        # problem worth surfacing, not silently skipping.
+        if {$K > 15} {
+            fail "known_dicts=$K leaves no headroom below the max cap (16); registry is not reclaiming dicts"
+        }
+
+        # Cap above the live count → flag 0.
+        r config set compression-dict-max-versions 16
+        assert_equal 0 [compression_info_int compression_dict_cap_reached]
+
+        # Cap == the live count → flag 1 (known_dicts >= cap).
+        r config set compression-dict-max-versions $K
+        assert_equal 1 [compression_info_int compression_dict_cap_reached]
+
+        # Cap back above the count → flag clears (proves it is derived
+        # live each render, not latched once set).
+        r config set compression-dict-max-versions 16
+        assert_equal 0 [compression_info_int compression_dict_cap_reached]
+
         assert_no_compression_errors
     }
     } ;# end if helper exists
