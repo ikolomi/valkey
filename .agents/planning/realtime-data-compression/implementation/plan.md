@@ -215,6 +215,14 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - No SANITIZE-detected races.
 - Preliminary perf numbers for at least 2 §7.5 scenarios.
 
+> **Sequencing override (2026-06-18):** with @ikolomi's S2.x track wrapped early (write/read paths, master switch, sweeper, queues, back-pressure all merged; the integration stress test in `tests/integration/compression.tcl` exercises the stack against a real workload) and @GilboaAWS's S1.x / S3.x / S4.x tracks lagging, the next-up @ikolomi work is reordered:
+>
+> - **Phase A (next):** **S4.x — observability counter wiring** taken from the @GilboaAWS track. Small, independent, removes the `TODO(S4.x)` annotations in `tests/integration/compression.tcl` and elsewhere; makes `assert_no_compression_errors` a real gate. Plus **S2.13 — COW audit pass 1** pulled forward from Phase 2 below (it's a v1 merge-blocker per R2.4.5). Plus **S5.1 scaffolding** (`valkey-benchmark` flag plumbing — can be developed without scenarios running).
+> - **Phase B (concurrent with @GilboaAWS):** transparency mode (§7.1) — full Tcl corpus under `--compression`. Now actionable because Phase A's S4.x gives tests-actually-hit-the-path verification and S2.13 closes COW false-positives. Plus opportunistic help on S1.x (design walkthroughs, paired pieces, code-review surge) without taking ownership.
+> - **Phase C (after @GilboaAWS lands S1.x):** **S5.2 / S5.3 / S5.4** — canonical scenarios + perf dashboard + full §7.5 benchmark run with auto-trained dicts. The customer-experience evaluation needs S1.x to land first or it measures a non-customer setup.
+>
+> Re-evaluate after Phase A lands; the central question for the review is where @GilboaAWS is on S1.x progress at that point. Branches: substantially landed → straight to Phase C; in flight → Phase B as planned; truly stuck → escalate to "take on S1.x".
+
 ### Phase 2 — Integration + production hardening (4 weeks, parallel)
 
 #### @ikolomi track
