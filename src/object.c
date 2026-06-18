@@ -1182,6 +1182,7 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_SKIPLIST: return "skiplist";
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
+    case OBJ_ENCODING_COMPRESSED: return "compressed"; /* R2.7.1 */
     default: return "unknown";
     }
 }
