@@ -251,6 +251,12 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     The two modes share `discardTransientEntry`'s release-and-decRef cleanup logic; only the restore vs leave-as-RAW step differs.
 
+    **Permanent-decompress is sticky until the sweeper re-compresses.** A value that is permanently decompressed — either by `master=decompression`'s drain mode (above) or by a write-path mutation that called `compressionPermanentlyDecompress` (R2.5.6) — stays RAW until one of:
+    - The sweeper visits the key on a subsequent tick under `master=compression` and the eligibility predicate (R2.2) admits it. The predicate's `compression-min-idle-seconds` gate (R2.2 hot-key check) means a freshly-mutated value typically waits one idle window before re-compressing — by design, to avoid churning the worker pool on hot keys.
+    - The key is evicted (under `maxmemory` pressure), expires, or is deleted — the stickiness question becomes moot.
+
+    There is no immediate auto-recompress path. Re-compressing on every mutation would either churn the worker pool or compete for main-thread CPU; the sweeper's pacing (`compression-sweep-max-cpu-pct`) bounds re-compress overhead globally, and the eligibility filter ensures hot keys aren't re-compressed prematurely. Operators expecting "compression is eventually-consistent" should size the sweep cadence accordingly. See R2.8.4 for the operator-facing memory implications during a `master=decompression` drain.
+
     **Mutation-detection invariant.** The pin (`refcount = 2`) forces any subsequent mutating command to honor the `dbUnshareStringValue` discipline (R2.4.4), creating a fresh robj that replaces the kvstore slot. The original (transient) robj is left intact for restoration; the slot now points elsewhere — detected at restoration time via pointer comparison. **No mutation-time hook is needed in any byte-mutating site.** This is the same staleness mechanism used by the write-path drain handler (R2.4.3 / §4.6).
 
     **ABA safety.** The pin keeps the original robj address reserved by the allocator for the duration of the transient state. A subsequent mutation creates a new robj at a different address. Pointer comparison at restoration time is therefore decisive (same property as the dict-lifetime invariant in §4.4 and the write-path stale check in §4.6).
@@ -301,6 +307,15 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 - **R2.8.1** Eviction sampler, `MEMORY USAGE`, and `INFO memory` use the compressed footprint for compressed values, via standard `zmalloc_size` / `used_memory` accounting. No custom accounting layer is introduced. (Q14)
 - **R2.8.2** Fixed overhead (CCtx/DCtx, digested dicts in the registry, candidate queue) is allocated via `zmalloc` → counted in `used_memory`. `INFO compression` additionally reports it under `compression_net_saved_bytes`. (Q14)
 - **R2.8.3** `MEMORY STATS` sub-aggregate for compression is v2. (Q14)
+- **R2.8.4** **Savings are workload-dependent; existing observability is sufficient.** The same `maxmemory` setting yields a wide range of effective dataset capacity depending on the workload:
+  - Highly compressible content (JSON, repetitive text) → effective capacity grows by `1/ratio` (e.g., 2× at a 50% ratio).
+  - Incompressible content (random binary) → effective capacity unchanged minus per-value header (~16 B/key) and fixed pool overhead (~10s of MB).
+
+  **Eviction interaction.** Per R2.8.1, `MEMORY USAGE` and the sampler see compressed footprints. Eviction triggers when the compressed dataset reaches `maxmemory`; the equivalent logical size is `maxmemory/ratio`. Victim selection is by LRU/LFU — per-key compression-ratio asymmetry doesn't bias which key gets evicted. `evicted_keys` (existing) is the canonical "is eviction firing" signal.
+
+  **Decompress-mode drain memory growth.** Flipping `compression-master-switch decompression` progressively reverts values to RAW (R2.5.7's permanent-decompress mode + the sweeper draining cold keys). `used_memory` grows toward the no-compression baseline during the drain window. With `maxmemory` active, operators should ensure headroom (or temporarily raise the cap) before flipping; otherwise the drain may trigger unexpected eviction.
+
+  **No new compression-specific metric for v1.** The interactions above are observable via existing fields: `used_memory`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_compressed_objects`, `compression_total_uncompressed_bytes` / `compression_total_compressed_bytes`, `evicted_keys`, plus the planned `compression_transient_view_capped_total` (S4.1, R2.5.7) for transient-view cap-fallback observability. Adding a dedicated "compression headroom" metric was considered after Topic-2 PR-B (integration stress test) landed and rejected — the existing surface already lets operators reason about workload-dependent capacity, and the stress test surfaced no observation that would justify a new metric. Revisit after S5.x benchmark scenarios run if a specific operator-facing gap surfaces. (Topic-1)
 
 ### 2.9 Scripting and transactions
 
