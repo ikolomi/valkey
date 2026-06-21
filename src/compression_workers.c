@@ -635,10 +635,18 @@ static int compressionInstall(compressionJob *job) {
      * holds via the caller's refcount. */
     dbReplaceValue(db, &key_obj, &compressed);
 
-    /* Bump the registry ref for the dict this frame is built with.
-     * Decrement happens when the compressed robj is freed (S2.x will
-     * wire freeStringObject → compressionRegistryDecRef). */
-    compressionRegistryIncRef(job->dict_id);
+    /* NOTE: the dict frame-ref is taken INSIDE createCompressedObject
+     * (it reads dict_id from the frame header's alg_meta and calls
+     * compressionRegistryIncRef). The matching DecRef happens in
+     * freeCompressedObject (robj freed) or releaseCompressedBuffer
+     * (permanent decompress). Both are keyed on the header alg_meta —
+     * a single source of truth. Do NOT add a second IncRef here:
+     * createCompressedObject is the sole producer of compressed robjs,
+     * so its IncRef covers every install. (An earlier design checklist
+     * listed an explicit install-time IncRef; that predated PR #8
+     * moving the ref into createCompressedObject and was double-counting
+     * — every frame got +2 on install but only -1 on free/decompress,
+     * leaking one ref per value and pinning the dict from GC forever.) */
 
     /* TODO(S4.1): compression_compressions_per_sec++ rate update; fold
      * (dst_len / sdslen(src)) into compression_live_ratio_10m EMA per
