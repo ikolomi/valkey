@@ -48,120 +48,124 @@ start_server {tags {"compression" "compression-training" "external:skip"}} {
         }
     } else {
 
-    test {First-training trigger fires and produces a usable dict} {
+    test {Below min keys: training does NOT trigger} {
         r flushall
-
-        # Configure for training: low threshold so we don't need 1000 keys.
         r config set compression-master-switch compression
         r config set compression-automatic-sweeper disabled
+        r config set compression-dict-min-training-keys 500
+        r config set compression-min-value-size 32
+        r config set compression-min-idle-seconds 0
+
+        # Fresh instance (external:skip): no dict, no scans yet.
+        assert_equal 0 [get_active_dict_id]
+        assert_equal 0 [getInfoProperty [r info compression] compression_training_scans_started]
+
+        # Insert 50 eligible (RAW, padded) keys — below the 500 trigger.
+        for {set i 0} {$i < 50} {incr i} {
+            set val "user_id=$i;name=user_$i;email=user${i}@example.com;score=[expr {$i * 10}];level=[expr {$i % 50}];active=true;region=us-east;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value_and_not_embstr"
+            r set "lowkey:$i" $val
+        }
+
+        # Give cron ~10 ticks (hz=10). The trigger is a synchronous
+        # check; if it were going to fire it would on the first tick
+        # after the keys land. scans_started staying 0 proves the
+        # min-keys gate held.
+        after 1000
+        assert_equal 0 [getInfoProperty [r info compression] compression_training_scans_started]
+        assert_equal 0 [get_active_dict_id]
+    }
+
+    test {Enough keys but none eligible: scan aborts, no dict} {
+        r flushall
+        # min-value-size 256 makes the small values below ineligible.
+        r config set compression-dict-min-training-keys 50
+        r config set compression-min-value-size 256
+
+        # Insert 100 keys, all values well under 256 bytes (also EMBSTR).
+        # Total keys (100) >= min (50) so the TRIGGER fires (no active
+        # dict yet), but the scan collects 0 eligible samples → abort.
+        for {set i 0} {$i < 100} {incr i} {
+            r set "tiny:$i" "tiny_value_$i"
+        }
+
+        # Deterministic via metrics: a scan started (trigger fired) and
+        # it failed (insufficient eligible samples). No dict promoted.
+        wait_for_condition 200 50 {
+            [getInfoProperty [r info compression] compression_training_scans_started] == 1 &&
+            [getInfoProperty [r info compression] compression_training_failures] == 1
+        } else {
+            fail "expected one started+failed scan; got started=[getInfoProperty [r info compression] compression_training_scans_started] failures=[getInfoProperty [r info compression] compression_training_failures]"
+        }
+        assert_equal 0 [get_active_dict_id]
+        # The abort armed a 30s cooldown (hardcoded). The next test
+        # waits it out before first-training can fire.
+    }
+
+    test {First-training fires across multiple DBs and produces a dict} {
+        r flushall
         r config set compression-dict-min-training-keys 100
         r config set compression-min-value-size 32
         r config set compression-min-idle-seconds 0
 
-        # Fresh instance (external:skip guarantees a private server),
-        # so no dict exists yet.
-        assert_equal 0 [get_active_dict_id]
-
-        # Insert enough eligible keys to trigger training.
-        # Use JSON-like patterns with padding — must exceed embstr threshold
-        # (~128 total robj size) to get RAW encoding.
-        for {set i 0} {$i < 200} {incr i} {
-            set val "user_id=$i;name=user_$i;email=user${i}@example.com;score=[expr {$i * 10}];level=[expr {$i % 50}];active=true;region=us-east;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value_and_not_embstr_which_would_skip_training"
-            r set "trainkey:$i" $val
-        }
-
-        # Wait for training to complete (scan + bio + promotion).
-        wait_for_trained_dict 300 100
-
-        # A dict was promoted — id is non-zero (monotonic, starts at 1).
-        assert {[get_active_dict_id] > 0}
-    }
-
-    test {After training, new writes get compressed} {
-        # Dict should be active from previous test.
-        assert {[get_active_dict_id] > 0}
-
-        # Write a new value with similar shape to training data.
-        set val "user_id=999;name=user_999;email=user999@example.com;score=9990;level=49;active=true;region=us-west;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value_and_not_embstr_which_would_skip_compression"
-        r set "newkey" $val
-
-        # Wait for it to be compressed (write-path hook enqueues,
-        # worker compresses, drain installs).
-        wait_for_encoding "newkey" compressed
-
-        # Round-trip: GET returns original bytes.
-        assert_equal $val [r get "newkey"]
-    }
-
-    test {Training does NOT fire when DB has fewer than min keys} {
-        r flushall
-        r config set compression-dict-min-training-keys 500
-
-        # Record current dict count before inserting.
-        set known_before [get_known_dicts]
-
-        # Insert only 50 keys — below the 500 threshold.
-        for {set i 0} {$i < 50} {incr i} {
-            r set "smalldb:$i" "value_${i}_padded_to_be_long_enough_for_raw_encoding_threshold"
-        }
-
-        # Wait a few seconds — training should NOT fire.
-        after 3000
-
-        # No new dict trained — known_dicts should not have increased.
-        set known_after [get_known_dicts]
-        assert {$known_after <= $known_before}
-    }
-
-    test {Training aborts and enters cooldown with ineligible values} {
-        r flushall
-        r config set compression-dict-min-training-keys 50
-        r config set compression-min-value-size 256
-
-        # Record current dict id — if training fires and succeeds
-        # it would change.
-        set dict_before [get_active_dict_id]
-
-        # Insert 100 keys but all values are small (< 256 bytes).
-        # They won't pass the eligibility check in the scan callback.
-        for {set i 0} {$i < 100} {incr i} {
-            r set "small:$i" "tiny_value_$i"
-        }
-
-        # Wait enough time for scan to run and abort.
-        after 5000
-
-        # No new dict should be trained — id should be unchanged.
-        assert_equal $dict_before [get_active_dict_id]
-    }
-
-    # Retirement lifecycle test moved to its own start_server block below.
-
-    test {Training scans across multiple databases} {
-        r flushall
-        r config set compression-master-switch compression
-        r config set compression-dict-min-training-keys 80
-        r config set compression-min-value-size 32
-        r config set compression-min-idle-seconds 0
-
-        # Split keys across db 0 and db 1 — each has fewer than min
-        # alone, but combined they exceed it.
+        # Split eligible keys across db0 and db1 — each below min alone,
+        # together (120) over the 100 trigger. Exercises both the
+        # first-training trigger AND multi-DB scan iteration.
         r select 0
-        for {set i 0} {$i < 50} {incr i} {
-            set val "db0_user=$i;role=admin;region=eu-west;plan=enterprise;note=padding_text_$i;extra=this_is_extra_long_padding_to_ensure_the_value_exceeds_the_embstr_threshold_and_gets_raw_encoding"
+        for {set i 0} {$i < 60} {incr i} {
+            set val "db0_user=$i;name=user_$i;email=user${i}@example.com;score=[expr {$i * 10}];level=[expr {$i % 50}];active=true;region=eu-west;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value"
             r set "db0key:$i" $val
         }
         r select 1
-        for {set i 0} {$i < 50} {incr i} {
-            set val "db1_user=$i;role=member;region=ap-south;plan=standard;note=padding_text_$i;extra=this_is_extra_long_padding_to_ensure_the_value_exceeds_the_embstr_threshold_and_gets_raw_encoding"
+        for {set i 0} {$i < 60} {incr i} {
+            set val "db1_user=$i;name=user_$i;email=user${i}@example.com;score=[expr {$i * 10}];level=[expr {$i % 50}];active=true;region=ap-south;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value"
             r set "db1key:$i" $val
         }
         r select 0
 
-        # Total is 100 > min 80. Training should fire.
-        wait_for_trained_dict 300 100
-
+        # Generous timeout (60s): must absorb the remainder of the 30s
+        # cooldown armed by the previous test, then scan + bio + promote.
+        wait_for_trained_dict 600 100
         assert {[get_active_dict_id] > 0}
+        assert_equal 1 [getInfoProperty [r info compression] compression_training_successes]
+    }
+
+    test {After training, new writes get compressed} {
+        # Dict active from the previous test.
+        assert {[get_active_dict_id] > 0}
+
+        set val "user_id=999;name=user_999;email=user999@example.com;score=9990;level=49;active=true;region=us-west;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value_and_not_embstr"
+        r set "newkey" $val
+
+        # Write-path hook enqueues → worker compresses → drain installs.
+        wait_for_encoding "newkey" compressed
+        assert_equal $val [r get "newkey"]
+    }
+
+    test {Active dict blocks a new first-training (no retrain while active)} {
+        # With an active dict present, first-training must NOT fire
+        # again regardless of key count — the trigger is gated on
+        # (!active). Drift / refresh triggers are not yet wired.
+        assert {[get_active_dict_id] > 0}
+        set dict_before [get_active_dict_id]
+        set scans_before [getInfoProperty [r info compression] compression_training_scans_started]
+
+        r flushall
+        r config set compression-dict-min-training-keys 50
+        r config set compression-min-value-size 32
+
+        # Insert plenty of eligible keys (>= min) — would trigger
+        # first-training if no dict were active.
+        for {set i 0} {$i < 200} {incr i} {
+            set val "user_id=$i;name=user_$i;email=user${i}@example.com;score=[expr {$i * 10}];level=[expr {$i % 50}];active=true;region=us-east;padding=this_is_extra_padding_to_ensure_raw_encoding_is_used_for_this_value_and_not_embstr"
+            r set "again:$i" $val
+        }
+
+        # Let cron run several ticks.
+        after 2000
+
+        # No new scan started, dict unchanged — active dict suppressed it.
+        assert_equal $scans_before [getInfoProperty [r info compression] compression_training_scans_started]
+        assert_equal $dict_before [get_active_dict_id]
     }
 
     } ;# end of else (BUILD_ZSTD=yes)
