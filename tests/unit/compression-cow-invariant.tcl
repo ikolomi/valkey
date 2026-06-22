@@ -40,6 +40,16 @@
 #
 # Skipped under BUILD_ZSTD=no (the gen-zstd-dict helper isn't built and the
 # server-side feature returns disabled stubs).
+#
+# Tagged external:skip — this test deliberately churns global compression
+# state (master switch, sweeper, an imported dictionary, compressed frames)
+# and cannot restore a pristine registry afterward (a dict that ever held
+# frames is not reliably reclaimable today). Against a shared --external
+# server it would pollute state for sibling compression tests (e.g.
+# unit/type/compression's documented-defaults assertions) and leave
+# compressed values that crash kvstore-direct readers such as DEBUG DIGEST.
+# Its COW-correctness value is fully delivered in normal (dedicated-server)
+# mode, which is the primary CI mode.
 
 # --- local helpers (file-scoped; the integration suite keeps its own copies
 #     so the two files stay independently runnable) ---
@@ -102,7 +112,7 @@ proc cow_recompress_and_verify {key expected} {
     cow_assert_no_errors
 }
 
-start_server {tags {"compression"}} {
+start_server {tags {"compression" "external:skip"}} {
     if {![file exists "tests/helpers/gen-zstd-dict"]} {
         test {compression COW-invariant tests skipped under BUILD_ZSTD=no} {
             skip "BUILD_ZSTD=no — gen-zstd-dict helper not built"
@@ -268,26 +278,6 @@ start_server {tags {"compression"}} {
             assert_equal "${base}_TAIL" [r get k]
             cow_assert_no_errors
             cow_recompress_and_verify k "${base}_TAIL"
-        }
-
-        # Shared-server hygiene (matters in --external mode, where this
-        # file shares one server with the rest of the suite). Leave the
-        # feature OFF with no compressed values behind: a following test
-        # that runs DEBUG DIGEST / a save over a compressed value would
-        # otherwise hit getDecodedObject()'s "Unknown encoding type"
-        # panic (compressed values reach kvstore-direct readers that
-        # don't decompress — see PR discussion / follow-up bug). flushall
-        # drops every compressed frame; master=off stops new compression.
-        test {cleanup: restore compression defaults (shared-server hygiene)} {
-            r flushall
-            r config set compression-master-switch off
-            r config set compression-automatic-sweeper disabled
-            # Leave dict-cap headroom (16, not the default 4): in
-            # --external mode later suites import more dicts into the
-            # shared registry, and dicts that ever held frames may not
-            # have fully reclaimed yet. A low cap here would starve them.
-            r config set compression-dict-max-versions 16
-            assert_equal {} [r keys *]
         }
     }
 }
