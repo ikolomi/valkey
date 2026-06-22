@@ -58,9 +58,9 @@ start_server {tags {"compression" "compression-training" "external:skip"}} {
         r config set compression-min-value-size 32
         r config set compression-min-idle-seconds 0
 
-        # Record initial state — may be non-zero in external test mode
-        # (shared server with dicts from other test files).
-        set dict_before [get_active_dict_id]
+        # Fresh instance (external:skip guarantees a private server),
+        # so no dict exists yet.
+        assert_equal 0 [get_active_dict_id]
 
         # Insert enough eligible keys to trigger training.
         # Use JSON-like patterns with padding — must exceed embstr threshold
@@ -73,10 +73,8 @@ start_server {tags {"compression" "compression-training" "external:skip"}} {
         # Wait for training to complete (scan + bio + promotion).
         wait_for_trained_dict 300 100
 
-        # Dict was promoted — verify it changed from before.
-        set dict_after [get_active_dict_id]
-        assert {$dict_after > 0}
-        assert {$dict_after != $dict_before || $dict_before > 0}
+        # A dict was promoted — id is non-zero (monotonic, starts at 1).
+        assert {[get_active_dict_id] > 0}
     }
 
     test {After training, new writes get compressed} {
@@ -99,8 +97,7 @@ start_server {tags {"compression" "compression-training" "external:skip"}} {
         r flushall
         r config set compression-dict-min-training-keys 500
 
-        # Record current state before inserting.
-        set dict_before [get_active_dict_id]
+        # Record current dict count before inserting.
         set known_before [get_known_dicts]
 
         # Insert only 50 keys — below the 500 threshold.
