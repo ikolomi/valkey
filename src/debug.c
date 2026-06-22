@@ -39,6 +39,7 @@
 #include "io_threads.h"
 #include "sds.h"
 #include "module.h"
+#include "compression.h" /* objectGetUncompressedView for DEBUG DIGEST on compressed values */
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -108,9 +109,27 @@ void xorDigest(unsigned char *digest, const void *ptr, size_t len) {
 }
 
 void xorStringObjectDigest(unsigned char *digest, robj *o) {
-    o = getDecodedObject(o);
-    xorDigest(digest, objectGetVal(o), sdslen(objectGetVal(o)));
-    decrRefCount(o);
+    /* The value may be an OBJ_ENCODING_COMPRESSED string: the digest paths
+     * (DEBUG DIGEST / DIGEST-VALUE) read kvstore values directly, bypassing
+     * the lookupKey() transient-view decompression hook. Route through the
+     * single decoder primitive (R2.5.2), exactly as rdbSaveStringObject and
+     * rioWriteBulkObject do. No-op passthrough for non-compressed values and
+     * for BUILD_ZSTD=no. */
+    sds scratch = NULL;
+    robj view;
+    robj *u = objectGetUncompressedView(o, &scratch, &view);
+    if (u == NULL) return; /* decode failure: decoder logged + counted (R6.2); skip */
+    if (u != o) {
+        /* Compressed: decompressed RAW bytes live in scratch. Do NOT call
+         * getDecodedObject on the OBJ_STATIC_REFCOUNT view — incrRefCount on a
+         * stack object panics. */
+        xorDigest(digest, scratch, sdslen(scratch));
+        sdsfree(scratch);
+    } else {
+        robj *dec = getDecodedObject(o); /* handles RAW/EMBSTR/INT */
+        xorDigest(digest, objectGetVal(dec), sdslen(objectGetVal(dec)));
+        decrRefCount(dec);
+    }
 }
 
 /* This function instead of just computing the SHA1 and xoring it
@@ -137,9 +156,24 @@ void mixDigest(unsigned char *digest, const void *ptr, size_t len) {
 }
 
 void mixStringObjectDigest(unsigned char *digest, robj *o) {
-    o = getDecodedObject(o);
-    mixDigest(digest, objectGetVal(o), sdslen(objectGetVal(o)));
-    decrRefCount(o);
+    /* See xorStringObjectDigest: route a possibly-compressed kvstore value
+     * through the single decoder primitive (R2.5.2). This is the funnel for
+     * the OBJ_STRING branch of xorObjectDigest, so it covers both
+     * DEBUG DIGEST (computeDatasetDigest) and DEBUG DIGEST-VALUE. */
+    sds scratch = NULL;
+    robj view;
+    robj *u = objectGetUncompressedView(o, &scratch, &view);
+    if (u == NULL) return; /* decode failure: decoder logged + counted (R6.2); skip */
+    if (u != o) {
+        /* Compressed: decompressed RAW bytes live in scratch. Do NOT call
+         * getDecodedObject on the OBJ_STATIC_REFCOUNT view. */
+        mixDigest(digest, scratch, sdslen(scratch));
+        sdsfree(scratch);
+    } else {
+        robj *dec = getDecodedObject(o); /* handles RAW/EMBSTR/INT */
+        mixDigest(digest, objectGetVal(dec), sdslen(objectGetVal(dec)));
+        decrRefCount(dec);
+    }
 }
 
 /* This function computes the digest of a data structure stored in the
