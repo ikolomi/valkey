@@ -118,12 +118,12 @@ start_server {tags {"compression" "external:skip"}} {
             skip "BUILD_ZSTD=no — gen-zstd-dict helper not built"
         }
     } else {
-        # In --external shared-server mode this file runs against the same
-        # server as the integration suite, so the registry may already hold
-        # dicts (and the frame-ref leak tracked for the registry owner means
-        # frame-holding dicts don't retire). Clear keys and guarantee
-        # headroom before importing, so the import is never refused by the
-        # compression-dict-max-versions cap.
+        # Clean slate: drop any keys and give the registry cap headroom
+        # before importing the suite dictionary. (The file is external:skip,
+        # so this runs only against a fresh dedicated server; the flush is
+        # defensive, and the raised cap covers the case where a dict that
+        # held frames lingers — frame-holding dicts are not reliably
+        # reclaimable today, tracked for the registry owner.)
         r flushall
         r config set compression-dict-max-versions 16
         # Install a kv-shaped dict once for the whole file.
@@ -134,8 +134,7 @@ start_server {tags {"compression" "external:skip"}} {
 
         # Aggressive config so every eligible value compresses promptly and
         # nothing is skipped for being "hot". Each test re-asserts the full
-        # set it depends on (no reliance on inherited state — matters in
-        # --external shared-server mode).
+        # set it depends on rather than relying on a prior test's config.
         proc cow_configure {} {
             r config set compression-master-switch compression
             r config set compression-automatic-sweeper enabled
