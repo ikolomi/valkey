@@ -273,6 +273,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
     - AOF rewrite child (`rewriteAppendOnlyFileRio`) — iterates kvstore directly via `kvstoreIteratorNext`; fork-time snapshot. Calls `objectGetUncompressedView` explicitly.
     - RDB save for replication full-sync (R2.6.8) — same iteration pattern; explicit decompression.
     - Disk RDB write (R2.6.1) — emits compressed bytes + AUX dict directly; **no decompression needed**.
+    - `DEBUG DIGEST` (`computeDatasetDigest` → `kvstoreIteratorNext`) and `DEBUG DIGEST-VALUE` (`dbFind`) — these deliberately bypass `lookupKey` so a debug command can digest logically-expired keys. The `OBJ_STRING` branch of `xorObjectDigest` funnels the raw kvstore value through `mixStringObjectDigest` / `xorStringObjectDigest`, which call `objectGetUncompressedView` explicitly before digesting. The digest is therefore defined over the logical (decompressed) bytes — identical whether a value is stored compressed or not (transparency). Without this, `getDecodedObject` panics on `OBJ_ENCODING_COMPRESSED`. (Other type branches digest sub-elements, which are never compressed in v1's STRING-only scope.)
 
     The replication feed (`feedReplicationBufferWithObject` in `src/replication.c`) operates on `argv` arguments and synthetic SELECT robjs — never on kvstore values. **No decompression needed.** AOF append (steady-state) likewise propagates command argv, not kvstore values.
 
