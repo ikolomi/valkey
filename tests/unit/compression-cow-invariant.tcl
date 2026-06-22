@@ -269,5 +269,25 @@ start_server {tags {"compression"}} {
             cow_assert_no_errors
             cow_recompress_and_verify k "${base}_TAIL"
         }
+
+        # Shared-server hygiene (matters in --external mode, where this
+        # file shares one server with the rest of the suite). Leave the
+        # feature OFF with no compressed values behind: a following test
+        # that runs DEBUG DIGEST / a save over a compressed value would
+        # otherwise hit getDecodedObject()'s "Unknown encoding type"
+        # panic (compressed values reach kvstore-direct readers that
+        # don't decompress — see PR discussion / follow-up bug). flushall
+        # drops every compressed frame; master=off stops new compression.
+        test {cleanup: restore compression defaults (shared-server hygiene)} {
+            r flushall
+            r config set compression-master-switch off
+            r config set compression-automatic-sweeper disabled
+            # Leave dict-cap headroom (16, not the default 4): in
+            # --external mode later suites import more dicts into the
+            # shared registry, and dicts that ever held frames may not
+            # have fully reclaimed yet. A low cap here would starve them.
+            r config set compression-dict-max-versions 16
+            assert_equal {} [r keys *]
+        }
     }
 }
