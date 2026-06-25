@@ -16,6 +16,9 @@ dump*.rdb
 *-sentinel
 *-server
 *-unit-gtests
+# The binary-ignore rules above (esp. *-benchmark) also match the compression
+# benchmark orchestrator's source directory; re-include that Python tooling.
+!utils/compression-benchmark/
 doc-tools
 release
 misc/*
