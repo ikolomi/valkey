@@ -126,8 +126,19 @@ Each is a C change in `src/valkey-benchmark.c` with a Tier-2 test written first.
   | **Delta-from-baseline** | both `reference` (`off`) + `compression-on` configs run and retain raw artifacts — `test_compression_path.py`. (Delta *computation* is post-processor scope, Appendix C.) |
   | **Honest about validity** | induced FAILED e2e — `target_tps_not_achieved` + `server_error` (`test_off_path.py`), `profile_not_stabilized` (`test_compression_path.py`), `benchmark_error` (`tests/component/test_loaders.py` dead-port); decision logic + precedence — `tests/unit/test_helpers.py` (runstatus). |
   | **Normal-machine runnable** | tiny e2e runs within CI budget (`key_count≈2k`, short duration) — `test_off_path.py` + `test_compression_path.py`. (No hard dataset-size cap enforced — operators size their own runs; the tiny e2e is the budget guard.) |
-- [ ] **F2** reproducibility soak; CI Tier-2/3 with binaries built; optional NUMA pinning; `--dry-run`.
-- [ ] **F3** docs: `README.md`, run-JSON schema reference, how-to-run, the S1.x dependency note.
+- [~] **F2** hardening. **DONE:** (a) **`--dry-run`** — binary-independent; emits the full load
+  plan (per-command process split via the R5 split math: procs/connections/rps + rendered
+  `--compression-*` server args per config) so a run can be sanity-checked before launch
+  (`orchestrator.build_plan` + `_format_plan`; Tier-1 `tests/unit/test_dry_run.py`). (b)
+  **reproducibility** — already covered: byte-identical corpus per seed (`tests/unit/test_corpus.py`)
+  + e2e identical corpus hash (`tests/e2e/test_off_path.py`); a long repeated-run "soak" is
+  informational/slow and left as a manual step, not a CI gate (per §7.3 policy). **REMAINING:**
+  CI workflow that builds `valkey-server`+`valkey-benchmark` (`BUILD_ZSTD=yes`) and runs the
+  Tier-2/3 tiers (path-filtered to `utils/compression-benchmark/**`); optional NUMA pinning.
+- [x] **F3** docs — **DONE.** `README.md` refreshed: status table (Phases A–F), binary-independent
+  `--dry-run` load-plan example, compression-ON-via-auto-training how-to, the **S1.x server-side-training
+  dependency note** (no manual `COMPRESSION TRAIN`; first-training-only), and a **run-JSON schema-reference**
+  pointer to design §5.1.
 
 **Phase F exit / M4:** instrument ready; hand-off point for the **post-processor** (separate idea-honing).
 

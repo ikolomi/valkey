@@ -26,14 +26,15 @@ reduction (histogram merge, percentiles, delta-vs-baseline) and the headline
 | Phase | What | State |
 |---|---|---|
 | A (M0) | pure-Python core: config / corpus / split-math / plateau / run-status | ✅ done |
-| C | server lifecycle, INFO polling, loader orchestration (FIFO barrier), provenance, dict-import | ✅ done |
-| D (**M2**) | **OFF-config run end-to-end** (no training, no benchmark changes) + failure paths | ✅ **done** |
-| B | benchmark flags `--value-data` / `--key-distribution` / `--record-start-signal` | ⏳ pending (needed for compression-ON realistic runs) |
-| E | compression-ON path (train/compress-all/profile-prep-to-plateau) + canonical 2-config run | ⏳ pending |
+| B | benchmark flags `--value-data corpus:FILE` / `--key-distribution zipf` / `--record-start-signal` | ✅ done |
+| C | server lifecycle, INFO polling, loader orchestration (FIFO barrier), provenance | ✅ done |
+| D (**M2**) | **OFF-config run end-to-end** + failure paths | ✅ done |
+| E (**M3**) | **compression-ON path** (auto-train → compress-all → profile-prep-to-plateau → windowed measure) + canonical 2-config run | ✅ done |
+| F | hardening: §7.4 goal-coverage matrix, `--dry-run` plan, docs | 🔄 in progress |
 
-> Today you can run the **off (reference) baseline** end-to-end. The compression-ON
-> config path is in progress (Phase E). A real compression *cycle* is already exercised
-> by the test suite via `COMPRESSION DICT-IMPORT` (see `tests/component/test_compression_cycle.py`).
+> Both the **off (reference) baseline** and the **compression-ON** config run end-to-end
+> today. The compression-ON path acquires its dictionary via the server's **automatic
+> first-training** (S1.2) — see the [dependency note](#dependency--server-side-training-s12).
 
 ---
 
@@ -44,10 +45,30 @@ reduction (histogram merge, percentiles, delta-vs-baseline) and the headline
 
   ```sh
   make BUILD_ZSTD=yes        # produces src/valkey-server, src/valkey-cli, src/valkey-benchmark
-  make -C tests/helpers gen-zstd-dict   # (only needed for compression-ON dict-import tests)
+  make -C tests/helpers gen-zstd-dict   # only for the DICT-IMPORT component test; the
+                                        # orchestrator's compression path auto-trains
   ```
 
   The orchestrator core has **no third-party Python dependencies** (stdlib only).
+
+### Dependency — server-side training (S1.2)
+
+The compression-ON path relies on the server's **automatic first-training**. With
+`compression-master-switch compression`, once the keyspace reaches
+`compression-dict-min-training-keys` (default `1000`) the server trains a ZSTD dictionary on
+a `bio` thread and promotes it; the orchestrator polls `compression_active_dict_id` until it
+is non-zero. Caveats of the current in-tree feature:
+
+- There is **no manual `COMPRESSION TRAIN` command** yet (the `COMPRESSION` container wires
+  only `STATUS` / `HELP` / `DICT-IMPORT` / `SWEEP`).
+- Only the **first-training** trigger is live; drift- and refresh-interval retraining are
+  stubbed — so a run trains exactly one dictionary.
+- `COMPRESSION DICT-IMPORT` (R2.3.10) exists and is exercised by
+  `tests/component/test_compression_cycle.py`, but the orchestrator's product path uses
+  auto-training, not import.
+
+A run therefore needs `key_count ≥ compression-dict-min-training-keys` for the server to
+train at all.
 
 ---
 
@@ -57,12 +78,20 @@ reduction (histogram merge, percentiles, delta-vs-baseline) and the headline
 cd utils/compression-benchmark
 export SRC="$(cd ../../src && pwd)"     # your built binaries live in src/
 
-# 1) Validate the config and print the plan — no server is started.
-python3 orchestrator.py configs/examples/off-baseline.json \
-    --server-binary    "$SRC/valkey-server" \
-    --benchmark-binary "$SRC/valkey-benchmark" \
-    --dry-run
-# → OK: 1 configs × 1 iterations; reference=off; server=.../valkey-server; benchmark=.../valkey-benchmark
+# 1) Validate the config and print the load plan — no server is started (works without binaries).
+python3 orchestrator.py configs/examples/canonical.json --dry-run
+# → DRY RUN — no server or load is started.
+#     server_binary    : valkey-server
+#     iterations       : 3
+#     reference_config : off
+#     target_tps       : 250000  (connections_total=256)
+#     data_model       : key_count=2000000 seed=1234 corpus_entries=50000
+#     loader processes : 5 total
+#       get      4 proc(s), 205 conn, 200000 rps
+#       set      1 proc(s), 51 conn, 50000 rps
+#     configs:
+#       off              [valkey-server] --compression-master-switch off
+#       compression-on   [valkey-server] --compression-master-switch compression ...
 
 # 2) Run it for real.
 python3 orchestrator.py configs/examples/off-baseline.json \
@@ -136,6 +165,11 @@ Annotated (`configs/examples/off-baseline.json`):
 `server_binary` override are also supported. See `configs/examples/canonical.json` for the
 2-config before/after (off + compression-on) target example.
 
+The **authoritative field-by-field schema** (types, defaults, validation rules) is §5.1 of
+the [detailed design](../../.agents/planning/realtime-data-compression/benchmark/design/detailed-design.md);
+the annotated example above is the practical reference. Invalid configs are rejected up front
+with a specific `ConfigError` (run `--dry-run` to validate without starting anything).
+
 ---
 
 ## What it produces
@@ -192,10 +226,10 @@ VALKEY_SERVER="$SRC/valkey-server" VALKEY_BENCHMARK="$SRC/valkey-benchmark" \
 
 - **OFF (reference) path** — skips training/compression; the path proven end-to-end today:
   `start → populate (--sequential) → open-loop load + measure (--rps/--duration) → collect → verdict`.
-- **Compression-ON path** (Phase E) — adds: acquire a dictionary (`COMPRESSION DICT-IMPORT`
-  today, server-side `COMPRESSION TRAIN` once it lands) → compress-all (`min-idle 0` +
-  `COMPRESSION SWEEP FORCE`) → profile-prep under load until the compressed-objects count
-  **plateaus** → windowed measurement (record-start signal) → collect.
+- **Compression-ON path** — `start → populate (--sequential, corpus values, compression
+  enabled) → auto-train (poll compression_active_dict_id until the server promotes a dict) →
+  compress-all (min-idle 0 + COMPRESSION SWEEP FORCE) → profile-prep under load until the
+  compressed-objects count plateaus → windowed measurement (record-start signal) → collect`.
 
 ---
 

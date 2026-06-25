@@ -87,6 +87,62 @@ def run_file(config_path: str, server_binary: str, benchmark_binary: str,
     return run(run_obj, raw, server_binary, benchmark_binary, out_root)
 
 
+def build_plan(run_obj, server_binary, benchmark_binary):
+    """Build a structured dry-run plan (pure; no binaries required). Shows the
+    per-command loader-process split (R5 split math) and each config's rendered
+    --compression-* server args, so an operator can sanity-check a run before
+    launching it."""
+    from lib import benchmark as _bm
+
+    wl = run_obj.workload
+    split = _bm.split_processes(
+        wl.commands, wl.connections_total, wl.max_clients_per_process, wl.target_tps)
+    return {
+        "server_binary": server_binary or "<unresolved>",
+        "benchmark_binary": benchmark_binary or "<unresolved>",
+        "iterations": run_obj.iterations,
+        "reference_config": run_obj.reference_config,
+        "target_tps": wl.target_tps,
+        "connections_total": wl.connections_total,
+        "loader_processes_total": sum(s["n_procs"] for s in split),
+        "workload_split": split,
+        "configs": [
+            {"name": e.name,
+             "server_binary": e.server_binary or server_binary or "<unresolved>",
+             "server_args": config.render_server_args(e)}
+            for e in run_obj.configs
+        ],
+        "data_model": {
+            "key_count": run_obj.data_model.key_count,
+            "seed": run_obj.data_model.seed,
+            "corpus_entries": run_obj.data_model.corpus_entries,
+        },
+    }
+
+
+def _format_plan(plan) -> str:
+    lines = [
+        "DRY RUN — no server or load is started.",
+        f"  server_binary    : {plan['server_binary']}",
+        f"  benchmark_binary : {plan['benchmark_binary']}",
+        f"  iterations       : {plan['iterations']}",
+        f"  reference_config : {plan['reference_config']}",
+        f"  target_tps       : {plan['target_tps']}  (connections_total={plan['connections_total']})",
+        f"  data_model       : key_count={plan['data_model']['key_count']} "
+        f"seed={plan['data_model']['seed']} corpus_entries={plan['data_model']['corpus_entries']}",
+        f"  loader processes : {plan['loader_processes_total']} total",
+    ]
+    for s in plan["workload_split"]:
+        rps = sum(p["rps"] for p in s["processes"])
+        conns = sum(p["connections"] for p in s["processes"])
+        lines.append(f"    {s['command']:<8} {s['n_procs']} proc(s), "
+                     f"{conns} conn, {rps:.0f} rps")
+    lines.append("  configs:")
+    for c in plan["configs"]:
+        lines.append(f"    {c['name']:<16} [{c['server_binary']}] {' '.join(c['server_args'])}")
+    return "\n".join(lines)
+
+
 def main(argv=None):
     from lib import env
 
@@ -106,8 +162,8 @@ def main(argv=None):
     bb = args.benchmark_binary or run_obj.benchmark_binary or env.benchmark_binary_path()
 
     if args.dry_run:
-        print(f"OK: {len(run_obj.configs)} configs × {run_obj.iterations} iterations; "
-              f"reference={run_obj.reference_config}; server={sb}; benchmark={bb}")
+        # Binary-independent: resolve leniently, never require a built server/benchmark.
+        print(_format_plan(build_plan(run_obj, sb, bb)))
         return 0
 
     result = run(run_obj, raw, sb, bb, args.out_root)
