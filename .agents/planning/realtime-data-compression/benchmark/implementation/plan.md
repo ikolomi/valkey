@@ -116,7 +116,16 @@ Each is a C change in `src/valkey-benchmark.c` with a Tier-2 test written first.
 
 ### Phase F — Hardening + goal-coverage closure
 
-- [ ] **F1 Close the §7.4 goal-coverage matrix** — every §1.3 goal cites a green test (review gate).
+- [x] **F1 Close the §7.4 goal-coverage matrix** — **DONE (2026-06-25).** Every design §1.3 goal cites a green test (100 passed). As part of closing it, decoupled the setup-phase timeouts (auto-train + compress-all use a fixed `_SETUP_TIMEOUT_S`) from `profile_prep.max_timeout_seconds`, and added the missing induced-failure e2e (`profile_not_stabilized`). Matrix:
+
+  | §1.3 goal | covering green test(s) |
+  |---|---|
+  | **Precision instrument** | exact coverage — `tests/component/test_benchmark_sequential.py` (`DBSIZE==N` + boundary keys); windowed recording reflects only the post-signal window — `tests/component/test_record_start_signal.py`; worst-case memory (MAX `used_memory` sampled across the window) — `tests/e2e/test_compression_path.py`; clean window (plateau before measure) — `test_compression_path.py` (`plateaued`); corpus compressibility / key skew — `test_value_data_corpus.py` / `test_key_distribution.py`. (True tail-percentile *merge* is post-processor scope, Appendix C.) |
+  | **Reproducible** | byte-identical corpus per seed — `tests/unit/test_corpus.py`; e2e identical corpus hash — `tests/e2e/test_off_path.py`; provenance (sha256/machine/seed/corpus-hash) — `tests/unit/test_provenance.py` + `test_off_path.py` artifact contract. |
+  | **Realistic** | start-compressed → equilibrium plateau under real load — `test_compression_path.py` (`compressed_objects>0` + `plateaued`); compress/ratio behavior — `tests/component/test_compression_cycle.py` (ratio<1). |
+  | **Delta-from-baseline** | both `reference` (`off`) + `compression-on` configs run and retain raw artifacts — `test_compression_path.py`. (Delta *computation* is post-processor scope, Appendix C.) |
+  | **Honest about validity** | induced FAILED e2e — `target_tps_not_achieved` + `server_error` (`test_off_path.py`), `profile_not_stabilized` (`test_compression_path.py`), `benchmark_error` (`tests/component/test_loaders.py` dead-port); decision logic + precedence — `tests/unit/test_helpers.py` (runstatus). |
+  | **Normal-machine runnable** | tiny e2e runs within CI budget (`key_count≈2k`, short duration) — `test_off_path.py` + `test_compression_path.py`. (No hard dataset-size cap enforced — operators size their own runs; the tiny e2e is the budget guard.) |
 - [ ] **F2** reproducibility soak; CI Tier-2/3 with binaries built; optional NUMA pinning; `--dry-run`.
 - [ ] **F3** docs: `README.md`, run-JSON schema reference, how-to-run, the S1.x dependency note.
 

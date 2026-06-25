@@ -17,6 +17,11 @@ import time as _time
 
 from lib import benchmark, config, info, provenance, server
 
+# Generous fixed timeout for the SETUP phases (auto-train + compress-all). These are
+# not the measured profile; only profile-prep is gated by profile_prep.max_timeout_seconds
+# (R4.6 fail-on-timeout → profile_not_stabilized).
+_SETUP_TIMEOUT_S = 180
+
 
 def representative_datasize(dm: config.DataModel) -> int:
     """A single representative value size for the off baseline (corpus-backed
@@ -184,9 +189,9 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         # The cron fires training once DBSIZE >= compression-dict-min-training-keys and
         # promotes a dict; poll until it's active. (A manual `COMPRESSION TRAIN` command
         # is a later PR; auto-training is the available — and realistic — path.)
-        if not _wait_active_dict(srv, pp.max_timeout_seconds):
+        if not _wait_active_dict(srv, _SETUP_TIMEOUT_S):
             raise RuntimeError(
-                f"server did not auto-train an active dict within {pp.max_timeout_seconds}s "
+                f"server did not auto-train an active dict within {_SETUP_TIMEOUT_S}s "
                 f"(need >= compression-dict-min-training-keys eligible keys)")
         log(f"[{entry.name}] auto-trained active dict id="
             f"{srv.info('compression').get('compression_active_dict_id')}")
@@ -198,7 +203,7 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         ca = info.poll_until_plateau(
             compressed_objects, tolerance_pct=pp.plateau_tolerance_pct,
             window_polls=pp.plateau_window_polls, poll_interval=pp.poll_interval_seconds,
-            max_timeout=pp.max_timeout_seconds)
+            max_timeout=_SETUP_TIMEOUT_S)
         log(f"[{entry.name}] compress-all: plateaued={ca['plateaued']} "
             f"objects={ca['series'][-1] if ca['series'] else 0}")
         srv.config_set("compression-min-idle-seconds", real_min_idle)  # restore the lever

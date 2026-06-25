@@ -86,3 +86,26 @@ def test_compression_on_run_succeeds_and_compresses(tmp_path):
     assert 0.0 < float(comp["compression_ratio"]) < 1.0, comp
     assert data["used_memory_max"] > 0
     assert data.get("plateaued") is True, data
+
+
+def test_compression_profile_not_stabilized_is_failed(tmp_path):
+    """If the equilibrium profile does not plateau within profile_prep.max_timeout_seconds,
+    the run is FAILED with reason `profile_not_stabilized` — never silently measured (R4.6).
+    The setup phases (auto-train, compress-all) have their own generous timeout, so a tiny
+    profile-prep timeout fails *only* the profile-prep stage."""
+    sb = env.server_binary_path()
+    cfg = _cfg(tmp_path)
+    cfg["configs"] = [cfg["configs"][1]]            # compression-on only (faster)
+    cfg["reference_config"] = "compression-on"
+    cfg["workload"]["target_tps"] = 1000            # easily achieved → not target_tps_not_achieved
+    cfg["profile_prep"]["max_timeout_seconds"] = 1  # too short for the profile to plateau
+    cfg["profile_prep"]["poll_interval_seconds"] = 1
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(cfg))
+
+    res = orchestrator.run_file(str(path), sb, env.benchmark_binary_path())
+    st = res["status"]
+    assert st["overall"] == "FAILED", st
+    it = st["configs"]["compression-on"]["iterations"][0]
+    assert it["status"] == "FAILED", it
+    assert it["reason"] == "profile_not_stabilized", it
