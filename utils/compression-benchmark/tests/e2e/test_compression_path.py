@@ -12,7 +12,7 @@ import os
 import pytest
 
 import orchestrator
-from lib import dictgen, env
+from lib import env
 
 pytestmark = [pytest.mark.needs_server, pytest.mark.needs_benchmark]
 
@@ -68,8 +68,6 @@ def _cfg(tmp_path):
 
 def test_compression_on_run_succeeds_and_compresses(tmp_path):
     sb = env.server_binary_path()
-    if dictgen.resolve_gen_zstd_dict(sb) is None:
-        pytest.skip("gen-zstd-dict helper not built (BUILD_ZSTD=yes)")
 
     cfg = _cfg(tmp_path)
     path = tmp_path / "run.json"

@@ -15,7 +15,7 @@ import signal as _signal
 import subprocess
 import time as _time
 
-from lib import benchmark, config, corpus, dictgen, info, provenance, server
+from lib import benchmark, config, info, provenance, server
 
 
 def representative_datasize(dm: config.DataModel) -> int:
@@ -112,6 +112,17 @@ def run_off_iteration(*, run, entry, server_binary, benchmark_binary, iter_dir,
     }
 
 
+def _wait_active_dict(srv, timeout):
+    """Poll until the server has auto-trained and promoted an active dictionary
+    (S1.2 first-training fires once DBSIZE >= compression-dict-min-training-keys)."""
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if int(srv.info("compression").get("compression_active_dict_id", "0")) != 0:
+            return True
+        _time.sleep(0.5)
+    return False
+
+
 def _sample_used_memory_until_done(spawned, srv, interval, max_wait):
     """Poll `used_memory` while the loaders run the measured window; return the
     series (the MAX is the headline memory metric, R6.1; transient decompression
@@ -158,19 +169,9 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
     try:
         srv.start()
 
-        # E1 Train: acquire a dict (DICT-IMPORT; S1.x COMPRESSION TRAIN not landed).
-        gen = dictgen.resolve_gen_zstd_dict(server_binary)
-        if gen is None:
-            raise RuntimeError("gen-zstd-dict helper not found (set VALKEY_DICTGEN)")
-        dict_b64 = dictgen.to_base64(
-            dictgen.train_dict(corpus.read_corpus(corpus_path), gen,
-                               os.path.join(iter_dir, "dict")))
-        srv.compression("dict-import", dict_b64)
-        if int(srv.info("compression").get("compression_active_dict_id", "0")) == 0:
-            raise RuntimeError("DICT-IMPORT did not produce an active dictionary")
-        srv.flushall()
-
-        # E2 Populate: exactly key_count keys, corpus-backed (compressible) values.
+        # E2 Populate first: exactly key_count keys, corpus-backed (compressible)
+        # values. No dict exists yet, so they store uncompressed — the server then
+        # auto-trains a dict on this keyspace (the realistic "train on your data" path).
         pr = subprocess.run(
             benchmark.populate_argv(benchmark_binary, host, port, dm.key_count,
                                     value_corpus=corpus_path),
@@ -178,6 +179,17 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         if pr.returncode != 0:
             bench_err = True
             log(f"[{entry.name}] populate failed (rc={pr.returncode}): {pr.stderr.strip()}")
+
+        # E1 Train: server-side automatic first-training (S1.2 BIO_COMPRESSION_TRAIN).
+        # The cron fires training once DBSIZE >= compression-dict-min-training-keys and
+        # promotes a dict; poll until it's active. (A manual `COMPRESSION TRAIN` command
+        # is a later PR; auto-training is the available — and realistic — path.)
+        if not _wait_active_dict(srv, pp.max_timeout_seconds):
+            raise RuntimeError(
+                f"server did not auto-train an active dict within {pp.max_timeout_seconds}s "
+                f"(need >= compression-dict-min-training-keys eligible keys)")
+        log(f"[{entry.name}] auto-trained active dict id="
+            f"{srv.info('compression').get('compression_active_dict_id')}")
 
         # E3 Compress-all (deterministic start): min-idle 0 + force sweep, wait to plateau.
         real_min_idle = srv.config_get("compression-min-idle-seconds")
