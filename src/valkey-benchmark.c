@@ -119,6 +119,7 @@ static struct config {
     int replace_placeholders;
     int keyspacelen;
     int sequential_replacement;
+    const char *value_corpus_path; /* --value-data corpus:FILE; NULL = default random data */
     int keepalive;
     int pipeline;
     long long start;
@@ -505,6 +506,126 @@ static void replacePlaceholders(char *cmd_data, int cmd_count) {
     }
 }
 
+/* ---- corpus-backed value data (--value-data corpus:FILE), R8.1 ----
+ * A separate, mutually-exclusive command-generation path. Incompatible with the
+ * in-place fixed-stride mechanism (which bakes one value and pokes only the key),
+ * so corpus mode rebuilds the SET command per request from the next corpus entry.
+ * The corpus file (orchestrator format: [4-byte BE len][bytes]* ) is loaded once
+ * into a single buffer; entries index into it. Read-only and static after load,
+ * so it is shared lock-free across client threads (only an atomic round-robin
+ * cursor is mutated). Pipeline is forced to 1 in corpus mode. */
+typedef struct {
+    const char *ptr;
+    uint32_t len;
+} corpusEntry;
+
+static struct {
+    char *buf;
+    size_t buflen;
+    corpusEntry *entries;
+    size_t n;
+    _Atomic uint64_t cursor;
+} corpus = {0};
+
+static int g_corpus_set_active = 0;   /* 1 while the corpus SET benchmark runs */
+static sds g_corpus_head = NULL;      /* "*3\r\n$3\r\nSET\r\n$<klen>\r\nkey<tag>:" */
+static size_t g_corpus_headlen = 0;
+static _Atomic uint64_t g_corpus_seqkey = 0;
+
+static void loadCorpus(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Could not open corpus file %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    if (fseek(fp, 0, SEEK_END) != 0 || ftell(fp) < 0) {
+        fprintf(stderr, "corpus file %s: seek/size error\n", path);
+        exit(1);
+    }
+    long sz = ftell(fp);
+    rewind(fp);
+    corpus.buf = zmalloc((size_t)sz);
+    if (sz > 0 && fread(corpus.buf, 1, (size_t)sz, fp) != (size_t)sz) {
+        fprintf(stderr, "corpus file %s: read error\n", path);
+        exit(1);
+    }
+    fclose(fp);
+    corpus.buflen = (size_t)sz;
+
+    /* Parse [4-byte big-endian len][bytes]* */
+    size_t cap = 1024;
+    corpus.entries = zmalloc(sizeof(corpusEntry) * cap);
+    corpus.n = 0;
+    size_t off = 0;
+    while (off + 4 <= corpus.buflen) {
+        unsigned char *p = (unsigned char *)corpus.buf + off;
+        uint32_t l = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        off += 4;
+        if (off + l > corpus.buflen) {
+            fprintf(stderr, "corpus file %s: truncated/malformed at offset %zu\n", path, off);
+            exit(1);
+        }
+        if (corpus.n == cap) {
+            cap *= 2;
+            corpus.entries = zrealloc(corpus.entries, sizeof(corpusEntry) * cap);
+        }
+        corpus.entries[corpus.n].ptr = corpus.buf + off;
+        corpus.entries[corpus.n].len = l;
+        corpus.n++;
+        off += l;
+    }
+    if (corpus.n == 0) {
+        fprintf(stderr, "corpus file %s contains no entries\n", path);
+        exit(1);
+    }
+}
+
+/* Precompute the constant command head for corpus SET. The key field is fixed
+ * width ("key<tag>:" + 12 digits), so its bulk header is constant; only the value
+ * bulk header varies per request. */
+static void prepareCorpusSetHead(const char *tag) {
+    int klen = 3 + (int)strlen(tag) + 1 + 12; /* "key" + tag + ":" + 12-digit */
+    g_corpus_head = sdscatprintf(sdsempty(), "*3\r\n$3\r\nSET\r\n$%d\r\nkey%s:", klen, tag);
+    g_corpus_headlen = sdslen(g_corpus_head);
+    atomic_store_explicit(&g_corpus_seqkey, 0, memory_order_relaxed);
+    atomic_store_explicit(&corpus.cursor, 0, memory_order_relaxed);
+}
+
+/* Rebuild "SET key<tag>:<12-digit> <value>" from the next corpus entry into the
+ * client's obuf (after its prefix), reusing the buffer's capacity. Hot path:
+ * one small snprintf for the value bulk header + one memcpy of the value bytes. */
+static void buildCorpusSetObuf(client c) {
+    uint64_t idx = atomic_fetch_add_explicit(&corpus.cursor, 1, memory_order_relaxed) % corpus.n;
+    const char *val = corpus.entries[idx].ptr;
+    uint32_t vlen = corpus.entries[idx].len;
+
+    uint64_t key = 0;
+    if (config.keyspacelen != 0) {
+        if (config.sequential_replacement)
+            key = atomic_fetch_add_explicit(&g_corpus_seqkey, 1, memory_order_relaxed);
+        else
+            key = (uint64_t)random();
+        key %= (uint64_t)config.keyspacelen;
+    }
+
+    sds o = c->obuf;
+    sdssetlen(o, c->prefixlen);
+    o[c->prefixlen] = '\0';
+    o = sdscatlen(o, g_corpus_head, g_corpus_headlen);
+    char kd[12];
+    for (int j = 11; j >= 0; j--) {
+        kd[j] = (char)('0' + key % 10);
+        key /= 10;
+    }
+    o = sdscatlen(o, kd, 12);
+    char vh[24];
+    int vhlen = snprintf(vh, sizeof(vh), "\r\n$%u\r\n", (unsigned)vlen);
+    o = sdscatlen(o, vh, (size_t)vhlen);
+    o = sdscatlen(o, val, vlen);
+    o = sdscatlen(o, "\r\n", 2);
+    c->obuf = o;
+}
+
 static void releasePausedClient(client c) {
     if (c->thread_id >= 0) {
         benchmarkThread *thread = config.threads[c->thread_id];
@@ -865,7 +986,10 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         /* Really initialize: replace keys and set start time. */
-        if (config.replace_placeholders) replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
+        if (g_corpus_set_active)
+            buildCorpusSetObuf(c);
+        else if (config.replace_placeholders)
+            replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
         if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
@@ -1720,6 +1844,15 @@ int parseOptions(int argc, char **argv) {
             if (config.keyspacelen < 0) config.keyspacelen = 0;
         } else if (!strcmp(argv[i], "--sequential")) {
             config.sequential_replacement = 1;
+        } else if (!strcmp(argv[i], "--value-data")) {
+            if (lastarg) goto invalid;
+            char *m = argv[++i];
+            if (!strncmp(m, "corpus:", 7)) {
+                config.value_corpus_path = m + 7;
+            } else {
+                printf("Unsupported --value-data '%s' (expected corpus:FILE)\n", m);
+                exit(1);
+            }
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2187,6 +2320,7 @@ int main(int argc, char **argv) {
     config.replace_placeholders = 0;
     config.keyspacelen = 0;
     config.sequential_replacement = 0;
+    config.value_corpus_path = NULL;
     config.quiet = 0;
     config.csv = 0;
     config.loop = 0;
@@ -2429,6 +2563,13 @@ int main(int argc, char **argv) {
     }
 
     /* Run default benchmark suite. */
+    if (config.value_corpus_path != NULL) {
+        loadCorpus(config.value_corpus_path);
+        if (config.pipeline != 1) {
+            fprintf(stderr, "Note: --value-data corpus forces pipeline=1 (was %d)\n", config.pipeline);
+            config.pipeline = 1;
+        }
+    }
     data = zmalloc(config.datasize + 1);
     do {
         genBenchmarkRandomData(data, config.datasize);
@@ -2443,9 +2584,22 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
-            benchmark("SET", cmd, len);
-            free(cmd);
+            if (config.value_corpus_path != NULL) {
+                /* Separate corpus path: rebuild the SET command per request from
+                 * the next corpus entry (writeHandler -> buildCorpusSetObuf). */
+                prepareCorpusSetHead(tag);
+                g_corpus_set_active = 1;
+                len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+                benchmark("SET", cmd, len);
+                free(cmd);
+                g_corpus_set_active = 0;
+                sdsfree(g_corpus_head);
+                g_corpus_head = NULL;
+            } else {
+                len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+                benchmark("SET", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("get")) {
