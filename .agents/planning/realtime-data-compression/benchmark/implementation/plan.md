@@ -132,9 +132,13 @@ Each is a C change in `src/valkey-benchmark.c` with a Tier-2 test written first.
   (`orchestrator.build_plan` + `_format_plan`; Tier-1 `tests/unit/test_dry_run.py`). (b)
   **reproducibility** — already covered: byte-identical corpus per seed (`tests/unit/test_corpus.py`)
   + e2e identical corpus hash (`tests/e2e/test_off_path.py`); a long repeated-run "soak" is
-  informational/slow and left as a manual step, not a CI gate (per §7.3 policy). **REMAINING:**
-  CI workflow that builds `valkey-server`+`valkey-benchmark` (`BUILD_ZSTD=yes`) and runs the
-  Tier-2/3 tiers (path-filtered to `utils/compression-benchmark/**`); optional NUMA pinning.
+  informational/slow and left as a manual step, not a CI gate (per §7.3 policy). (c) **CI** —
+  `.github/workflows/compression-benchmark.yml`: path-filtered (runs only on
+  `utils/compression-benchmark/**`, `src/compression*`, `src/valkey-benchmark.c`, the workflow
+  file), builds the server+benchmark (`make BUILD_ZSTD=yes`, which also builds the
+  `gen-zstd-dict` helper via `ALL_BUILD_PREREQUISITES`) and runs the full Tier-1/2/3 pytest
+  with `VALKEY_SERVER`/`VALKEY_BENCHMARK`/`VALKEY_CLI` pointed at `src/`. Optional NUMA pinning
+  not added (single-runner CI). **Phase F complete.**
 - [x] **F3** docs — **DONE.** `README.md` refreshed: status table (Phases A–F), binary-independent
   `--dry-run` load-plan example, compression-ON-via-auto-training how-to, the **S1.x server-side-training
   dependency note** (no manual `COMPRESSION TRAIN`; first-training-only), and a **run-JSON schema-reference**

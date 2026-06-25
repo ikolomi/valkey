@@ -44,9 +44,8 @@ reduction (histogram merge, percentiles, delta-vs-baseline) and the headline
 - **Built Valkey binaries** (from the repo root, with the compression feature):
 
   ```sh
-  make BUILD_ZSTD=yes        # produces src/valkey-server, src/valkey-cli, src/valkey-benchmark
-  make -C tests/helpers gen-zstd-dict   # only for the DICT-IMPORT component test; the
-                                        # orchestrator's compression path auto-trains
+  make BUILD_ZSTD=yes        # builds src/valkey-server, src/valkey-cli, src/valkey-benchmark,
+                             # and tests/helpers/gen-zstd-dict (the DICT-IMPORT test helper)
   ```
 
   The orchestrator core has **no third-party Python dependencies** (stdlib only).
