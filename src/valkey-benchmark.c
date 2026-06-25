@@ -127,6 +127,7 @@ static struct config {
     int key_distribution;          /* KEY_DIST_* */
     double zipf_theta;             /* --zipf-theta (zipf skew; != 1.0) */
     double zipf_zetan, zipf_eta, zipf_alpha; /* precomputed by zipfInit() */
+    int record_start_signal;       /* --record-start-signal SIGNUM; 0 = off (timer warmup) */
     int keepalive;
     int pipeline;
     long long start;
@@ -1820,6 +1821,10 @@ int parseOptions(int argc, char **argv) {
             config.duration = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--warmup")) {
             if (lastarg) goto invalid;
+            if (config.record_start_signal > 0) {
+                fprintf(stderr, "Options --warmup and --record-start-signal are mutually exclusive.\n");
+                exit(1);
+            }
             config.warmup_duration = atoi(argv[++i]);
 
         } else if (!strcmp(argv[i], "-k")) {
@@ -1905,6 +1910,17 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--zipf-theta")) {
             if (lastarg) goto invalid;
             config.zipf_theta = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--record-start-signal")) {
+            if (lastarg) goto invalid;
+            if (config.warmup_duration > 0) {
+                fprintf(stderr, "Options --warmup and --record-start-signal are mutually exclusive.\n");
+                exit(1);
+            }
+            config.record_start_signal = atoi(argv[++i]);
+            if (config.record_start_signal <= 0) {
+                printf("--record-start-signal requires a positive signal number\n");
+                exit(1);
+            }
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2218,6 +2234,17 @@ usage:
     exit(exit_status);
 }
 
+/* Windowed recording (R8.3): with --record-start-signal the measurement window
+ * starts when this signal is received (not on a timer), so the orchestrator can
+ * begin measuring exactly at the compression plateau. The handler is async-signal-
+ * safe (only sets the flag); showThroughput performs the warmup-exit reset when it
+ * observes the flag. */
+static volatile sig_atomic_t g_record_start = 0;
+static void recordStartSignalHandler(int sig) {
+    (void)sig;
+    g_record_start = 1;
+}
+
 long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
@@ -2233,7 +2260,12 @@ long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clie
     }
     int warmup_duration = atomic_load_explicit(&config.current_warmup_duration, memory_order_relaxed);
     if (warmup_duration > 0) {
-        if ((current_tick - config.start) >= (warmup_duration * 1000LL)) {
+        /* Exit warmup on the record-start signal (windowed recording, R8.3) when
+         * --record-start-signal is set; otherwise on the warmup timer (#2581). */
+        int exit_warmup = (config.record_start_signal > 0)
+                              ? (g_record_start != 0)
+                              : ((current_tick - config.start) >= (warmup_duration * 1000LL));
+        if (exit_warmup) {
             /* exit the warmup period, clear all stats */
             atomic_store_explicit(&config.current_warmup_duration, 0, memory_order_relaxed);
 
@@ -2375,6 +2407,7 @@ int main(int argc, char **argv) {
     config.value_corpus_path = NULL;
     config.key_distribution = KEY_DIST_UNIFORM;
     config.zipf_theta = 0.99;
+    config.record_start_signal = 0;
     config.quiet = 0;
     config.csv = 0;
     config.loop = 0;
@@ -2426,6 +2459,23 @@ int main(int argc, char **argv) {
             exit(1);
         }
         zipfInit();
+    }
+
+    /* Windowed recording (R8.3): start the measured window on a signal, not a timer.
+     * Enter warmup (so isBenchmarkFinished waits) and install the handler; the
+     * warmup-exit in showThroughput is gated on the signal flag instead of time. */
+    if (config.record_start_signal > 0) {
+        if (config.warmup_duration <= 0) config.warmup_duration = 1; /* enter warmup; gated by the signal */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = recordStartSignalHandler;
+        sa.sa_flags = SA_RESTART; /* don't surface EINTR to the client I/O paths */
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(config.record_start_signal, &sa, NULL) != 0) {
+            fprintf(stderr, "Could not install --record-start-signal handler for signal %d: %s\n",
+                    config.record_start_signal, strerror(errno));
+            exit(1);
+        }
     }
 
     tag = "";
