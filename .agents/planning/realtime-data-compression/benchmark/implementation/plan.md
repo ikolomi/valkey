@@ -103,12 +103,14 @@ Each is a C change in `src/valkey-benchmark.c` with a Tier-2 test written first.
 
 **Phase D exit / M2:** the **whole instrument is proven end-to-end on the `off` config** — corpus, populate, load, windowed measurement, artifact collection, validity verdict, reproducibility — *without S1.x*. Only the compression-specific phases remain.
 
-### Phase E — Compression phases (Tier-3) — GATED on in-tree S1.x training
+### Phase E — Compression phases (Tier-3)
 
-- [ ] **E1 Train phase.** (T) `COMPRESSION TRAIN` on written data → `compression_active_dict_id != 0`, then `FLUSHALL` → `DBSIZE == 0`. (I) implement (R4.1).
-- [ ] **E2 Compress-all.** (T) `min-idle-seconds=0` + `COMPRESSION SWEEP FORCE` (cranked) → `compression_compressed_objects == size-eligible count`. (I) implement (R4.3).
-- [ ] **E3 Profile-prep + plateau.** (T) switch to real `min-idle-seconds` + load → plateau detected; hot keys observably uncompressed / cold compressed; **no-plateau within `max_timeout_seconds` → FAILED `profile_not_stabilized`**. (I) implement (R4.4, R4.6).
-- [ ] **E4 Canonical 2-config run.** (T, e2e) the Q7 example (`off` + `compression-on` @ 256/16K/idle-3/sweeper-enabled) → SUCCESS run-status; both configs' raw artifacts present for the post-processor. (I) wire the compression-on path end-to-end.
+> **DONE (2026-06-25).** Implemented `lib/phases.run_compression_iteration` end-to-end. Dict acquisition uses **`COMPRESSION DICT-IMPORT`** (a dict trained out-of-process by `gen-zstd-dict` via `lib.dictgen`) because server-side `COMPRESSION TRAIN` (S1.x) isn't landed — when S1.x arrives, swap E1's import for `COMPRESSION TRAIN` (the rest of the phase machine is unchanged). The benchmark building blocks (corpus/zipf/record-start argv knobs + `spawn_loaders`/`record_start_loaders`/`collect_loaders`) landed first (increment 1). e2e `tests/e2e/test_compression_path.py` runs the tiny canonical off + compression-on run → SUCCESS + asserts real compression (`compressed_objects>0`, `ratio<1`, `plateaued`). **99 tests green.**
+
+- [x] **E1 Train phase.** **DONE** — dict via `dictgen.train_dict` (gen-zstd-dict) → `COMPRESSION DICT-IMPORT` → assert `compression_active_dict_id != 0` → `FLUSHALL`. (S1.x `COMPRESSION TRAIN` deferred; same registry/promotion path.) (R4.1)
+- [x] **E2 Compress-all.** **DONE** — save real `min-idle` via `config_get`, set `compression-min-idle-seconds 0`, `COMPRESSION SWEEP FORCE`, poll `compression_compressed_objects` to plateau, restore the real `min-idle`. (R4.3)
+- [x] **E3 Profile-prep + plateau.** **DONE** — one continuous load (`spawn_loaders` with corpus/zipf/`--record-start-signal`) under the real `min-idle`; `poll_until_plateau` on `compression_compressed_objects` → `plateaued`; on timeout `plateaued=False` → runstatus maps to FAILED `profile_not_stabilized`. (R4.4, R4.6)
+- [x] **E4 Canonical 2-config run.** **DONE** — `tests/e2e/test_compression_path.py` (tiny off + compression-on) → SUCCESS; per-config/iteration raw artifacts present; the measured window is started via `record_start_loaders(SIGUSR1)` after plateau, with `used_memory` sampled (MAX) during the window. (I) `orchestrator.run()` already dispatched compression configs to this path.
 
 **Phase E exit / M3:** the **canonical example runs end-to-end**, producing a run directory the (future) post-processor can consume.
 

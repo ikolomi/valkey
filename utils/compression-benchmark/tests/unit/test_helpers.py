@@ -195,3 +195,46 @@ def test_config_fails_if_any_iteration_fails():
     res = runstatus.decide({"c": [ok_iter(), ok_iter(crashed=True)]})
     assert res["configs"]["c"]["status"] == "FAILED"
     assert res["overall"] == "FAILED"
+
+
+# --- compression-mode argv knobs (Phase E prerequisites: B1/B3/B4) ----------- #
+
+def test_populate_argv_corpus_replaces_random_data():
+    from lib import benchmark
+    a = benchmark.populate_argv("vb", "h", 1, 100, datasize=512, value_corpus="/tmp/c.bin")
+    assert "--value-data" in a and "corpus:/tmp/c.bin" in a
+    assert "-d" not in a  # corpus supplies the values
+    assert "--sequential" in a
+    b = benchmark.populate_argv("vb", "h", 1, 100, datasize=512)
+    assert "-d" in b and "--value-data" not in b  # default unchanged
+
+
+def test_loader_argv_set_corpus_zipf_record_start():
+    from lib import benchmark
+    s = benchmark.loader_argv("vb", "h", 1, "set", 10, 5000, 30, 100,
+                              value_corpus="/c.bin", key_dist=("zipf", 0.99),
+                              record_start_signal=10)
+    assert "--value-data" in s and "corpus:/c.bin" in s and "-d" not in s
+    assert s[s.index("--key-distribution") + 1] == "zipf"
+    assert s[s.index("--zipf-theta") + 1] == "0.99"
+    assert s[s.index("--record-start-signal") + 1] == "10"
+    assert "--duration" in s
+
+
+def test_loader_argv_get_skips_value_data_keeps_keydist():
+    from lib import benchmark
+    g = benchmark.loader_argv("vb", "h", 1, "get", 10, 5000, 30, 100,
+                              value_corpus="/c.bin", key_dist=("zipf", 0.99),
+                              record_start_signal=10)
+    # GET carries no value → no --value-data even in corpus mode; key dist still applies.
+    assert "--value-data" not in g and "-d" in g
+    assert "--key-distribution" in g and "--record-start-signal" in g
+
+
+def test_loader_argv_uniform_and_defaults_are_backward_compatible():
+    from lib import benchmark
+    u = benchmark.loader_argv("vb", "h", 1, "set", 10, 5000, 30, 100, key_dist=("uniform",))
+    assert "--key-distribution" not in u  # uniform = default, omitted
+    o = benchmark.loader_argv("vb", "h", 1, "get", 10, 5000, 30, 100)
+    assert "-d" in o and "--value-data" not in o
+    assert "--key-distribution" not in o and "--record-start-signal" not in o
