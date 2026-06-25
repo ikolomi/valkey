@@ -123,11 +123,11 @@ static struct config {
     int replace_placeholders;
     int keyspacelen;
     int sequential_replacement;
-    const char *value_corpus_path; /* --value-data corpus:FILE; NULL = default random data */
-    int key_distribution;          /* KEY_DIST_* */
-    double zipf_theta;             /* --zipf-theta (zipf skew; != 1.0) */
+    const char *value_corpus_path;           /* --value-data corpus:FILE; NULL = default random data */
+    int key_distribution;                    /* KEY_DIST_* */
+    double zipf_theta;                       /* --zipf-theta (zipf skew; != 1.0) */
     double zipf_zetan, zipf_eta, zipf_alpha; /* precomputed by zipfInit() */
-    int record_start_signal;       /* --record-start-signal SIGNUM; 0 = off (timer warmup) */
+    int record_start_signal;                 /* --record-start-signal SIGNUM; 0 = off (timer warmup) */
     int keepalive;
     int pipeline;
     long long start;
@@ -564,8 +564,8 @@ static struct {
     _Atomic uint64_t cursor;
 } corpus = {0};
 
-static int g_corpus_set_active = 0;   /* 1 while the corpus SET benchmark runs */
-static sds g_corpus_head = NULL;      /* "*3\r\n$3\r\nSET\r\n$<klen>\r\nkey<tag>:" */
+static int g_corpus_set_active = 0; /* 1 while the corpus SET benchmark runs */
+static sds g_corpus_head = NULL;    /* "*3\r\n$3\r\nSET\r\n$<klen>\r\nkey<tag>:" */
 static size_t g_corpus_headlen = 0;
 static _Atomic uint64_t g_corpus_seqkey = 0;
 
