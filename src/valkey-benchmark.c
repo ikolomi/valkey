@@ -96,6 +96,10 @@ typedef enum readFromReplica {
 #define FUZZ_MODE_MALFORMED_COMMANDS (1 << 0)
 #define FUZZ_MODE_CONFIG_COMMANDS (1 << 1)
 
+/* --key-distribution modes (R8.x) */
+#define KEY_DIST_UNIFORM 0
+#define KEY_DIST_ZIPF 1
+
 static struct config {
     aeEventLoop *el;
     enum valkeyConnectionType ct;
@@ -120,6 +124,9 @@ static struct config {
     int keyspacelen;
     int sequential_replacement;
     const char *value_corpus_path; /* --value-data corpus:FILE; NULL = default random data */
+    int key_distribution;          /* KEY_DIST_* */
+    double zipf_theta;             /* --zipf-theta (zipf skew; != 1.0) */
+    double zipf_zetan, zipf_eta, zipf_alpha; /* precomputed by zipfInit() */
     int keepalive;
     int pipeline;
     long long start;
@@ -454,6 +461,33 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
     return;
 }
 
+/* Zipfian key generator (R8.x) — Gray et al. / YCSB ZipfianGenerator. zetan, eta
+ * and alpha are precomputed once by zipfInit() over the keyspace [0, keyspacelen);
+ * item 0 is the hottest. random() is already used across threads on this path. */
+static double zipfZeta(uint64_t n, double theta) {
+    double sum = 0.0;
+    for (uint64_t i = 1; i <= n; i++) sum += 1.0 / pow((double)i, theta);
+    return sum;
+}
+
+static void zipfInit(void) {
+    uint64_t n = (uint64_t)config.keyspacelen;
+    double theta = config.zipf_theta;
+    config.zipf_zetan = zipfZeta(n, theta);
+    config.zipf_alpha = 1.0 / (1.0 - theta);
+    double zeta2 = 1.0 + pow(0.5, theta); /* zeta(2, theta) */
+    config.zipf_eta = (1.0 - pow(2.0 / (double)n, 1.0 - theta)) / (1.0 - zeta2 / config.zipf_zetan);
+}
+
+static uint64_t zipfNext(void) {
+    double u = (double)random() / ((double)RAND_MAX + 1.0);
+    double uz = u * config.zipf_zetan;
+    if (uz < 1.0) return 0;
+    if (uz < 1.0 + pow(0.5, config.zipf_theta)) return 1;
+    return (uint64_t)((double)config.keyspacelen *
+                      pow(config.zipf_eta * u - config.zipf_eta + 1.0, config.zipf_alpha));
+}
+
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
     if (count == 0) return;
 
@@ -461,6 +495,8 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
     if (config.keyspacelen != 0) {
         if (config.sequential_replacement) {
             key = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
+        } else if (config.key_distribution == KEY_DIST_ZIPF) {
+            key = zipfNext();
         } else {
             key = random();
         }
@@ -603,6 +639,8 @@ static void buildCorpusSetObuf(client c) {
     if (config.keyspacelen != 0) {
         if (config.sequential_replacement)
             key = atomic_fetch_add_explicit(&g_corpus_seqkey, 1, memory_order_relaxed);
+        else if (config.key_distribution == KEY_DIST_ZIPF)
+            key = zipfNext();
         else
             key = (uint64_t)random();
         key %= (uint64_t)config.keyspacelen;
@@ -1853,6 +1891,20 @@ int parseOptions(int argc, char **argv) {
                 printf("Unsupported --value-data '%s' (expected corpus:FILE)\n", m);
                 exit(1);
             }
+        } else if (!strcmp(argv[i], "--key-distribution")) {
+            if (lastarg) goto invalid;
+            char *m = argv[++i];
+            if (!strcmp(m, "uniform")) {
+                config.key_distribution = KEY_DIST_UNIFORM;
+            } else if (!strcmp(m, "zipf")) {
+                config.key_distribution = KEY_DIST_ZIPF;
+            } else {
+                printf("Unsupported --key-distribution '%s' (expected uniform|zipf)\n", m);
+                exit(1);
+            }
+        } else if (!strcmp(argv[i], "--zipf-theta")) {
+            if (lastarg) goto invalid;
+            config.zipf_theta = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2321,6 +2373,8 @@ int main(int argc, char **argv) {
     config.keyspacelen = 0;
     config.sequential_replacement = 0;
     config.value_corpus_path = NULL;
+    config.key_distribution = KEY_DIST_UNIFORM;
+    config.zipf_theta = 0.99;
     config.quiet = 0;
     config.csv = 0;
     config.loop = 0;
@@ -2360,6 +2414,19 @@ int main(int argc, char **argv) {
 
     /* Set default for requests if not specified */
     if (config.requests < 0) config.requests = 100000;
+
+    /* Initialize the Zipfian key generator if requested (R8.x). */
+    if (config.key_distribution == KEY_DIST_ZIPF) {
+        if (config.keyspacelen < 2) {
+            fprintf(stderr, "--key-distribution zipf requires -r >= 2\n");
+            exit(1);
+        }
+        if (config.zipf_theta <= 0.0 || config.zipf_theta == 1.0) {
+            fprintf(stderr, "--zipf-theta must be > 0 and != 1.0 (got %g)\n", config.zipf_theta);
+            exit(1);
+        }
+        zipfInit();
+    }
 
     tag = "";
 
