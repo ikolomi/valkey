@@ -44,10 +44,12 @@ jobs:
         # DICT-IMPORT component test uses.
         run: make -j4 BUILD_ZSTD=yes SERVER_CFLAGS=-Werror
       - name: Run orchestrator tests (Tier-1/2/3)
+        # -v: per-test names + result; -ra: end-of-run summary of skips/xfails/etc
+        # (so a silently-skipped tier is visible); --durations: the slowest tests.
         run: |
           cd utils/compression-benchmark
           SRC="$(cd ../../src && pwd)"
           VALKEY_SERVER="$SRC/valkey-server" \
           VALKEY_BENCHMARK="$SRC/valkey-benchmark" \
           VALKEY_CLI="$SRC/valkey-cli" \
-            python3 -m pytest -q
+            python3 -m pytest -v -ra --durations=20
