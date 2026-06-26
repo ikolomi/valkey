@@ -36,6 +36,25 @@ def representative_datasize(dm: config.DataModel) -> int:
     return max(dm.value_size_min, min(dm.value_size_max, int(size)))
 
 
+_COMPRESSION_CONFIG_KEYS = (
+    "compression-master-switch", "compression-automatic-sweeper", "compression-threads",
+    "compression-min-value-size", "compression-max-value-size", "compression-min-idle-seconds",
+    "compression-dict-size", "compression-min-savings-ratio",
+)
+
+
+def _capture_compression_config(srv):
+    """CONFIG GET the applied compression knobs (the four size/threads knobs are not in
+    INFO compression), so a run records exactly what the server was configured with."""
+    cfg = {}
+    for k in _COMPRESSION_CONFIG_KEYS:
+        try:
+            cfg[k] = srv.config_get(k)
+        except Exception:
+            cfg[k] = None
+    return cfg
+
+
 def _copy_server_log(srv, iter_dir):
     try:
         src = os.path.join(srv.home_dir, "server.log")
@@ -85,6 +104,10 @@ def run_off_iteration(*, run, entry, server_binary, benchmark_binary, iter_dir,
 
         used_mem_post = int(srv.info("memory").get("used_memory", "0"))
         used_mem_max = max(used_mem_pre, used_mem_post)
+        try:
+            dbsize = int(srv.dbsize())
+        except Exception:
+            dbsize = None
         achieved = sum((r["achieved_rps"] or 0.0) for r in results)
         if any(r["returncode"] != 0 or r["achieved_rps"] is None for r in results):
             bench_err = True
@@ -95,8 +118,10 @@ def run_off_iteration(*, run, entry, server_binary, benchmark_binary, iter_dir,
                 "used_memory_pre": used_mem_pre,
                 "used_memory_post": used_mem_post,
                 "used_memory_max": used_mem_max,
+                "dbsize": dbsize,
                 "achieved_tps": achieved,
                 "compression": srv.info("compression"),
+                "compression_config": _capture_compression_config(srv),
                 "loaders": [{k: r[k] for k in ("command", "index", "returncode", "achieved_rps")}
                             for r in results],
             }, f, indent=2)
@@ -236,6 +261,10 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
 
         used_mem_max = max(mem_series) if mem_series else int(
             srv.info("memory").get("used_memory", "0"))
+        try:
+            dbsize = int(srv.dbsize())
+        except Exception:
+            dbsize = None
         achieved = sum((r["achieved_rps"] or 0.0) for r in results)
         if any(r["returncode"] != 0 or r["achieved_rps"] is None for r in results):
             bench_err = True
@@ -245,11 +274,13 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
             json.dump({
                 "used_memory_series": mem_series,
                 "used_memory_max": used_mem_max,
+                "dbsize": dbsize,
                 "achieved_tps": achieved,
                 "plateaued": plateaued,
                 "compress_all_series": ca["series"],
                 "profile_prep_series": prep["series"],
                 "compression": srv.info("compression"),
+                "compression_config": _capture_compression_config(srv),
                 "loaders": [{k: r[k] for k in ("command", "index", "returncode", "achieved_rps")}
                             for r in results],
             }, f, indent=2)

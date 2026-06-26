@@ -146,6 +146,27 @@ Each is a C change in `src/valkey-benchmark.c` with a Tier-2 test written first.
 
 **Phase F exit / M4:** instrument ready; hand-off point for the **post-processor** (separate idea-honing).
 
+- [x] **F4 (review hardening) — e2e coverage expansion.** **DONE.** On review the e2e suite was
+  judged too thin (e2e is the most reliable signal). Expanded **6 → 22 e2e tests** covering both
+  axes the review asked for: (a) **each config setting's effect** — `iterations`→N iteration
+  dirs/verdicts, `reference_config` recorded, command-ratio/`connections_total`/`max_clients_per_process`
+  → loader-process split (file counts), `target_tps` open-loop rate-limited (+ unmet-fails),
+  `seed`→reproducible corpus, `key_count`→`dbsize`, `master_switch` off/compression→compressed
+  objects 0/>0, `automatic_sweeper`/`min_value_size`/`max_value_size`/`min_idle_seconds`/`threads`
+  applied (verified via captured `CONFIG GET`), `threads=0`→trains-but-doesn't-compress; (b)
+  **output-file/data soundness** — `run-config.json` verbatim echo, full `provenance.json`,
+  `run-status.json` structure, `orchestrator.log` markers, per-iteration `info-measurement.json`
+  field consistency (memory MAX, byte totals vs ratio, net-saved>0, active dict, plateau, series),
+  loader artifacts present + recorded rps re-parses from stdout. Two data-soundness additions to
+  the artifact: `dbsize` and `compression_config` (CONFIG GET of 8 compression knobs — the
+  size/threads knobs aren't in `INFO compression`). Session-scoped fixtures (`off_run`, `comp_run`)
+  amortize the expensive runs. Full suite **119 passed**. Conscious gaps (covered elsewhere or not
+  e2e-observable): `pipeline` (not in artifacts), `key_distribution zipf` (Tier-2
+  `test_key_distribution`), deep value-size-distribution (Tier-1 `test_corpus`),
+  `min/max_value_size` *behavioral exclusion* (starves auto-training → no clean e2e; covered by
+  echo + the in-tree feature's own tests), standalone `master_switch=decompression` (a drain mode,
+  not a coherent benchmark run).
+
 ---
 
 ## 6. Milestones
