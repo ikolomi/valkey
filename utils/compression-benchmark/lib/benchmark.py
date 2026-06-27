@@ -69,13 +69,15 @@ def populate_argv(benchmark, host, port, key_count, datasize=3, value_corpus=Non
 
 def loader_argv(benchmark, host, port, command, connections, rps, duration,
                 key_count, datasize=3, pipeline=1, value_corpus=None,
-                key_dist=None, record_start_signal=None):
+                key_dist=None, record_start_signal=None, latency_dump=None):
     """One open-loop, duration-bounded loader process for a single command type.
 
     Optional compression-mode knobs: ``value_corpus`` (corpus-backed values for
     value-bearing commands, B1), ``key_dist`` = ``("zipf", theta)`` for a hotset
     (B3), ``record_start_signal`` (windowed recording — the measured window starts
-    on the signal, B4; ``--duration`` then bounds it)."""
+    on the signal, B4; ``--duration`` then bounds it), ``latency_dump`` (a file path
+    the loader writes its recorded hdr latency histogram to — independent of ``-q``,
+    Plan 1; enables lossless cross-process latency merge)."""
     argv = [
         benchmark, "-h", str(host), "-p", str(port),
         "-t", command, "-r", str(key_count), "-c", str(connections),
@@ -89,25 +91,42 @@ def loader_argv(benchmark, host, port, command, connections, rps, duration,
         argv += ["--key-distribution", "zipf", "--zipf-theta", str(key_dist[1])]
     if record_start_signal:
         argv += ["--record-start-signal", str(int(record_start_signal))]
+    if latency_dump:
+        argv += ["--latency-dump", str(latency_dump)]
     argv += ["--rps", str(max(1, int(round(rps)))), "--duration", str(duration), "-q"]
     return argv
 
 
+def _loader_base(command, index):
+    """Per-process artifact basename — the single source of truth shared by
+    :func:`build_load_argvs` (``.hist`` path) and :func:`spawn_loaders`
+    (``.stdout``/``.stderr``) so the names can never drift apart."""
+    return f"loader-{command}-{index}"
+
+
 def build_load_argvs(benchmark, host, port, split_result, duration, key_count,
                      datasize=3, pipeline=1, value_corpus=None, key_dist=None,
-                     record_start_signal=None):
-    """Flatten a :func:`split_processes` result into per-process loader specs."""
+                     record_start_signal=None, load_dir=None):
+    """Flatten a :func:`split_processes` result into per-process loader specs.
+
+    When ``load_dir`` is given, each (measured) loader is told to ``--latency-dump``
+    its recorded histogram to ``<load_dir>/loader-<cmd>-<idx>.hist`` and the path is
+    recorded on the spec as ``hist_path`` (Plan 2)."""
     out = []
     for entry in split_result:
         for idx, proc in enumerate(entry["processes"]):
+            hist_path = (os.path.join(load_dir, _loader_base(entry["command"], idx) + ".hist")
+                         if load_dir else None)
             out.append({
                 "command": entry["command"],
                 "index": idx,
+                "hist_path": hist_path,
                 "argv": loader_argv(benchmark, host, port, entry["command"],
                                     proc["connections"], proc["rps"], duration,
                                     key_count, datasize, pipeline,
                                     value_corpus=value_corpus, key_dist=key_dist,
-                                    record_start_signal=record_start_signal),
+                                    record_start_signal=record_start_signal,
+                                    latency_dump=hist_path),
             })
     return out
 
@@ -144,7 +163,7 @@ def spawn_loaders(loader_specs, work_dir, fifo_name="start.fifo", barrier_delay=
 
     spawned = []
     for spec in loader_specs:
-        base = f"loader-{spec['command']}-{spec['index']}"
+        base = _loader_base(spec["command"], spec["index"])
         out_path = os.path.join(work_dir, base + ".stdout")
         err_path = os.path.join(work_dir, base + ".stderr")
         out_fh = open(out_path, "w")
@@ -198,6 +217,7 @@ def collect_loaders(spawned, timeout_slack=15):
             "returncode": proc.returncode,
             "stdout_path": s["out_path"],
             "stderr_path": s["err_path"],
+            "hist_path": s["spec"].get("hist_path"),
             "achieved_rps": parse_achieved_rps(stdout_text),
         })
     return results

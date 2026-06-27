@@ -238,3 +238,39 @@ def test_loader_argv_uniform_and_defaults_are_backward_compatible():
     o = benchmark.loader_argv("vb", "h", 1, "get", 10, 5000, 30, 100)
     assert "-d" in o and "--value-data" not in o
     assert "--key-distribution" not in o and "--record-start-signal" not in o
+
+
+# --------------------------------------------------------------------------- #
+# --latency-dump wiring (Plan 2, P2.1) — measured loaders dump raw hdr buckets
+# --------------------------------------------------------------------------- #
+
+def test_loader_argv_latency_dump_appends_flag():
+    argv = benchmark.loader_argv("vb", "h", 7000, "get", 8, rps=5000, duration=10,
+                                 key_count=100, latency_dump="/tmp/x.hist")
+    assert argv[argv.index("--latency-dump") + 1] == "/tmp/x.hist"
+    assert "-q" in argv  # dump is independent of -q
+
+
+def test_loader_argv_no_latency_dump_by_default():
+    argv = benchmark.loader_argv("vb", "h", 7000, "get", 8, rps=5000, duration=10, key_count=100)
+    assert "--latency-dump" not in argv
+
+
+def test_build_load_argvs_load_dir_sets_per_process_hist_path():
+    split = benchmark.split_processes([Command("get", 0.8), Command("set", 0.2)],
+                                      8, 4, 2000)
+    loaders = benchmark.build_load_argvs("vb", "127.0.0.1", 7000, split,
+                                         duration=10, key_count=100, load_dir="/run/load")
+    for spec in loaders:
+        expected = f"/run/load/loader-{spec['command']}-{spec['index']}.hist"
+        assert spec["hist_path"] == expected
+        assert spec["argv"][spec["argv"].index("--latency-dump") + 1] == expected
+
+
+def test_build_load_argvs_without_load_dir_has_no_dump():
+    split = benchmark.split_processes([Command("get", 1.0)], 4, 4, 2000)
+    loaders = benchmark.build_load_argvs("vb", "127.0.0.1", 7000, split,
+                                         duration=10, key_count=100)
+    for spec in loaders:
+        assert spec.get("hist_path") is None
+        assert "--latency-dump" not in spec["argv"]

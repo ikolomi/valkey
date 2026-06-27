@@ -76,7 +76,9 @@ def test_off_info_measurement_fields_sound(off_run):
         im = _load(off_run["run_dir"], "off", f"iteration-{it}", "info-measurement.json")
         assert isinstance(im["used_memory_pre"], int) and im["used_memory_pre"] > 0
         assert isinstance(im["used_memory_post"], int) and im["used_memory_post"] > 0
-        assert im["used_memory_max"] == max(im["used_memory_pre"], im["used_memory_post"])
+        # used_memory_max now spans pre/post AND the sampled measurement-window series
+        assert im["used_memory_max"] == max(
+            [im["used_memory_pre"], im["used_memory_post"]] + im["memory"]["used_memory_series"])
         assert im["dbsize"] == key_count, "populate must cover exactly key_count keys"
         assert im["achieved_tps"] > 0
         # off config: the server reports compression off and nothing compressed

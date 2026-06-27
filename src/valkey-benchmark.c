@@ -137,6 +137,7 @@ static struct config {
     list *paused_clients;
     int quiet;
     int csv;
+    const char *latency_dump_file; /* --latency-dump FILE; NULL = off. Dumps recorded hdr buckets. */
     int loop;
     int idlemode;
     sds input_dbnumstr;
@@ -1284,6 +1285,27 @@ static void showRPSReport(void) {
     }
 }
 
+/* Dump the recorded latency-histogram buckets to config.latency_dump_file as
+ * "value_usec,count" lines (preceded by an hdr-params header), so the windowed
+ * per-process distributions can be summed losslessly across processes and
+ * iterations by a post-processor. Runs regardless of -q / --csv. */
+static void dumpLatencyHistogram(void) {
+    if (config.latency_dump_file == NULL) return;
+    FILE *fp = fopen(config.latency_dump_file, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "Could not open --latency-dump file \"%s\": %s\n", config.latency_dump_file, strerror(errno));
+        exit(1);
+    }
+    struct hdr_histogram *h = config.latency_histogram;
+    fprintf(fp, "# hdr lowest=%lld highest=%lld sigfig=%d total_count=%lld\n", (long long)h->lowest_discernible_value, (long long)h->highest_trackable_value, (int)h->significant_figures, (long long)h->total_count);
+    struct hdr_iter iter;
+    hdr_iter_recorded_init(&iter, h);
+    while (hdr_iter_next(&iter)) {
+        fprintf(fp, "%lld,%lld\n", (long long)iter.value_iterated_to, (long long)iter.count);
+    }
+    fclose(fp);
+}
+
 static void showReport(void) {
     const float reqpersec = (float)config.requests_finished / ((float)config.totlatency / 1000.0f);
     const float p0 = ((float)hdr_min(config.latency_histogram)) / 1000.0f;
@@ -1292,6 +1314,9 @@ static void showReport(void) {
     const float p99 = hdr_value_at_percentile(config.latency_histogram, 99.0) / 1000.0f;
     const float p100 = ((float)hdr_max(config.latency_histogram)) / 1000.0f;
     const float avg = hdr_mean(config.latency_histogram) / 1000.0f;
+
+    /* Dump the raw windowed histogram first — independent of -q / --csv. */
+    dumpLatencyHistogram();
 
     if (!config.quiet && !config.csv) {
         printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
@@ -1921,6 +1946,9 @@ int parseOptions(int argc, char **argv) {
                 printf("--record-start-signal requires a positive signal number\n");
                 exit(1);
             }
+        } else if (!strcmp(argv[i], "--latency-dump")) {
+            if (lastarg) goto invalid;
+            config.latency_dump_file = argv[++i];
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2182,6 +2210,9 @@ usage:
         "                    the number of times the command sequence is sent in each\n"
         "                    pipeline.\n",
         " -q                 Quiet. Just show query/sec values\n"
+        " --latency-dump <file> After the measured window, dump the recorded latency\n"
+        "                    histogram to <file> ('value_usec,count' per line, with an\n"
+        "                    hdr-params header) for lossless cross-process merging. Works with -q.\n"
         " --precision        Number of decimal places to display in latency output\n"
         "                    (default 0)\n"
         " --csv              Output in CSV format\n"
@@ -2410,6 +2441,7 @@ int main(int argc, char **argv) {
     config.record_start_signal = 0;
     config.quiet = 0;
     config.csv = 0;
+    config.latency_dump_file = NULL;
     config.loop = 0;
     config.idlemode = 0;
     config.clients = listCreate();

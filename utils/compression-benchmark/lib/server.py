@@ -25,6 +25,17 @@ def free_port() -> int:
     return port
 
 
+def _parse_proc_stat_cpu(text):
+    """Parse utime (field 14) + stime (field 15) from /proc/<pid>/stat contents.
+
+    The ``comm`` field (2) is wrapped in parens and may itself contain spaces or
+    parens, so we split *after* the last ``)`` — the remaining tokens start at the
+    ``state`` field (3), making utime = token[11], stime = token[12]."""
+    rparen = text.rfind(")")
+    rest = text[rparen + 1:].split()
+    return int(rest[11]), int(rest[12])
+
+
 class Server:
     def __init__(self, server_binary, servers_directory, name, port,
                  args=None, cli_binary=None, copy_binary=True):
@@ -134,6 +145,18 @@ class Server:
 
     def dbsize(self):
         return int(self.cli("dbsize"))
+
+    def process_cpu_jiffies(self):
+        """``(utime, stime)`` clock ticks for the server process from
+        ``/proc/<pid>/stat`` (includes all threads — bio/compression workers), or
+        ``None`` if unavailable (process gone / non-Linux)."""
+        if self.proc is None:
+            return None
+        try:
+            with open(f"/proc/{self.proc.pid}/stat") as f:
+                return _parse_proc_stat_cpu(f.read())
+        except Exception:
+            return None
 
     def flushall(self):
         self.cli("flushall")
