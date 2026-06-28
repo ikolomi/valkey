@@ -25,6 +25,16 @@ def test_build_plan_structure_no_binaries():
     assert plan["target_tps"] == 250000
     assert plan["data_model"]["key_count"] == 2000000
     assert plan["data_model"]["seed"] == 1234
+    # enriched data model + workload knobs (idea-honing UX feedback)
+    dm = plan["data_model"]
+    assert dm["value_shape"] == "json"
+    assert dm["value_size_distribution"] == "lognormal:512.0:0.8"
+    assert dm["value_size_min"] == 256 and dm["value_size_max"] == 16384
+    assert dm["key_distribution"] == "zipf:0.99"
+    assert dm["corpus_entries"] == 50000
+    assert plan["setup_timeout_seconds"] == 180.0       # default
+    assert plan["max_clients_per_process"] == 64 and plan["pipeline"] == 1
+    assert plan["measurement_duration_seconds"] == 60
 
     split = {s["command"]: s for s in plan["workload_split"]}
     assert set(split) == {"get", "set"}
@@ -50,6 +60,8 @@ def test_dry_run_cli_exits_zero_and_prints_plan(capsys):
     out = capsys.readouterr().out
     assert "compression-on" in out and "off" in out
     assert "get" in out and "set" in out
+    assert "shape=json" in out and "zipf:0.99" in out and "lognormal:512.0:0.8" in out
+    assert "setup_timeout" in out
 
 
 def test_dry_run_invalid_config_raises(tmp_path):

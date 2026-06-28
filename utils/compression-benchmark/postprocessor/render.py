@@ -32,111 +32,120 @@ def _figures(report):
     baseline = report.get("baseline")
     names = list(configs)
     others = [n for n in names if n != baseline]
+    base = configs.get(baseline, {})
 
-    # --- Pareto: X = memory saved %, Y = latency penalty; one trace per percentile.
-    pareto_traces = []
+    def saved_bytes(b, c):
+        return (b - c) if (b is not None and c is not None) else None
+
+    def saved_pct(b, c):
+        return (100.0 * (b - c) / b) if (b not in (None, 0) and c is not None) else None
+
+    # --- Pareto: X = memory saved, Y = latency penalty; one trace per percentile.
+    # Toggle (abs ↔ %): X = saved bytes ↔ saved %, Y = penalty µs ↔ %.
+    base_rss = _g(base, "memory", "rss_bytes")
+    x_abs = [[saved_bytes(base_rss, _g(configs, n, "memory", "rss_bytes")) for n in others]]
+    x_pct = [[_g(configs, n, "memory", "memory_saved_pct") for n in others]]
+    pareto_traces, py_abs, py_pct = [], [], []
     for p in PERCENTILE_ORDER:
+        ya = [_g(configs, n, "latency", "aggregate", p, "delta_usec") for n in others]
+        yp = [_g(configs, n, "latency", "aggregate", p, "delta_pct") for n in others]
+        py_abs.append(ya)
+        py_pct.append(yp)
         pareto_traces.append({
             "type": "scatter", "mode": "markers+text", "name": p,
-            "x": [_g(configs, n, "memory", "memory_saved_pct") for n in others],
-            "y": [_g(configs, n, "latency", "aggregate", p, "delta_usec") for n in others],
-            "customdata": [_g(configs, n, "latency", "aggregate", p, "delta_pct") for n in others],
-            "text": others, "textposition": "top center",
+            "x": x_abs[0], "y": ya, "text": others, "textposition": "top center",
             "visible": True if p in DEFAULT_VISIBLE else "legendonly",
         })
     pareto = {
-        "div": "chart-pareto", "toggle": True, "traces": pareto_traces,
+        "div": "chart-pareto", "traces": pareto_traces,
         "layout": {"title": "Memory saved vs latency penalty (Pareto)",
-                   "xaxis": {"title": "Memory saved vs baseline (%)"},
-                   "yaxis": {"title": "Latency penalty vs baseline (µs)"},
-                   "hovermode": "closest"},
+                   "xaxis": {"title": "Memory saved vs baseline (bytes)"},
+                   "yaxis": {"title": "Latency penalty vs baseline (µs)"}, "hovermode": "closest"},
+        "modes": {
+            "abs": {"x": x_abs * len(PERCENTILE_ORDER), "y": py_abs,
+                    "xtitle": "Memory saved vs baseline (bytes)", "ytitle": "Latency penalty vs baseline (µs)"},
+            "pct": {"x": x_pct * len(PERCENTILE_ORDER), "y": py_pct,
+                    "xtitle": "Memory saved vs baseline (%)", "ytitle": "Latency penalty vs baseline (%)"},
+        },
     }
 
-    # --- Per-percentile delta: X = percentile, one trace per (non-baseline) config.
-    pd_traces = []
+    # --- Per-percentile latency delta: X = percentile, one trace per non-baseline config.
+    pd_traces, pd_abs, pd_pct = [], [], []
     for n in others:
-        pd_traces.append({
-            "type": "scatter", "mode": "lines+markers", "name": n,
-            "x": PERCENTILE_ORDER,
-            "y": [_g(configs, n, "latency", "aggregate", p, "delta_usec") for p in PERCENTILE_ORDER],
-            "customdata": [_g(configs, n, "latency", "aggregate", p, "delta_pct") for p in PERCENTILE_ORDER],
-        })
+        ya = [_g(configs, n, "latency", "aggregate", p, "delta_usec") for p in PERCENTILE_ORDER]
+        yp = [_g(configs, n, "latency", "aggregate", p, "delta_pct") for p in PERCENTILE_ORDER]
+        pd_abs.append(ya)
+        pd_pct.append(yp)
+        pd_traces.append({"type": "scatter", "mode": "lines+markers", "name": n,
+                          "x": PERCENTILE_ORDER, "y": ya})
     percentile_delta = {
-        "div": "chart-percentile-delta", "toggle": True, "traces": pd_traces,
+        "div": "chart-percentile-delta", "traces": pd_traces,
         "layout": {"title": "Latency delta vs baseline, by percentile "
                             "(tail percentiles use fewer samples — see Measurement coverage)",
                    "xaxis": {"title": "percentile"}, "yaxis": {"title": "Δ latency vs baseline (µs)"}},
+        "modes": {
+            "abs": {"y": pd_abs, "ytitle": "Δ latency vs baseline (µs)"},
+            "pct": {"y": pd_pct, "ytitle": "Δ latency vs baseline (%)"},
+        },
     }
 
-    # --- Memory saved vs baseline (%), the delta view (consistent with latency-delta).
+    # --- Memory saved vs baseline, by percentile of the steady-window sample series.
+    # One chart, RSS + used_memory series per non-baseline config; toggle bytes ↔ %.
+    _MEM_PCTS = ["min", "p25", "median", "p75", "p90", "p95", "p99", "max"]
+    ms_traces, ms_abs, ms_pct = [], [], []
+    for n in others:
+        for label, stat in (("RSS", "rss_stats"), ("used_memory", "used_stats")):
+            ba = [saved_bytes(_g(base, "memory", stat, k), _g(configs, n, "memory", stat, k)) for k in _MEM_PCTS]
+            bp = [saved_pct(_g(base, "memory", stat, k), _g(configs, n, "memory", stat, k)) for k in _MEM_PCTS]
+            ms_abs.append(ba)
+            ms_pct.append(bp)
+            ms_traces.append({"type": "scatter", "mode": "lines+markers",
+                              "name": (f"{n} {label}" if len(others) > 1 else label),
+                              "x": _MEM_PCTS, "y": ba})
     mem_saved = {
-        "div": "chart-memory-saved", "traces": [
-            {"type": "bar", "name": "RSS saved % (headline)", "x": names,
-             "y": [_g(configs, n, "memory", "memory_saved_pct") for n in names]},
-            {"type": "bar", "name": "used_memory saved %", "x": names,
-             "y": [_g(configs, n, "memory", "used_memory_saved_pct") for n in names]},
-        ],
-        "layout": {"title": "Memory saved vs baseline (%) — higher is better",
-                   "barmode": "group", "yaxis": {"title": "% saved vs baseline"}},
+        "div": "chart-memory-saved", "traces": ms_traces,
+        "layout": {"title": "Memory saved vs baseline, by percentile of the RSS/used sample series "
+                            "(higher is better)",
+                   "xaxis": {"title": "percentile of the memory sample series"},
+                   "yaxis": {"title": "Memory saved vs baseline (bytes)"}},
+        "modes": {
+            "abs": {"y": ms_abs, "ytitle": "Memory saved vs baseline (bytes)"},
+            "pct": {"y": ms_pct, "ytitle": "Memory saved vs baseline (%)"},
+        },
     }
 
-    # --- Absolute memory breakdown: RSS (headline) vs used_memory, MEDIAN over the
-    # steady-state window per config.
-    mem_breakdown = {
-        "div": "chart-memory-breakdown", "traces": [
-            {"type": "bar", "name": "RSS (physical)", "x": names,
-             "y": [_g(configs, n, "memory", "rss_bytes") for n in names]},
-            {"type": "bar", "name": "used_memory (logical)", "x": names,
-             "y": [_g(configs, n, "memory", "used_memory_bytes") for n in names]},
-        ],
-        "layout": {"title": "Absolute memory — MEDIAN over the steady-state window "
-                            "(RSS vs used_memory; gap = fragmentation)",
-                   "barmode": "group", "yaxis": {"title": "bytes"}},
-    }
-
-    # --- Memory stability: RSS median with min–max whiskers per config.
-    med = [_g(configs, n, "memory", "rss_stats", "median") for n in names]
-    mx = [_g(configs, n, "memory", "rss_stats", "max") for n in names]
-    mn = [_g(configs, n, "memory", "rss_stats", "min") for n in names]
-    mem_stability = {
-        "div": "chart-memory-stability", "traces": [{
-            "type": "scatter", "mode": "markers", "name": "RSS median (min–max)",
-            "x": names, "y": med,
-            "error_y": {"type": "data", "symmetric": False,
-                        "array": [(a - b) if (a is not None and b is not None) else None for a, b in zip(mx, med)],
-                        "arrayminus": [(b - a) if (a is not None and b is not None) else None for a, b in zip(mn, med)]},
-        }],
-        "layout": {"title": "RSS stability (median + min–max across kept iterations)",
-                   "yaxis": {"title": "bytes"}},
-    }
-
-    # --- Heatmap: rows = config/command, cols = percentile, z = Δ latency (µs).
+    # --- Heatmap: rows = command (or config/command if >1 config), cols = percentile.
     z, yrows = [], []
+    single = len(others) == 1
     for n in others:
         for cmd in sorted(_g(configs, n, "latency", "per_command", default={})):
-            yrows.append(f"{n}/{cmd}")
+            yrows.append(cmd if single else f"{n}/{cmd}")
             z.append([_g(configs, n, "latency", "per_command", cmd, p, "delta_usec")
                       for p in PERCENTILE_ORDER])
     heatmap = {
         "div": "chart-heatmap", "traces": [{
             "type": "heatmap", "x": PERCENTILE_ORDER, "y": yrows, "z": z, "colorscale": "Reds",
+            "colorbar": {"title": "Δ µs"},
         }],
-        "layout": {"title": "Per-command latency penalty (µs) vs baseline"},
+        "layout": {"title": "Per-command latency penalty (µs) vs baseline",
+                   "xaxis": {"title": "percentile"},
+                   "yaxis": {"title": ("command" if single else "config / command"),
+                             "automargin": True}},
     }
 
-    # --- Operational headroom: server-process CPU% per config.
+    # --- Operational headroom: server-PROCESS CPU% per config (not system-wide).
     headroom = {
         "div": "chart-headroom", "traces": [{
-            "type": "bar", "name": "server CPU %", "x": names,
+            "type": "bar", "name": "valkey-server process CPU %", "x": names,
             "y": [_g(configs, n, "cpu", "pct_total") for n in names],
         }],
-        "layout": {"title": "Operational headroom — server-process CPU%",
-                   "yaxis": {"title": "CPU %"}},
+        "layout": {"title": "Operational headroom — valkey-server PROCESS CPU% "
+                            "(all server threads incl. compression workers; not system-wide)",
+                   "yaxis": {"title": "CPU % (process)"}},
     }
 
     return {"pareto": pareto, "percentile-delta": percentile_delta,
-            "memory-saved": mem_saved, "memory-breakdown": mem_breakdown,
-            "memory-stability": mem_stability, "heatmap": heatmap, "headroom": headroom}
+            "memory-saved": mem_saved, "heatmap": heatmap, "headroom": headroom}
 
 
 def _fmt(v, suffix=""):
@@ -167,28 +176,32 @@ def _workload_header(report):
 
 
 def _coverage_table(report):
-    """Measurement coverage — so the reader can judge tail reliability: a p99.9 is
-    only ~0.1% of the request count, p99.99 ~0.01% — small counts ⇒ noisy tails."""
+    """Measurement coverage — so the reader can judge tail reliability. The samples that
+    *determine* a percentile p are the ones in its tail ≈ requests × (1 − p/100); small
+    counts ⇒ noisy percentiles."""
+    pcts = [("p50", 0.5), ("p90", 0.1), ("p95", 0.05), ("p99", 0.01),
+            ("p99.9", 1e-3), ("p99.99", 1e-4), ("p99.999", 1e-5)]
     configs = report.get("configs", {})
-    head = ("<tr><th>Config</th><th>iterations (kept/total)</th><th>requests measured</th>"
-            "<th>≈p99.9 samples</th><th>≈p99.99 samples</th><th>memory samples</th></tr>")
+    head = ("<tr><th>Config</th><th>iterations<br>(kept/total)</th><th>requests</th>"
+            "<th>memory<br>samples</th>"
+            + "".join(f"<th>≈{lbl}<br>tail samples</th>" for lbl, _ in pcts) + "</tr>")
     rows = []
     for n, c in configs.items():
         s = _g(c, "samples", default={})
         req = s.get("requests_total")
-        s999 = f"{req/1000:.0f}" if isinstance(req, (int, float)) else "n/a"
-        s9999 = f"{req/10000:.0f}" if isinstance(req, (int, float)) else "n/a"
+        tail = "".join(
+            f"<td>{round(req * frac)}</td>" if isinstance(req, (int, float)) else "<td>n/a</td>"
+            for _, frac in pcts)
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(n))}</td>"
             f"<td>{s.get('iterations_kept')}/{s.get('iterations_total')}</td>"
             f"<td>{req if req is not None else 'n/a'}</td>"
-            f"<td>{s999}</td><td>{s9999}</td>"
             f"<td>{s.get('memory_samples')}</td>"
-            "</tr>")
-    note = ('<p style="color:#666;font-size:0.9em">Tail percentiles use few samples '
-            '(≈ requests × the tail fraction). Treat p99.9 / p99.99 with &lt; a few hundred '
-            'samples as noisy — widen the measurement window or add iterations to tighten them.</p>')
+            f"{tail}</tr>")
+    note = ('<p style="color:#666;font-size:0.9em">"tail samples" ≈ requests × (1 − p/100) — the '
+            'number of observations beyond percentile p. Treat percentiles with &lt; a few hundred '
+            'tail samples as noisy; widen the measurement window or add iterations to tighten them.</p>')
     return f'<div id="table-coverage"><h2>Measurement coverage</h2><table>{head}{"".join(rows)}</table>{note}</div>'
 
 
@@ -214,22 +227,28 @@ def _summary_table(report):
 
 _JS = """
 var FIGS = __FIGS_JSON__;
-var ORIG = {};
+var MODES = {};
 Object.keys(FIGS).forEach(function(k){
   var f = FIGS[k];
   Plotly.newPlot(f.div, f.traces, f.layout, {responsive: true});
-  if (f.toggle) {
-    ORIG[f.div] = { abs: f.traces.map(function(t){ return t.y; }),
-                    pct: f.traces.map(function(t){ return t.customdata; }) };
-  }
+  if (f.modes) MODES[f.div] = f.modes;   // charts that support absolute↔% toggling
 });
 var pctMode = false;
 function toggleMode(){
   pctMode = !pctMode;
+  var m = pctMode ? 'pct' : 'abs';
   document.getElementById('mode-toggle').textContent =
-      pctMode ? 'Show absolute (µs)' : 'Show % delta';
-  Object.keys(ORIG).forEach(function(div){
-    Plotly.restyle(div, {y: pctMode ? ORIG[div].pct : ORIG[div].abs});
+      pctMode ? 'Show absolute values' : 'Show % vs baseline';
+  Object.keys(MODES).forEach(function(div){
+    var md = MODES[div][m];
+    var up = {};
+    if (md.y) up.y = md.y;
+    if (md.x) up.x = md.x;
+    Plotly.restyle(div, up);                       // swap the data
+    var rl = {};
+    if (md.ytitle) rl['yaxis.title.text'] = md.ytitle;
+    if (md.xtitle) rl['xaxis.title.text'] = md.xtitle;
+    Plotly.relayout(div, rl);                       // and the axis labels
   });
 }
 """
@@ -252,7 +271,7 @@ def render(report):
         "</head><body>\n"
         "<h1>Compression Benchmark Report</h1>\n"
         f"{_workload_header(report)}\n"
-        '<button id="mode-toggle" onclick="toggleMode()">Show % delta</button>\n'
+        '<button id="mode-toggle" onclick="toggleMode()">Show % vs baseline</button>\n'
         f"{divs}\n"
         f"{_summary_table(report)}\n"
         f"{_coverage_table(report)}\n"

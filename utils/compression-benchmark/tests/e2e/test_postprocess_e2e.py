@@ -51,8 +51,8 @@ def test_postprocess_real_pipeline(comp_run):
     # report.html renders, self-contained, with the chart containers
     html = open(os.path.join(run_dir, "report.html")).read()
     assert html.startswith("<!DOCTYPE html>")
-    for div in ("chart-pareto", "chart-percentile-delta", "chart-memory-breakdown",
-                "chart-heatmap", "table-summary"):
+    for div in ("chart-pareto", "chart-percentile-delta", "chart-memory-saved",
+                "chart-heatmap", "table-summary", "table-coverage"):
         assert f'id="{div}"' in html
 
 

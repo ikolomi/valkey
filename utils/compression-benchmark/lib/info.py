@@ -26,7 +26,8 @@ def detect_plateau(series, tolerance_pct, window_polls):
 
 
 def poll_until_plateau(sample_fn, tolerance_pct, window_polls, poll_interval,
-                       max_timeout, clock=None, sleep=None):
+                       max_timeout, clock=None, sleep=None, progress=None,
+                       progress_every=5.0):
     """Poll ``sample_fn()`` every ``poll_interval`` seconds, appending to a series,
     until :func:`detect_plateau` is True or ``max_timeout`` elapses (R4.6).
 
@@ -40,18 +41,24 @@ def poll_until_plateau(sample_fn, tolerance_pct, window_polls, poll_interval,
     sleep = sleep or _time.sleep
     series = []
     start = clock()
+    last_prog = start
     while True:
         series.append(sample_fn())
         if detect_plateau(series, tolerance_pct, window_polls):
             return {"plateaued": True, "series": series, "elapsed": clock() - start}
-        if clock() - start >= max_timeout:
-            return {"plateaued": False, "series": series, "elapsed": clock() - start}
+        now = clock()
+        if now - start >= max_timeout:
+            return {"plateaued": False, "series": series, "elapsed": now - start}
+        if progress and now - last_prog >= progress_every:
+            progress(f"plateau wait: latest={series[-1]} ({now - start:.0f}s, {len(series)} polls)")
+            last_prog = now
         sleep(poll_interval)
 
 
 
 def poll_until_swept(probe_fn, poll_interval, max_timeout, stable_polls=4,
-                     start_grace_polls=2, clock=None, sleep=None):
+                     start_grace_polls=2, clock=None, sleep=None, progress=None,
+                     progress_every=5.0):
     """Poll until a compress-all sweep has truly COMPLETED, not merely stalled.
 
     ``probe_fn()`` returns ``(compressed_objects, candidates_pending)``. Completion
@@ -74,6 +81,7 @@ def poll_until_swept(probe_fn, poll_interval, max_timeout, stable_polls=4,
     sleep = sleep or _time.sleep
     series = []
     start = clock()
+    last_prog = start
     baseline = None
     saw_activity = False
     while True:
@@ -87,6 +95,10 @@ def poll_until_swept(probe_fn, poll_interval, max_timeout, stable_polls=4,
         steady = len(series) >= stable_polls and len(set(series[-stable_polls:])) == 1
         if started and pending == 0 and steady:
             return {"completed": True, "series": series, "elapsed": clock() - start}
-        if clock() - start >= max_timeout:
-            return {"completed": False, "series": series, "elapsed": clock() - start}
+        now = clock()
+        if now - start >= max_timeout:
+            return {"completed": False, "series": series, "elapsed": now - start}
+        if progress and now - last_prog >= progress_every:
+            progress(f"compress-all: {compressed} compressed, {pending} pending ({now - start:.0f}s)")
+            last_prog = now
         sleep(poll_interval)

@@ -29,8 +29,12 @@ def run(run_obj: config.RunConfig, raw: dict, server_binary: str,
     logf = open(os.path.join(run_dir, "orchestrator.log"), "w")
 
     def log(m):
-        logf.write(m + "\n")
+        # Mirror to the console (stderr) with a timestamp so a human can follow a long
+        # run live (heartbeats during compress-all / measurement), not just the file.
+        line = f"[{time.strftime('%H:%M:%S')}] {m}"
+        logf.write(line + "\n")
         logf.flush()
+        print(line, file=sys.stderr, flush=True)
 
     log(f"run start: {run_obj.description!r} → {run_dir}")
 
@@ -58,7 +62,7 @@ def run(run_obj: config.RunConfig, raw: dict, server_binary: str,
         for it in range(run_obj.iterations):
             iter_dir = os.path.join(run_dir, entry.name, f"iteration-{it}")
             port = server.free_port()
-            log(f"[{entry.name}] iteration {it} (port {port}, off={is_off})")
+            log(f"[{entry.name}] iteration {it} (port {port})")
             if is_off:
                 res = phases.run_off_iteration(
                     run=run_obj, entry=entry, server_binary=sb,
@@ -75,6 +79,8 @@ def run(run_obj: config.RunConfig, raw: dict, server_binary: str,
     with open(os.path.join(run_dir, "run-status.json"), "w") as f:
         json.dump(status, f, indent=2)
     log(f"overall: {status['overall']}")
+    log(f"run directory: {run_dir}")
+    log(f"generate charts: python3 -m postprocessor.postprocess {run_dir}")
     logf.close()
     return {"run_dir": run_dir, "status": status}
 
@@ -94,7 +100,11 @@ def build_plan(run_obj, server_binary, benchmark_binary):
     launching it."""
     from lib import benchmark as _bm
 
+    def _fmt_dist(t):
+        return ":".join(str(x) for x in t)
+
     wl = run_obj.workload
+    dm = run_obj.data_model
     split = _bm.split_processes(
         wl.commands, wl.connections_total, wl.max_clients_per_process, wl.target_tps)
     return {
@@ -102,8 +112,12 @@ def build_plan(run_obj, server_binary, benchmark_binary):
         "benchmark_binary": benchmark_binary or "<unresolved>",
         "iterations": run_obj.iterations,
         "reference_config": run_obj.reference_config,
+        "setup_timeout_seconds": run_obj.setup_timeout_seconds,
         "target_tps": wl.target_tps,
         "connections_total": wl.connections_total,
+        "max_clients_per_process": wl.max_clients_per_process,
+        "pipeline": wl.pipeline,
+        "measurement_duration_seconds": wl.measurement_duration_seconds,
         "loader_processes_total": sum(s["n_procs"] for s in split),
         "workload_split": split,
         "configs": [
@@ -113,23 +127,33 @@ def build_plan(run_obj, server_binary, benchmark_binary):
             for e in run_obj.configs
         ],
         "data_model": {
-            "key_count": run_obj.data_model.key_count,
-            "seed": run_obj.data_model.seed,
-            "corpus_entries": run_obj.data_model.corpus_entries,
+            "value_shape": dm.value_shape,
+            "value_size_distribution": _fmt_dist(dm.value_size_distribution),
+            "value_size_min": dm.value_size_min,
+            "value_size_max": dm.value_size_max,
+            "key_distribution": _fmt_dist(dm.key_distribution),
+            "key_count": dm.key_count,
+            "seed": dm.seed,
+            "corpus_entries": dm.corpus_entries,
         },
     }
 
 
 def _format_plan(plan) -> str:
+    dm = plan["data_model"]
     lines = [
         "DRY RUN — no server or load is started.",
         f"  server_binary    : {plan['server_binary']}",
         f"  benchmark_binary : {plan['benchmark_binary']}",
-        f"  iterations       : {plan['iterations']}",
+        f"  iterations       : {plan['iterations']}   setup_timeout: {plan['setup_timeout_seconds']}s",
         f"  reference_config : {plan['reference_config']}",
-        f"  target_tps       : {plan['target_tps']}  (connections_total={plan['connections_total']})",
-        f"  data_model       : key_count={plan['data_model']['key_count']} "
-        f"seed={plan['data_model']['seed']} corpus_entries={plan['data_model']['corpus_entries']}",
+        f"  target_tps       : {plan['target_tps']}  (connections_total={plan['connections_total']}, "
+        f"max_clients_per_process={plan['max_clients_per_process']}, pipeline={plan['pipeline']}, "
+        f"measure={plan['measurement_duration_seconds']}s)",
+        f"  data_model       : shape={dm['value_shape']}  value_size={dm['value_size_distribution']} "
+        f"(min {dm['value_size_min']}, max {dm['value_size_max']} B)",
+        f"                     key_count={dm['key_count']}  key_distribution={dm['key_distribution']}  "
+        f"corpus_entries={dm['corpus_entries']}  seed={dm['seed']}",
         f"  loader processes : {plan['loader_processes_total']} total",
     ]
     for s in plan["workload_split"]:

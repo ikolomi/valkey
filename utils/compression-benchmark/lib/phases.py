@@ -62,12 +62,15 @@ def _server_cpu_block(srv, j0, t0):
     return _cpu_pct(j0, j1, t1 - t0, clk)
 
 
-def _sample_resources_until_done(spawned, srv, interval, max_wait):
+def _sample_resources_until_done(spawned, srv, interval, max_wait, progress=None,
+                                 progress_every=10.0):
     """Poll the memory series (used_memory + RSS + fragmentation) while the loaders
     run the measured window. RSS is the headline metric (Q6); no MEMORY PURGE — the
     series represents the real, honest footprint over a sufficiently long window."""
     series = {"used_memory": [], "used_memory_rss": [], "mem_fragmentation_ratio": []}
-    deadline = _time.monotonic() + max_wait
+    start = _time.monotonic()
+    deadline = start + max_wait
+    last_prog = start
     while any(s["proc"].poll() is None for s in spawned):
         try:
             m = srv.info("memory")
@@ -76,8 +79,13 @@ def _sample_resources_until_done(spawned, srv, interval, max_wait):
             series["mem_fragmentation_ratio"].append(float(m.get("mem_fragmentation_ratio", "0")))
         except Exception:
             pass
-        if _time.monotonic() >= deadline:
+        now = _time.monotonic()
+        if now >= deadline:
             break
+        if progress and now - last_prog >= progress_every and series["used_memory_rss"]:
+            progress(f"measuring: {now - start:.0f}s, rss={series['used_memory_rss'][-1] / 1e6:.0f}MB "
+                     f"used={series['used_memory'][-1] / 1e6:.0f}MB ({len(series['used_memory'])} samples)")
+            last_prog = now
         _time.sleep(interval)
     return series
 
@@ -175,7 +183,8 @@ def run_off_iteration(*, run, entry, server_binary, benchmark_binary, iter_dir,
         cpu_j0, cpu_t0 = srv.process_cpu_jiffies(), _time.monotonic()
         spawned = benchmark.spawn_loaders(loaders, os.path.join(iter_dir, "load"))
         res_series = _sample_resources_until_done(
-            spawned, srv, interval=0.5, max_wait=wl.measurement_duration_seconds + 30)
+            spawned, srv, interval=0.5, max_wait=wl.measurement_duration_seconds + 30,
+            progress=lambda m: log(f"[{entry.name}] {m}"))
         results = benchmark.collect_loaders(spawned)
         server_cpu = _server_cpu_block(srv, cpu_j0, cpu_t0)
         stats = _stats_block(srv)
@@ -304,7 +313,8 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         srv.compression("sweep", "force")
         ca = info.poll_until_swept(
             sweep_probe, poll_interval=pp.poll_interval_seconds,
-            max_timeout=setup_timeout, stable_polls=pp.plateau_window_polls)
+            max_timeout=setup_timeout, stable_polls=pp.plateau_window_polls,
+            progress=lambda m: log(f"[{entry.name}] {m}"))
         log(f"[{entry.name}] compress-all: completed={ca['completed']} "
             f"objects={ca['series'][-1] if ca['series'] else 0}")
         srv.config_set("compression-min-idle-seconds", real_min_idle)  # restore the lever
@@ -330,7 +340,8 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         prep = info.poll_until_plateau(
             compressed_objects, tolerance_pct=pp.plateau_tolerance_pct,
             window_polls=pp.plateau_window_polls, poll_interval=pp.poll_interval_seconds,
-            max_timeout=pp.max_timeout_seconds)
+            max_timeout=pp.max_timeout_seconds,
+            progress=lambda m: log(f"[{entry.name}] profile-prep {m}"))
         plateaued = prep["plateaued"]
         if not plateaued:
             log(f"[{entry.name}] profile did not stabilize within {pp.max_timeout_seconds}s")
@@ -339,7 +350,8 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         cpu_j0, cpu_t0 = srv.process_cpu_jiffies(), _time.monotonic()
         benchmark.record_start_loaders(spawned, sig)
         res_series = _sample_resources_until_done(
-            spawned, srv, interval=0.5, max_wait=wl.measurement_duration_seconds + 30)
+            spawned, srv, interval=0.5, max_wait=wl.measurement_duration_seconds + 30,
+            progress=lambda m: log(f"[{entry.name}] {m}"))
         results = benchmark.collect_loaders(spawned)
         server_cpu = _server_cpu_block(srv, cpu_j0, cpu_t0)
         stats = _stats_block(srv)
