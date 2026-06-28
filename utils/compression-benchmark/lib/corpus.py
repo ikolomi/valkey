@@ -51,16 +51,74 @@ def _alnum(rng: random.Random, n: int) -> str:
     return "".join(rng.choices(_ALNUM, k=n))
 
 
+# Small fixed vocabularies so the corpus models the human-readable, repetitive data
+# real applications store (customer/order/inventory records) — and is therefore
+# realistically COMPRESSIBLE (repeated keys + a bounded word pool), unlike a random
+# base-62 pad which sits at the entropy floor. (idea-honing corpus refinement.)
+_FIRST = ["James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael", "Linda",
+          "William", "Elizabeth", "David", "Susan", "Maria", "Jose", "Wei", "Mohammed",
+          "Sofia", "Liam", "Olivia", "Noah", "Emma", "Lucas", "Ava", "Aiden"]
+_LAST = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
+         "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson",
+         "Lee", "Patel", "Kim", "Chen", "Singh", "Nguyen", "Khan", "Ali", "Cohen"]
+_CITY = ["Springfield", "Riverside", "Franklin", "Greenville", "Bristol", "Clinton",
+         "Fairview", "Salem", "Madison", "Georgetown", "Arlington", "Ashland",
+         "Burlington", "Manchester", "Oakland", "Kingston", "Newport", "Dover"]
+_STREET = ["Main St", "Oak Ave", "Maple Dr", "Cedar Ln", "Pine Rd", "Elm St",
+           "Washington Ave", "Lake Rd", "Hill St", "Park Ave", "Sunset Blvd", "River Rd"]
+_STATE = ["CA", "NY", "TX", "FL", "IL", "PA", "OH", "GA", "NC", "MI", "WA", "AZ", "MA"]
+_STATUS = ["active", "pending", "shipped", "delivered", "cancelled", "returned",
+           "processing", "backordered", "confirmed", "refunded"]
+# General word pool for the free-text "notes" field (order/inventory domain + connectives).
+_VOCAB = ["order", "customer", "item", "quantity", "price", "total", "note", "please",
+          "deliver", "before", "standard", "express", "priority", "warehouse", "stock",
+          "available", "shipment", "tracking", "number", "invoice", "account", "balance",
+          "due", "paid", "product", "category", "unit", "discount", "tax", "subtotal",
+          "the", "and", "for", "with", "from", "to", "of", "in", "on", "per", "each",
+          "widget", "gadget", "sprocket", "bracket", "cable", "adapter", "battery",
+          "charger", "sensor", "module", "panel", "valve", "bearing", "filter", "gasket"]
+
+
+def _words(rng: random.Random, n: int) -> str:
+    """Exactly ``n`` chars of human-readable words from ``_VOCAB`` (lowercase letters +
+    spaces only — never JSON-escaped, so the length is exact). The bounded pool makes
+    the text compress like real prose."""
+    if n <= 0:
+        return ""
+    parts, joined_len = [], 0
+    while joined_len < n:
+        w = rng.choice(_VOCAB)
+        joined_len += (1 if parts else 0) + len(w)  # leading space for all but the first
+        parts.append(w)
+    return " ".join(parts)[:n]
+
+
 # --------------------------------------------------------------------------- #
 # Value-shape generators — each returns exactly `size` bytes
 # --------------------------------------------------------------------------- #
 
 def _gen_json(rng: random.Random, size: int, i: int) -> bytes:
-    base = json.dumps({"id": i, "pad": ""}, separators=(",", ":"))
-    filler_len = size - len(base)
-    pad = _alnum(rng, filler_len)  # alnum is never JSON-escaped → length is exact
-    s = json.dumps({"id": i, "pad": pad}, separators=(",", ":"))
-    return s.encode("ascii")
+    """A realistic customer/order record (human-readable, repeated keys + bounded
+    vocabulary → compressible), sized to exactly ``size`` bytes via a word-filled
+    ``notes`` field. Stays valid JSON (the filler uses only letters + spaces, which
+    are never JSON-escaped, so the length is exact)."""
+    first, last = rng.choice(_FIRST), rng.choice(_LAST)
+    rec = {
+        "id": i,
+        "name": first + " " + last,
+        "email": (first + "." + last + "@example.com").lower(),
+        "address": (f"{rng.randint(1, 9999)} {rng.choice(_STREET)}, "
+                    f"{rng.choice(_CITY)} {rng.choice(_STATE)} {rng.randint(0, 99999):05d}"),
+        "status": rng.choice(_STATUS),
+        "notes": "",
+    }
+    base = len(json.dumps(rec, separators=(",", ":")))
+    if size - base < 0:
+        # value smaller than the structured record: fall back to a minimal record
+        rec = {"id": i, "notes": ""}
+        base = len(json.dumps(rec, separators=(",", ":")))
+    rec["notes"] = _words(rng, size - base)
+    return json.dumps(rec, separators=(",", ":")).encode("ascii")
 
 
 def _build_truncate(rng: random.Random, size: int, head: str, make_token) -> bytes:
@@ -118,6 +176,7 @@ def corpus_hash(dm: DataModel) -> str:
     """Stable hash of the corpus-defining fields (Q8d cache key)."""
     key = json.dumps(
         {
+            "ver": 2,  # bump when a generator's output bytes change (cache invalidation)
             "shape": dm.value_shape,
             "dist": list(dm.value_size_distribution),
             "min": dm.value_size_min,

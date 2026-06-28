@@ -93,6 +93,11 @@ def test_build_report_numbers(tmp_path):
     # compression + kept iterations
     assert comp["compression"]["compressed_objects"] == "999"
     assert comp["iterations"]["kept"] == [0, 1]
+    # measurement coverage: 2 iterations merged, get+set each 10/iter → 40 total requests
+    assert comp["samples"]["requests_total"] == 40
+    assert comp["samples"]["per_command"] == {"get": 20, "set": 20}
+    assert comp["samples"]["iterations_kept"] == 2 and comp["samples"]["iterations_total"] == 2
+    assert comp["samples"]["memory_samples"] == off["samples"]["memory_samples"] > 0
 
 
 def test_build_report_flags_and_drops_outlier_iteration(tmp_path):

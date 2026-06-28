@@ -27,6 +27,8 @@ def _report():
             "cpu": {"pct_total": cpu, "delta_pct": 5.0},
             "stats": {"evicted_keys": 0, "rejected_connections": 0, "expired_keys": 0, "keyspace_misses": 0},
             "compression": {"ratio": "2.5", "net_saved_bytes": "123", "compressed_objects": "999"},
+            "samples": {"requests_total": 480000, "per_command": {"get": 384000, "set": 96000},
+                        "memory_samples": 60, "iterations_kept": 2, "iterations_total": 3},
         }
     return {
         "workload": {"target_tps": 2000, "key_distribution": "zipf:0.99",
@@ -49,19 +51,21 @@ def test_figures_pareto_per_percentile_visibility():
 
 def test_figures_present():
     figs = render._figures(_report())
-    for key in ("pareto", "percentile-delta", "memory-breakdown",
+    for key in ("pareto", "percentile-delta", "memory-saved", "memory-breakdown",
                 "memory-stability", "heatmap", "headroom"):
         assert key in figs and figs[key]["traces"] is not None
 
 
 def test_render_html_has_all_containers_and_toggle():
     html = render.render(_report())
-    for div in ("chart-pareto", "chart-percentile-delta", "chart-memory-breakdown",
-                "chart-memory-stability", "chart-heatmap", "chart-headroom", "table-summary"):
+    for div in ("chart-pareto", "chart-percentile-delta", "chart-memory-saved",
+                "chart-memory-breakdown", "chart-memory-stability", "chart-heatmap",
+                "chart-headroom", "table-summary", "table-coverage"):
         assert f'id="{div}"' in html, f"missing chart container {div}"
     assert "plotly" in html.lower() and "Plotly.newPlot" in html
     assert 'id="mode-toggle"' in html  # absolute↔% switch
     assert "zipf:0.99" in html  # workload header rendered
+    assert "480000" in html      # measurement-coverage request count rendered
     assert html.strip().startswith("<!DOCTYPE html>")
 
 

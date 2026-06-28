@@ -220,12 +220,16 @@ def _reduce_config(iter_data, n_threshold=5):
     commands = set()
     for d in kept_data:
         commands |= set((d["im"].get("latency") or {}).get("per_command", {}).keys())
-    per_command_pcts = {}
+    per_command_pcts, per_command_counts = {}, {}
     for cmd in sorted(commands):
         bl = [d["im"]["latency"]["per_command"][cmd]["buckets"]
               for d in kept_data if cmd in (d["im"].get("latency") or {}).get("per_command", {})]
-        per_command_pcts[cmd] = percentiles(merge_bucket_lists(bl))
-    aggregate_pcts = percentiles(merge_bucket_lists([_aggregate_buckets(d["im"]) for d in kept_data]))
+        merged = merge_bucket_lists(bl)
+        per_command_pcts[cmd] = percentiles(merged)
+        per_command_counts[cmd] = sum(c for _, c in merged)
+    agg_merged = merge_bucket_lists([_aggregate_buckets(d["im"]) for d in kept_data])
+    aggregate_pcts = percentiles(agg_merged)
+    requests_total = sum(c for _, c in agg_merged)
 
     rss_pool = [x for i in kept for x in rss_pools[i]]
     used_pool = [x for i in kept for x in used_pools[i]]
@@ -241,17 +245,21 @@ def _reduce_config(iter_data, n_threshold=5):
         if kept_data else {}
     comp = (kept_data[-1]["im"].get("compression") or {}) if kept_data else {}
 
+    rss_stats = memory_stats(rss_pool)
     return {
         "kept": [iter_data[i]["index"] for i in kept],
         "flagged_outliers": flagged,
         "rss_headline": rss_headline,
         "used_headline": used_headline,
         "frag_ratio": (rss_headline / used_headline) if used_headline else None,
-        "rss_stats": memory_stats(rss_pool),
+        "rss_stats": rss_stats,
         "used_stats": memory_stats(used_pool),
         "per_iteration_rss_median": rss_med_kept,
         "aggregate_pcts": aggregate_pcts,
         "per_command_pcts": per_command_pcts,
+        "requests_total": requests_total,
+        "per_command_counts": per_command_counts,
+        "memory_samples": (rss_stats or {}).get("samples", 0),
         "cpu_total": statistics.fmean(cpus) if cpus else None,
         "stats": stats,
         "compression": {
@@ -327,6 +335,13 @@ def build_report(run_dir):
             "cpu": {"pct_total": r["cpu_total"], "delta_pct": cpu_delta},
             "stats": r["stats"],
             "compression": r["compression"],
+            "samples": {
+                "requests_total": r["requests_total"],
+                "per_command": r["per_command_counts"],
+                "memory_samples": r["memory_samples"],
+                "iterations_kept": len(r["kept"]),
+                "iterations_total": len(disc["configs"][name]["iterations"]),
+            },
         }
 
     wl = runcfg.get("workload", {})
@@ -336,9 +351,17 @@ def build_report(run_dir):
             "description": runcfg.get("description"),
             "target_tps": wl.get("target_tps"),
             "commands": wl.get("commands"),
+            "connections_total": wl.get("connections_total"),
+            "max_clients_per_process": wl.get("max_clients_per_process"),
+            "pipeline": wl.get("pipeline"),
+            "measurement_duration_seconds": wl.get("measurement_duration_seconds"),
+            "iterations": runcfg.get("iterations"),
             "value_size_distribution": dm.get("value_size_distribution"),
+            "value_size_min": dm.get("value_size_min"),
+            "value_size_max": dm.get("value_size_max"),
             "key_distribution": dm.get("key_distribution"),
             "key_count": dm.get("key_count"),
+            "corpus_entries": dm.get("corpus_entries"),
             "seed": dm.get("seed"),
             "corpus_sha256": (prov.get("corpus") or {}).get("sha256"),
         },

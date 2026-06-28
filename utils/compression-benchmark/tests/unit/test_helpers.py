@@ -274,3 +274,48 @@ def test_build_load_argvs_without_load_dir_has_no_dump():
     for spec in loaders:
         assert spec.get("hist_path") is None
         assert "--latency-dump" not in spec["argv"]
+
+
+# --------------------------------------------------------------------------- #
+# poll_until_swept — compress-all completion (waits for the worker queue to drain
+# + compressed_objects to hold steady; NOT a premature growth-plateau). Fixes the
+# bug where a paced/back-pressured sweep stalls growth while candidates_pending>0.
+# --------------------------------------------------------------------------- #
+
+class _Clk:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_poll_until_swept_waits_for_drain_then_completes():
+    clk = _Clk()
+    # (compressed_objects, candidates_pending): growth, then a STALL with pending>0
+    # (the old bug would fire here), then resume, then drain + steady.
+    seq = iter([(100, 50), (215, 80), (215, 80), (215, 80), (400, 60),
+                (810, 10), (810, 0), (810, 0), (810, 0), (810, 0), (810, 0)])
+    res = info.poll_until_swept(lambda: next(seq), poll_interval=2, max_timeout=1000,
+                                stable_polls=4, clock=clk, sleep=clk.sleep)
+    assert res["completed"] is True
+    assert res["series"][-1] == 810  # completed at the drained/steady value, not the 215 stall
+
+
+def test_poll_until_swept_does_not_complete_while_backlogged():
+    clk = _Clk()
+    # compressed_objects steady at 215 BUT candidates_pending stays 80 → still working
+    res = info.poll_until_swept(lambda: (215, 80), poll_interval=2, max_timeout=20,
+                                stable_polls=4, clock=clk, sleep=clk.sleep)
+    assert res["completed"] is False  # never drained → times out (→ setup failure)
+
+
+def test_poll_until_swept_noop_when_nothing_eligible():
+    clk = _Clk()
+    # nothing to compress: compressed stays 0, pending 0 → completes after grace
+    res = info.poll_until_swept(lambda: (0, 0), poll_interval=2, max_timeout=1000,
+                                stable_polls=3, start_grace_polls=2, clock=clk, sleep=clk.sleep)
+    assert res["completed"] is True

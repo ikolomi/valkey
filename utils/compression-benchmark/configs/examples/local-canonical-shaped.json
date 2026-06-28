@@ -1,0 +1,54 @@
+{
+  "description": "canonical-shaped local run (dev box): off vs compression-on, lognormal JSON corpus, Zipfian, 80/20 GET/SET. Scaled-down from configs/examples/canonical.json so target TPS is achievable on a shared 8-CPU host.",
+  "output_directory": "/tmp/cbench-canonical-local/results",
+  "servers_directory": "/tmp/cbench-canonical-local/servers",
+  "benchmark_binary": "valkey-benchmark",
+  "server_binary": "valkey-server",
+  "iterations": 3,
+  "reference_config": "off",
+
+  "data_model": {
+    "value_shape": "json",
+    "value_size_distribution": "lognormal:512:0.8",
+    "value_size_min": 256,
+    "value_size_max": 8192,
+    "seed": 1234,
+    "corpus_entries": 8000,
+    "key_count": 100000,
+    "key_distribution": "zipf:0.99"
+  },
+
+  "workload": {
+    "target_tps": 10000,
+    "commands": [
+      { "type": "get", "ratio": 0.8 },
+      { "type": "set", "ratio": 0.2 }
+    ],
+    "connections_total": 16,
+    "max_clients_per_process": 8,
+    "pipeline": 1,
+    "measurement_duration_seconds": 8
+  },
+
+  "profile_prep": {
+    "plateau_metric": "compression_compressed_objects",
+    "plateau_tolerance_pct": 5,
+    "plateau_window_polls": 3,
+    "poll_interval_seconds": 1,
+    "max_timeout_seconds": 180
+  },
+
+  "configs": [
+    { "name": "off", "compression": { "master_switch": "off" } },
+    {
+      "name": "compression-on",
+      "compression": {
+        "master_switch": "compression",
+        "automatic_sweeper": "enabled",
+        "min_value_size": 256,
+        "max_value_size": 8192,
+        "min_idle_seconds": 2
+      }
+    }
+  ]
+}

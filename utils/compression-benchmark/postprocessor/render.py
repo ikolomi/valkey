@@ -63,11 +63,25 @@ def _figures(report):
         })
     percentile_delta = {
         "div": "chart-percentile-delta", "toggle": True, "traces": pd_traces,
-        "layout": {"title": "Latency delta vs baseline, by percentile",
+        "layout": {"title": "Latency delta vs baseline, by percentile "
+                            "(tail percentiles use fewer samples — see Measurement coverage)",
                    "xaxis": {"title": "percentile"}, "yaxis": {"title": "Δ latency vs baseline (µs)"}},
     }
 
-    # --- Memory breakdown: RSS (headline) vs used_memory per config.
+    # --- Memory saved vs baseline (%), the delta view (consistent with latency-delta).
+    mem_saved = {
+        "div": "chart-memory-saved", "traces": [
+            {"type": "bar", "name": "RSS saved % (headline)", "x": names,
+             "y": [_g(configs, n, "memory", "memory_saved_pct") for n in names]},
+            {"type": "bar", "name": "used_memory saved %", "x": names,
+             "y": [_g(configs, n, "memory", "used_memory_saved_pct") for n in names]},
+        ],
+        "layout": {"title": "Memory saved vs baseline (%) — higher is better",
+                   "barmode": "group", "yaxis": {"title": "% saved vs baseline"}},
+    }
+
+    # --- Absolute memory breakdown: RSS (headline) vs used_memory, MEDIAN over the
+    # steady-state window per config.
     mem_breakdown = {
         "div": "chart-memory-breakdown", "traces": [
             {"type": "bar", "name": "RSS (physical)", "x": names,
@@ -75,7 +89,8 @@ def _figures(report):
             {"type": "bar", "name": "used_memory (logical)", "x": names,
              "y": [_g(configs, n, "memory", "used_memory_bytes") for n in names]},
         ],
-        "layout": {"title": "Memory by config (RSS = headline; gap vs used_memory = fragmentation)",
+        "layout": {"title": "Absolute memory — MEDIAN over the steady-state window "
+                            "(RSS vs used_memory; gap = fragmentation)",
                    "barmode": "group", "yaxis": {"title": "bytes"}},
     }
 
@@ -120,8 +135,8 @@ def _figures(report):
     }
 
     return {"pareto": pareto, "percentile-delta": percentile_delta,
-            "memory-breakdown": mem_breakdown, "memory-stability": mem_stability,
-            "heatmap": heatmap, "headroom": headroom}
+            "memory-saved": mem_saved, "memory-breakdown": mem_breakdown,
+            "memory-stability": mem_stability, "heatmap": heatmap, "headroom": headroom}
 
 
 def _fmt(v, suffix=""):
@@ -137,15 +152,44 @@ def _workload_header(report):
     items = [
         ("target TPS", wl.get("target_tps")),
         ("commands", ", ".join(f"{c.get('type')}={c.get('ratio')}" for c in (wl.get("commands") or []))),
-        ("value sizes", wl.get("value_size_distribution")),
+        ("connections / max-per-proc / pipeline",
+         f"{wl.get('connections_total')} / {wl.get('max_clients_per_process')} / {wl.get('pipeline')}"),
+        ("measurement window", f"{wl.get('measurement_duration_seconds')} s × {wl.get('iterations')} iterations"),
+        ("value sizes", f"{wl.get('value_size_distribution')}  (min {wl.get('value_size_min')}, max {wl.get('value_size_max')} B)"),
         ("key distribution", wl.get("key_distribution")),
-        ("key count", wl.get("key_count")),
-        ("seed", wl.get("seed")),
+        ("key count / corpus entries", f"{wl.get('key_count')} / {wl.get('corpus_entries')}"),
+        ("seed / corpus sha256", f"{wl.get('seed')} / {wl.get('corpus_sha256')}"),
         ("baseline", report.get("baseline")),
     ]
     rows = "".join(f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
                    for k, v in items)
     return f'<div id="workload"><h2>Workload</h2><table>{rows}</table></div>'
+
+
+def _coverage_table(report):
+    """Measurement coverage — so the reader can judge tail reliability: a p99.9 is
+    only ~0.1% of the request count, p99.99 ~0.01% — small counts ⇒ noisy tails."""
+    configs = report.get("configs", {})
+    head = ("<tr><th>Config</th><th>iterations (kept/total)</th><th>requests measured</th>"
+            "<th>≈p99.9 samples</th><th>≈p99.99 samples</th><th>memory samples</th></tr>")
+    rows = []
+    for n, c in configs.items():
+        s = _g(c, "samples", default={})
+        req = s.get("requests_total")
+        s999 = f"{req/1000:.0f}" if isinstance(req, (int, float)) else "n/a"
+        s9999 = f"{req/10000:.0f}" if isinstance(req, (int, float)) else "n/a"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(n))}</td>"
+            f"<td>{s.get('iterations_kept')}/{s.get('iterations_total')}</td>"
+            f"<td>{req if req is not None else 'n/a'}</td>"
+            f"<td>{s999}</td><td>{s9999}</td>"
+            f"<td>{s.get('memory_samples')}</td>"
+            "</tr>")
+    note = ('<p style="color:#666;font-size:0.9em">Tail percentiles use few samples '
+            '(≈ requests × the tail fraction). Treat p99.9 / p99.99 with &lt; a few hundred '
+            'samples as noisy — widen the measurement window or add iterations to tighten them.</p>')
+    return f'<div id="table-coverage"><h2>Measurement coverage</h2><table>{head}{"".join(rows)}</table>{note}</div>'
 
 
 def _summary_table(report):
@@ -211,6 +255,7 @@ def render(report):
         '<button id="mode-toggle" onclick="toggleMode()">Show % delta</button>\n'
         f"{divs}\n"
         f"{_summary_table(report)}\n"
+        f"{_coverage_table(report)}\n"
         f"<script>\n{_JS.replace('__FIGS_JSON__', figs_json)}\n</script>\n"
         "</body></html>\n"
     )

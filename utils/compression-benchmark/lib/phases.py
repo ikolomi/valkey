@@ -248,6 +248,7 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
     """
     os.makedirs(iter_dir, exist_ok=True)
     dm, wl, pp = run.data_model, run.workload, run.profile_prep
+    setup_timeout = getattr(run, "setup_timeout_seconds", None) or _SETUP_TIMEOUT_S
     datasize = representative_datasize(dm)
     key_dist = dm.key_distribution if dm.key_distribution[0] == "zipf" else None
     sig = int(_signal.SIGUSR1)
@@ -281,24 +282,38 @@ def run_compression_iteration(*, run, entry, server_binary, benchmark_binary,
         # The cron fires training once DBSIZE >= compression-dict-min-training-keys and
         # promotes a dict; poll until it's active. (A manual `COMPRESSION TRAIN` command
         # is a later PR; auto-training is the available — and realistic — path.)
-        if not _wait_active_dict(srv, _SETUP_TIMEOUT_S):
+        if not _wait_active_dict(srv, setup_timeout):
             raise RuntimeError(
-                f"server did not auto-train an active dict within {_SETUP_TIMEOUT_S}s "
+                f"server did not auto-train an active dict within {setup_timeout}s "
                 f"(need >= compression-dict-min-training-keys eligible keys)")
         log(f"[{entry.name}] auto-trained active dict id="
             f"{srv.info('compression').get('compression_active_dict_id')}")
 
-        # E3 Compress-all (deterministic start): min-idle 0 + force sweep, wait to plateau.
+        # E3 Compress-all (deterministic start): min-idle 0 + force sweep, wait until the
+        # sweep has TRULY completed — the worker queue drained (candidates_pending==0) and
+        # compressed_objects steady — NOT a premature growth-plateau (which fires while the
+        # paced/back-pressured sweep is still working → a half-compressed measurement).
         real_min_idle = srv.config_get("compression-min-idle-seconds")
         srv.config_set("compression-min-idle-seconds", 0)
+
+        def sweep_probe():
+            c = srv.info("compression")
+            return (int(c.get("compression_compressed_objects", "0")),
+                    int(c.get("compression_candidates_pending", "0")))
+
         srv.compression("sweep", "force")
-        ca = info.poll_until_plateau(
-            compressed_objects, tolerance_pct=pp.plateau_tolerance_pct,
-            window_polls=pp.plateau_window_polls, poll_interval=pp.poll_interval_seconds,
-            max_timeout=_SETUP_TIMEOUT_S)
-        log(f"[{entry.name}] compress-all: plateaued={ca['plateaued']} "
+        ca = info.poll_until_swept(
+            sweep_probe, poll_interval=pp.poll_interval_seconds,
+            max_timeout=setup_timeout, stable_polls=pp.plateau_window_polls)
+        log(f"[{entry.name}] compress-all: completed={ca['completed']} "
             f"objects={ca['series'][-1] if ca['series'] else 0}")
         srv.config_set("compression-min-idle-seconds", real_min_idle)  # restore the lever
+        if not ca["completed"]:
+            raise RuntimeError(
+                f"compress-all did not finish within {setup_timeout}s "
+                f"(sweep queue not drained; compressed_objects="
+                f"{ca['series'][-1] if ca['series'] else 0}) — a steady-state memory "
+                f"measurement is impossible mid-compression")
 
         # E4 Profile-prep + E5 Measure: ONE continuous load. Release the barrier, poll the
         # equilibrium plateau (FAIL on timeout), fire the record-start signal, then measure.

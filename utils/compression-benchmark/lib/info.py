@@ -48,3 +48,45 @@ def poll_until_plateau(sample_fn, tolerance_pct, window_polls, poll_interval,
             return {"plateaued": False, "series": series, "elapsed": clock() - start}
         sleep(poll_interval)
 
+
+
+def poll_until_swept(probe_fn, poll_interval, max_timeout, stable_polls=4,
+                     start_grace_polls=2, clock=None, sleep=None):
+    """Poll until a compress-all sweep has truly COMPLETED, not merely stalled.
+
+    ``probe_fn()`` returns ``(compressed_objects, candidates_pending)``. Completion
+    requires the worker queue to be **fully drained** (``candidates_pending == 0``)
+    AND ``compressed_objects`` to hold **steady** across the last ``stable_polls``
+    samples — after the sweep has demonstrably started (compressed grew, or pending
+    was seen > 0, or ``start_grace_polls`` polls elapsed for the nothing-eligible
+    case).
+
+    This fixes the premature ``poll_until_plateau`` exit: a paced / inbox-back-pressured
+    sweep stalls *growth* while ``candidates_pending`` is still > 0, which the old
+    growth-only detector mistook for "done" (measuring a half-compressed dataset).
+
+    Returns ``{"completed": bool, "series": [...], "elapsed": float}``. On timeout
+    ``completed`` is False → the driver fails the iteration (setup did not finish).
+    """
+    import time as _time
+
+    clock = clock or _time.monotonic
+    sleep = sleep or _time.sleep
+    series = []
+    start = clock()
+    baseline = None
+    saw_activity = False
+    while True:
+        compressed, pending = probe_fn()
+        series.append(compressed)
+        if baseline is None:
+            baseline = compressed
+        if compressed > baseline or pending > 0:
+            saw_activity = True
+        started = saw_activity or len(series) > start_grace_polls
+        steady = len(series) >= stable_polls and len(set(series[-stable_polls:])) == 1
+        if started and pending == 0 and steady:
+            return {"completed": True, "series": series, "elapsed": clock() - start}
+        if clock() - start >= max_timeout:
+            return {"completed": False, "series": series, "elapsed": clock() - start}
+        sleep(poll_interval)

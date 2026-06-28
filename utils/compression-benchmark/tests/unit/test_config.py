@@ -252,3 +252,23 @@ def test_per_config_server_binary_override():
     on = next(c for c in run.configs if c.name == "compression-on")
     assert config.resolve_server_binary(off, run) == "/path/to/valkey-server"
     assert config.resolve_server_binary(on, run) == "/feature/valkey-server"
+
+
+# ---- setup_timeout_seconds (idea-honing refinement) ----
+
+def test_setup_timeout_defaults_to_180():
+    assert config.parse(valid_run()).setup_timeout_seconds == 180.0
+
+
+def test_setup_timeout_custom_value():
+    d = valid_run()
+    d["setup_timeout_seconds"] = 900
+    assert config.parse(d).setup_timeout_seconds == 900.0
+
+
+@pytest.mark.parametrize("bad", [0, -5, "x", True])
+def test_setup_timeout_must_be_positive_number(bad):
+    d = valid_run()
+    d["setup_timeout_seconds"] = bad
+    with pytest.raises(config.ConfigError):
+        config.parse(d)

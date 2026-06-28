@@ -76,6 +76,19 @@ def test_shape_json_is_valid_json():
         assert isinstance(obj, dict)
 
 
+def test_shape_json_is_realistically_compressible():
+    """The json shape must model real (compressible) application data — repeated keys
+    + a bounded human-readable vocabulary — not a random pad sitting at the entropy
+    floor. zlib should shrink it well below half."""
+    import zlib
+    blobs = corpus.generate_blobs(dm(value_shape="json", corpus_entries=500))
+    blob = b"".join(blobs)
+    ratio = len(zlib.compress(blob, 6)) / len(blob)
+    assert ratio < 0.5, f"json corpus not compressible enough (ratio {ratio:.3f})"
+    # human-readable, real-word content (not random base-62)
+    assert b"@example.com" in blob and b"notes" in blob
+
+
 def test_shape_kv_has_separators():
     for b in corpus.generate_blobs(dm(value_shape="kv", corpus_entries=200)):
         assert b"=" in b and b";" in b

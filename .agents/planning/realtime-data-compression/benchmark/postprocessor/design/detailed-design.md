@@ -307,3 +307,41 @@ One design (this doc) → **three staged implementation plans/PRs** in dependenc
 3. **`plan-3-postprocessor.md`** — reduction + rendering + tests (new `postprocessor/` subtree).
 
 Each plan TDD red→green; review-then-commit-then-proceed; commit only when asked; push to fork only.
+
+---
+
+## 11. Empirical hardening (post-implementation findings)
+
+Running the instrument on a real Valkey build surfaced artifacts that, once fixed,
+flipped the headline result from "compression costs memory" to the correct tradeoff.
+These are now part of the design of record:
+
+- **F1 — corpus must be realistically compressible.** The original `json` shape filled
+  values with a random base-62 pad, which sits at the entropy floor (`zstd -19` = 0.74),
+  so compression had nothing to win. Replaced with realistic customer/order records
+  drawn from a bounded vocabulary (repeated keys + human-readable words) → `zstd -19`
+  = 0.15, and the server compresses to ~0.29. **A compression benchmark is only as
+  valid as its corpus's compressibility; validate it with an external compressor.**
+- **F2 — compress-all must wait for TRUE completion, not a growth-plateau.** The setup
+  detector watched `compressed_objects` growth and mistook the paced/back-pressured
+  sweep's stalls for "done" — measuring a ~21%-compressed dataset. Fixed
+  (`info.poll_until_swept`): complete only when the worker queue has **drained**
+  (`candidates_pending == 0`) AND `compressed_objects` is **steady**; **fail the
+  iteration** if it can't complete within the setup budget. After the fix compress-all
+  reaches ~all eligible objects, so the memory comparison is steady-state.
+- **F3 — `setup_timeout_seconds` is an orchestrator parameter** (default 180) bounding
+  setup (auto-train + compress-all) before failing — large datasets need more.
+- **F4 — RSS-headline validated.** With F1+F2, the 1M/60 s/active-defrag run shows
+  **RSS −52.7%** (715→338 MB) for a **+54% p99 latency** penalty — the canonical
+  memory↔latency tradeoff. `used_memory` dropped 396 MB vs 490 MB logical `net_saved`;
+  the ~94 MB gap is read-path transient decompression views (capped at savings) for the
+  Zipfian hot set. `used_memory` alone (≈flat in the buggy run) hid all of this — RSS is
+  the right headline.
+- **F5 — report surfaces measurement coverage.** The report now shows per-config request
+  counts (⇒ tail-percentile sample counts) + iterations kept/total, so limited-sample
+  tail noise (the 8 s run's ~24-sample p99.99) is visible at a glance, and memory is also
+  shown as a saved-% delta (not just absolute).
+
+**Takeaway:** the instrument's value came from the empirical loop catching these — a
+stable orchestrator→post-processor contract + pure reduction made fast re-analysis (and
+this debugging) possible.

@@ -96,6 +96,10 @@ class RunConfig:
     profile_prep: ProfilePrep
     configs: list[ConfigEntry]
     description: str = ""
+    # Max wall-time (seconds) for a compression config's SETUP phases (auto-train +
+    # compress-all) before the iteration is failed. Bounds how long the orchestrator
+    # waits on setup; large datasets need a higher value. (idea-honing refinement.)
+    setup_timeout_seconds: float = 180.0
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +311,8 @@ def parse(d: dict) -> RunConfig:
         profile_prep=_parse_profile_prep(d["profile_prep"]),
         configs=configs,
         description=d.get("description", ""),
+        setup_timeout_seconds=(_positive_num(d["setup_timeout_seconds"], "setup_timeout_seconds")
+                               if "setup_timeout_seconds" in d else 180.0),
     )
 
 
