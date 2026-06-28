@@ -20,6 +20,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import config, corpus, phases, provenance, runstatus, server
 
 
+def _iteration_order(configs, iterations):
+    """Interleaved execution order — iteration-major: (it0:c0,c1,…), (it1:c0,c1,…), …
+    so every config samples similar system conditions across the run's wall-clock.
+    Running all of config A then all of config B lets host contention (which dominates
+    the tail) bias whichever config runs during a busy stretch, confounding the
+    cross-config comparison."""
+    return [(it, e) for it in range(iterations) for e in configs]
+
+
 def run(run_obj: config.RunConfig, raw: dict, server_binary: str,
         benchmark_binary: str, out_root: str | None = None) -> dict:
     out_root = out_root or run_obj.output_directory
@@ -53,27 +62,23 @@ def run(run_obj: config.RunConfig, raw: dict, server_binary: str,
     with open(os.path.join(run_dir, "provenance.json"), "w") as f:
         json.dump(prov, f, indent=2)
 
-    config_results = {}
-    for entry in run_obj.configs:
-        iters = []
-        # per-config override, else the resolved default passed in (CLI/env/JSON)
-        sb = entry.server_binary or server_binary
+    config_results = {entry.name: [] for entry in run_obj.configs}
+    for it, entry in _iteration_order(run_obj.configs, run_obj.iterations):
+        sb = entry.server_binary or server_binary  # per-config override, else the default
         is_off = entry.compression.get("master_switch", "off") == "off"
-        for it in range(run_obj.iterations):
-            iter_dir = os.path.join(run_dir, entry.name, f"iteration-{it}")
-            port = server.free_port()
-            log(f"[{entry.name}] iteration {it} (port {port})")
-            if is_off:
-                res = phases.run_off_iteration(
-                    run=run_obj, entry=entry, server_binary=sb,
-                    benchmark_binary=benchmark_binary, iter_dir=iter_dir, port=port, log=log)
-            else:
-                res = phases.run_compression_iteration(
-                    run=run_obj, entry=entry, server_binary=sb,
-                    benchmark_binary=benchmark_binary, corpus_path=corpus_path,
-                    iter_dir=iter_dir, port=port, log=log)
-            iters.append(res)
-        config_results[entry.name] = iters
+        iter_dir = os.path.join(run_dir, entry.name, f"iteration-{it}")
+        port = server.free_port()
+        log(f"[{entry.name}] iteration {it} (port {port})")
+        if is_off:
+            res = phases.run_off_iteration(
+                run=run_obj, entry=entry, server_binary=sb,
+                benchmark_binary=benchmark_binary, iter_dir=iter_dir, port=port, log=log)
+        else:
+            res = phases.run_compression_iteration(
+                run=run_obj, entry=entry, server_binary=sb,
+                benchmark_binary=benchmark_binary, corpus_path=corpus_path,
+                iter_dir=iter_dir, port=port, log=log)
+        config_results[entry.name].append(res)
 
     status = runstatus.decide(config_results)
     with open(os.path.join(run_dir, "run-status.json"), "w") as f:

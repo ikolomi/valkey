@@ -176,33 +176,52 @@ def _workload_header(report):
 
 
 def _coverage_table(report):
-    """Measurement coverage — so the reader can judge tail reliability. The samples that
-    *determine* a percentile p are the ones in its tail ≈ requests × (1 − p/100); small
-    counts ⇒ noisy percentiles."""
+    """Measurement coverage + reliability flags. A percentile p is determined by the
+    samples in its tail ≈ requests × (1 − p/100); a thin tail (< 100) is flagged ⚠. A
+    large per-iteration p99 spread is flagged too — it means host conditions varied
+    across iterations (the tail is environment-confounded, not a config property)."""
     pcts = [("p50", 0.5), ("p90", 0.1), ("p95", 0.05), ("p99", 0.01),
             ("p99.9", 1e-3), ("p99.99", 1e-4), ("p99.999", 1e-5)]
+    THIN = 100
     configs = report.get("configs", {})
     head = ("<tr><th>Config</th><th>iterations<br>(kept/total)</th><th>requests</th>"
-            "<th>memory<br>samples</th>"
+            "<th>p99 per-iter<br>(µs, spread)</th>"
             + "".join(f"<th>≈{lbl}<br>tail samples</th>" for lbl, _ in pcts) + "</tr>")
     rows = []
+    any_thin = False
     for n, c in configs.items():
         s = _g(c, "samples", default={})
         req = s.get("requests_total")
-        tail = "".join(
-            f"<td>{round(req * frac)}</td>" if isinstance(req, (int, float)) else "<td>n/a</td>"
-            for _, frac in pcts)
+        # per-iteration p99 spread → within-run instability (host noise)
+        p99s = s.get("per_iteration_p99") or []
+        if p99s:
+            lo, hi, md = min(p99s), max(p99s), sorted(p99s)[len(p99s) // 2]
+            rel = (hi - lo) / md if md else 0
+            spread = f"{lo:.0f}–{hi:.0f}" + (" ⚠" if rel > 0.3 else "")
+        else:
+            spread = "n/a"
+        cells = []
+        for _, frac in pcts:
+            if isinstance(req, (int, float)):
+                cnt = round(req * frac)
+                thin = cnt < THIN
+                any_thin = any_thin or thin
+                cells.append(f'<td>{cnt}{" ⚠" if thin else ""}</td>')
+            else:
+                cells.append("<td>n/a</td>")
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(n))}</td>"
             f"<td>{s.get('iterations_kept')}/{s.get('iterations_total')}</td>"
             f"<td>{req if req is not None else 'n/a'}</td>"
-            f"<td>{s.get('memory_samples')}</td>"
-            f"{tail}</tr>")
-    note = ('<p style="color:#666;font-size:0.9em">"tail samples" ≈ requests × (1 − p/100) — the '
-            'number of observations beyond percentile p. Treat percentiles with &lt; a few hundred '
-            'tail samples as noisy; widen the measurement window or add iterations to tighten them.</p>')
-    return f'<div id="table-coverage"><h2>Measurement coverage</h2><table>{head}{"".join(rows)}</table>{note}</div>'
+            f"<td>{spread}</td>"
+            f"{''.join(cells)}</tr>")
+    note = ('<p style="color:#666;font-size:0.9em">⚠ flags unreliable readings: a tail with '
+            f'&lt; {THIN} samples, or a per-iteration p99 spread &gt; 30% (host conditions varied '
+            'across iterations — the tail is environment-confounded). "tail samples" ≈ requests × '
+            '(1 − p/100). Widen the window, add iterations, or run on a quiet/dedicated host to '
+            'tighten the tail.</p>')
+    return f'<div id="table-coverage"><h2>Measurement coverage &amp; reliability</h2><table>{head}{"".join(rows)}</table>{note}</div>'
 
 
 def _summary_table(report):

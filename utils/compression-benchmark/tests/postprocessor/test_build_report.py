@@ -98,6 +98,7 @@ def test_build_report_numbers(tmp_path):
     assert comp["samples"]["per_command"] == {"get": 20, "set": 20}
     assert comp["samples"]["iterations_kept"] == 2 and comp["samples"]["iterations_total"] == 2
     assert comp["samples"]["memory_samples"] == off["samples"]["memory_samples"] > 0
+    assert comp["samples"]["per_iteration_p99"] == [140, 140]  # aggregate p99 per iteration
 
 
 def test_build_report_flags_and_drops_outlier_iteration(tmp_path):

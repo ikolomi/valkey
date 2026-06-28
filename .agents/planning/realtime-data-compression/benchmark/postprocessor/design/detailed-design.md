@@ -345,3 +345,18 @@ These are now part of the design of record:
 **Takeaway:** the instrument's value came from the empirical loop catching these — a
 stable orchestrator→post-processor contract + pure reduction made fast re-analysis (and
 this debugging) possible.
+
+- **F6 — tail-latency comparisons are environment-confounded on a shared host; the
+  measurement itself is correct.** Cross-validation proves our dump→parse→merge→percentile
+  pipeline matches `valkey-benchmark`'s own hdr percentiles to within a bucket
+  (`tests/component/test_latency_validation.py`) — so the high percentiles are *correctly
+  computed*. But on a shared/noisy host the **cross-config tail comparison** is unreliable:
+  the `off` config's p99 was observed swinging 208 µs ↔ ~1350 µs across runs while its p50
+  (56 µs) and RSS (715 MB) were identical — pure host contention. Mitigations applied:
+  (1) **iteration interleaving** (`orchestrator._iteration_order`, iteration-major) so configs
+  share conditions over wall-clock; (2) the report **flags unreliability** — thin tails
+  (< 100 samples) and high per-iteration p99 spread (> 30%) are marked ⚠ in the
+  "Measurement coverage & reliability" table. Note: **outlier detection cannot fix this** — a
+  uniformly-elevated run is a confound, not an outlier (nothing to deviate from), and at low
+  iteration counts consensus flags-only anyway. For trustworthy tails: a **quiet/dedicated
+  host** + more iterations. p50 and the headline memory savings remain robust regardless.

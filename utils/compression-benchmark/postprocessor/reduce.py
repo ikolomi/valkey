@@ -262,6 +262,7 @@ def _reduce_config(iter_data, n_threshold=5):
         "per_command_pcts": per_command_pcts,
         "requests_total": requests_total,
         "per_command_counts": per_command_counts,
+        "per_iteration_p99": p99s,
         "memory_samples": (rss_stats or {}).get("samples", 0),
         "cpu_total": statistics.fmean(cpus) if cpus else None,
         "stats": stats,
@@ -341,6 +342,7 @@ def build_report(run_dir):
             "samples": {
                 "requests_total": r["requests_total"],
                 "per_command": r["per_command_counts"],
+                "per_iteration_p99": r["per_iteration_p99"],
                 "memory_samples": r["memory_samples"],
                 "iterations_kept": len(r["kept"]),
                 "iterations_total": len(disc["configs"][name]["iterations"]),

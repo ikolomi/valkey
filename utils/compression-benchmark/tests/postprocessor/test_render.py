@@ -28,7 +28,8 @@ def _report():
             "stats": {"evicted_keys": 0, "rejected_connections": 0, "expired_keys": 0, "keyspace_misses": 0},
             "compression": {"ratio": "2.5", "net_saved_bytes": "123", "compressed_objects": "999"},
             "samples": {"requests_total": 480000, "per_command": {"get": 384000, "set": 96000},
-                        "memory_samples": 60, "iterations_kept": 2, "iterations_total": 3},
+                        "per_iteration_p99": [100, 100], "memory_samples": 60,
+                        "iterations_kept": 2, "iterations_total": 3},
         }
     return {
         "workload": {"target_tps": 2000, "key_distribution": "zipf:0.99",
@@ -99,6 +100,7 @@ def test_render_html_has_all_containers_and_toggle():
     assert "Plotly.relayout" in html  # toggle updates axis titles
     assert "zipf:0.99" in html      # workload header rendered
     assert "480000" in html          # measurement-coverage request count rendered
+    assert "⚠" in html               # thin-tail reliability flag (p99.99/p99.999 < 100 samples)
     assert html.strip().startswith("<!DOCTYPE html>")
 
 

@@ -204,20 +204,27 @@ server crashes (`server_error`), or a loader errors (`benchmark_error`).
 ---
 
 ## The report (charts)
+`report.html` is self-contained (Plotly via CDN) and interactive (legend toggle/isolate, hover).
+A single **mode toggle** flips **all** comparison charts between **absolute** and **% vs baseline**
+and relabels their axes accordingly. It includes:
 
-`report.html` is self-contained (Plotly via CDN) and interactive (legend toggle/isolate,
-hover, an absolute↔%-delta toggle). It includes:
-
-- **Pareto** — memory-saved % (X) vs latency penalty (Y), one series per canonical percentile
-  ({p50, p99, p99.9} visible by default; all 7 legend-toggleable).
-- **Latency delta by percentile**, **memory saved %** (delta), **absolute memory** (median over
-  the steady window: RSS vs used_memory), **memory stability** (median + min–max), **per-command
-  heatmap**, **operational headroom** (CPU).
-- **Summary** + **Measurement coverage** tables — the latter shows per-config request counts (⇒
-  tail-percentile sample counts) and iterations kept/total, so limited-sample tail noise is
-  obvious at a glance.
+- **Pareto** — memory saved (X) vs latency penalty (Y), one series per canonical percentile
+  ({p50, p99, p99.9} visible by default; all 7 legend-toggleable). Toggle: X = saved bytes ↔ %,
+  Y = penalty µs ↔ %.
+- **Latency delta by percentile** (µs ↔ %).
+- **Memory saved vs baseline** — one chart, X = `min…max` percentiles of the RSS/used sample
+  series, **RSS + used_memory** series (toggle: bytes saved ↔ % saved).
+- **Per-command latency heatmap** and **operational headroom** (server-PROCESS CPU%).
+- **Summary** + **Measurement coverage & reliability** tables — the latter shows per-config request
+  counts, tail-sample counts for **every** canonical percentile, and the per-iteration p99 spread,
+  with **⚠ flags** for thin tails (< 100 samples) or high spread (> 30%, host-noise-confounded).
 
 `report.json` is the same reduced data in machine-readable form (feed it to other tools / an LLM).
+
+> **Tail-latency reliability.** p99.9+ is determined by very few samples and is highly sensitive to
+> host contention. Because configs run **interleaved** but on a shared host the tail can still be
+> noise-dominated — trust p50/headline-memory there, and treat ⚠-flagged percentiles cautiously.
+> For trustworthy tails, run on a **quiet/dedicated host** with more iterations.
 
 ---
 
@@ -241,6 +248,14 @@ The benchmark's `--latency-dump` flag has its own integration tests in
 ---
 
 ## How it works (phases)
+
+**Execution model.** Iterations are **interleaved across configs** (off, comp, off, comp, …) so
+every config samples similar host conditions over the run's wall-clock — running all of one config
+then the other lets a busy stretch bias whichever ran during it (the tail is contention-sensitive).
+The orchestrator logs to the **console with timestamps + periodic heartbeats** during the long
+phases (compress-all drain, profile-prep, measurement), and prints the `postprocess` command at the
+end. Reduction uses the **median** over kept iterations and consensus **outlier detection** on the
+iteration axis (flag at low iteration counts, drop at ≥ ~5).
 
 - **OFF (reference) path** — `start → populate (--sequential) → open-loop load + measure
   (--rps/--duration, sampling memory/CPU + per-loader latency dumps) → collect → verdict`.

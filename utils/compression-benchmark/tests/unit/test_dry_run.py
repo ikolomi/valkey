@@ -69,3 +69,14 @@ def test_dry_run_invalid_config_raises(tmp_path):
     bad.write_text(json.dumps({"description": "missing everything"}))
     with pytest.raises(config.ConfigError):
         orchestrator.main([str(bad), "--dry-run"])
+
+
+def test_iteration_order_interleaves_configs():
+    class _E:
+        def __init__(self, n):
+            self.name = n
+
+    a, b = _E("off"), _E("comp")
+    order = [(it, e.name) for it, e in orchestrator._iteration_order([a, b], 3)]
+    # iteration-major: configs alternate so both sample similar conditions over time
+    assert order == [(0, "off"), (0, "comp"), (1, "off"), (1, "comp"), (2, "off"), (2, "comp")]
