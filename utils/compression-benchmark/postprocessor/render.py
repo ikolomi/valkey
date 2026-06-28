@@ -95,13 +95,13 @@ def _figures(report):
     ms_traces, ms_abs, ms_pct = [], [], []
     for n in others:
         for label, stat in (("RSS", "rss_stats"), ("used_memory", "used_stats")):
-            ba = [saved_bytes(_g(base, "memory", stat, k), _g(configs, n, "memory", stat, k)) for k in _MEM_PCTS]
-            bp = [saved_pct(_g(base, "memory", stat, k), _g(configs, n, "memory", stat, k)) for k in _MEM_PCTS]
-            ms_abs.append(ba)
-            ms_pct.append(bp)
+            bytes_y = [saved_bytes(_g(base, "memory", stat, k), _g(configs, n, "memory", stat, k)) for k in _MEM_PCTS]
+            pct_y = [saved_pct(_g(base, "memory", stat, k), _g(configs, n, "memory", stat, k)) for k in _MEM_PCTS]
+            ms_abs.append(bytes_y)
+            ms_pct.append(pct_y)
             ms_traces.append({"type": "scatter", "mode": "lines+markers",
                               "name": (f"{n} {label}" if len(others) > 1 else label),
-                              "x": _MEM_PCTS, "y": ba})
+                              "x": _MEM_PCTS, "y": bytes_y})
     mem_saved = {
         "div": "chart-memory-saved", "traces": ms_traces,
         "layout": {"title": "Memory saved vs baseline, by percentile of the RSS/used sample series "
