@@ -1,3 +1,10 @@
+> **STATUS: IMPLEMENTED** in `../postprocessor/render.py` (rendered from `report.json`). The
+> headline Pareto, per-percentile-delta, memory-breakdown/stability, per-command heatmap,
+> operational-headroom, and summary are all present, plus a measurement-coverage table and a
+> memory-saved-% delta view. The **"Recommended configs"** section below was intentionally
+> **dropped** (idea-honing Q10 — the tool measures + visualizes; a human/LLM reads the Pareto).
+> This file remains the rendering rationale of record.
+
 A good visualization should answer one user-facing question:
 
 **“For my fixed workload, which compression config gives me acceptable latency cost for enough memory savings?”**

@@ -1,10 +1,17 @@
-# Compression Benchmark Orchestrator
+# Compression Benchmark
 
-A standalone Python orchestrator that measures the **memory↔latency tradeoff** of
-Valkey's in-tree real-time value-compression feature. It drives `valkey-benchmark`
-against `valkey-server` under a set of compression **configurations** at a fixed
-offered TPS (open-loop), collects precise raw artifacts, and decides each run's
-validity (SUCCESS / FAILED).
+Measures the **memory↔latency tradeoff** of Valkey's in-tree real-time value-compression
+feature. Two components:
+
+1. **Orchestrator** (`orchestrator.py`) — drives `valkey-benchmark` against `valkey-server`
+   under a set of compression **configurations** at a fixed offered TPS (open-loop),
+   collects precise raw artifacts into a **stable, versioned contract**, and decides each
+   run's validity (SUCCESS / FAILED). It does **no** statistical reduction.
+2. **Post-processor** (`postprocessor/`) — consumes a run directory and produces
+   **`report.json`** (reduced numbers) + a self-contained interactive **`report.html`**
+   (the headline **Pareto** memory-saved-% vs latency-penalty chart, per-percentile deltas,
+   memory breakdown/stability, per-command heatmap, headroom, summary + measurement-coverage
+   tables). Reduction is pure stdlib and split from rendering.
 
 It is modeled on [`amz_redis-benchmark-orc`](https://github.com/ikolomi/amz_redis-benchmark-orc)
 (process orchestration, FIFO-barrier launch, reproducibility rigor, CPU capture) but
@@ -14,41 +21,38 @@ It is modeled on [`amz_redis-benchmark-orc`](https://github.com/ikolomi/amz_redi
 - computes **true tail percentiles by merging per-bucket histograms** (not averaging per-interval percentiles);
 - adds the entire **memory + compressed-steady-state** dimension amz-orc lacks.
 
-The orchestrator **collects raw artifacts and decides validity**. Statistical
-reduction (histogram merge, percentiles, delta-vs-baseline) and the headline
-**Pareto chart** (memory-saved % vs latency-penalty %) are a separate **post-processor**
-(future work) that consumes the run directory.
+**The headline memory metric is `used_memory_rss`** (physical RAM the user actually pays),
+with `used_memory` + fragmentation shown alongside — `used_memory` alone hides fragmentation
+and the read-path's transient decompression views.
 
 ---
 
-## Status
+## Status — complete
 
-| Phase | What | State |
+| Area | What | State |
 |---|---|---|
-| A (M0) | pure-Python core: config / corpus / split-math / plateau / run-status | ✅ done |
-| B | benchmark flags `--value-data corpus:FILE` / `--key-distribution zipf` / `--record-start-signal` | ✅ done |
-| C | server lifecycle, INFO polling, loader orchestration (FIFO barrier), provenance | ✅ done |
-| D (**M2**) | **OFF-config run end-to-end** + failure paths | ✅ done |
-| E (**M3**) | **compression-ON path** (auto-train → compress-all → profile-prep-to-plateau → windowed measure) + canonical 2-config run | ✅ done |
-| F | hardening: §7.4 goal-coverage matrix, `--dry-run` plan, docs | 🔄 in progress |
+| Core | config / corpus / split-math / plateau / run-status | ✅ |
+| benchmark flags | `--value-data corpus:FILE`, `--key-distribution zipf`, `--record-start-signal`, **`--latency-dump`** | ✅ |
+| Orchestrator | server lifecycle, INFO polling, FIFO-barrier loaders, windowed measure, provenance | ✅ |
+| OFF + Compression-ON | auto-train → compress-all (**true completion**) → profile-prep → windowed measure | ✅ |
+| Stable contract | per-command **latency histogram**, **RSS/used/frag series**, INFO `stats`, server-process CPU% | ✅ |
+| Post-processor | merge → true percentiles, consensus outliers, deltas, `report.json` + interactive `report.html` | ✅ |
 
-> Both the **off (reference) baseline** and the **compression-ON** config run end-to-end
-> today. The compression-ON path acquires its dictionary via the server's **automatic
+> The compression-ON path acquires its dictionary via the server's **automatic
 > first-training** (S1.2) — see the [dependency note](#dependency--server-side-training-s12).
 
 ---
 
 ## Prerequisites
 
-- **Python 3.10+** and `pytest`.
+- **Python 3.10+** and `pytest`. The orchestrator + post-processor have **no third-party
+  Python dependencies** (stdlib only); `report.html` loads Plotly from a CDN.
 - **Built Valkey binaries** (from the repo root, with the compression feature):
 
   ```sh
-  make BUILD_ZSTD=yes        # builds src/valkey-server, src/valkey-cli, src/valkey-benchmark,
-                             # and tests/helpers/gen-zstd-dict (the DICT-IMPORT test helper)
+  make BUILD_ZSTD=yes        # builds src/valkey-server, src/valkey-cli, src/valkey-benchmark
+                             # (and tests/helpers/gen-zstd-dict, a DICT-IMPORT test helper)
   ```
-
-  The orchestrator core has **no third-party Python dependencies** (stdlib only).
 
 ### Dependency — server-side training (S1.2)
 
@@ -56,118 +60,113 @@ The compression-ON path relies on the server's **automatic first-training**. Wit
 `compression-master-switch compression`, once the keyspace reaches
 `compression-dict-min-training-keys` (default `1000`) the server trains a ZSTD dictionary on
 a `bio` thread and promotes it; the orchestrator polls `compression_active_dict_id` until it
-is non-zero. Caveats of the current in-tree feature:
-
-- There is **no manual `COMPRESSION TRAIN` command** yet (the `COMPRESSION` container wires
-  only `STATUS` / `HELP` / `DICT-IMPORT` / `SWEEP`).
-- Only the **first-training** trigger is live; drift- and refresh-interval retraining are
-  stubbed — so a run trains exactly one dictionary.
-- `COMPRESSION DICT-IMPORT` (R2.3.10) exists and is exercised by
-  `tests/component/test_compression_cycle.py`, but the orchestrator's product path uses
-  auto-training, not import.
-
-A run therefore needs `key_count ≥ compression-dict-min-training-keys` for the server to
-train at all.
+is non-zero. The current in-tree feature has **no manual `COMPRESSION TRAIN`** and only the
+**first-training** trigger is live (drift/refresh retraining is stubbed). A run therefore
+needs `key_count ≥ compression-dict-min-training-keys`.
 
 ---
 
-## Quick start (how-to)
+## Quick start
 
 ```sh
 cd utils/compression-benchmark
-export SRC="$(cd ../../src && pwd)"     # your built binaries live in src/
+export SRC="$(cd ../../src && pwd)"          # built binaries live in src/
 
-# 1) Validate the config and print the load plan — no server is started (works without binaries).
-python3 orchestrator.py configs/examples/canonical.json --dry-run
-# → DRY RUN — no server or load is started.
-#     server_binary    : valkey-server
-#     iterations       : 3
-#     reference_config : off
-#     target_tps       : 250000  (connections_total=256)
-#     data_model       : key_count=2000000 seed=1234 corpus_entries=50000
-#     loader processes : 5 total
-#       get      4 proc(s), 205 conn, 200000 rps
-#       set      1 proc(s), 51 conn, 50000 rps
-#     configs:
-#       off              [valkey-server] --compression-master-switch off
-#       compression-on   [valkey-server] --compression-master-switch compression ...
+# 1) Validate the config + print the load plan — no server started (works without binaries).
+python3 orchestrator.py configs/examples/local-canonical-shaped.json --dry-run
 
-# 2) Run it for real.
-python3 orchestrator.py configs/examples/off-baseline.json \
+# 2) Run it (off + compression-on, per the config).
+python3 orchestrator.py configs/examples/local-canonical-shaped.json \
     --server-binary    "$SRC/valkey-server" \
     --benchmark-binary "$SRC/valkey-benchmark" \
     --out-root /tmp/cbench-results
+# exit code 0 = overall SUCCESS, 1 = FAILED.
+
+# 3) Produce the charts from the run directory.
+python3 -m postprocessor.postprocess /tmp/cbench-results/<timestamp>
+# → writes <run-dir>/report.json and <run-dir>/report.html  (open report.html in a browser)
 ```
 
-For each config × iteration this:
+Example configs in `configs/examples/`: `canonical.json` (perf-host target: 250k TPS / 2M keys),
+`local-canonical-shaped.json` and `local-1m-defrag.json` (dev-box-tractable; the latter enables
+`active-defrag` on both configs and uses a 60 s window).
 
-1. starts a `valkey-server` **in its own temporary home directory** (the binary is copied in),
-2. **populates** exactly `key_count` keys (`--sequential -r N -n N`, each key once),
-3. drives an **open-loop** load (per-command processes, FIFO-barrier-synchronized start, `--rps`/`--duration`),
-4. samples `used_memory` + `INFO compression` + CPU (mpstat),
-5. writes a **timestamped run directory** of raw artifacts and a **`run-status.json`** verdict.
-
-The process exit code is `0` on overall SUCCESS, `1` on FAILED.
+For each config × iteration the orchestrator: starts a `valkey-server` **in its own temp home
+dir** → **populates** exactly `key_count` keys (`--sequential -r N -n N`) → (compression-ON:
+auto-trains a dict, then **compress-all** to true completion) → drives an **open-loop** load
+(per-command FIFO-barrier-synchronized processes, `--rps`/`--duration`) → samples
+`used_memory`/`used_memory_rss`/fragmentation + `INFO compression`/`stats` + server-process CPU
+and each loader's **`--latency-dump`** histogram → writes a timestamped run directory + a
+`run-status.json` verdict.
 
 ---
 
 ## The run-JSON config
 
 One run-JSON = one `(workload, target TPS) × list of configs` → one run directory.
-Annotated (`configs/examples/off-baseline.json`):
 
 ```jsonc
 {
-  "description": "off baseline — 80/20 GET/SET",
+  "description": "off vs compression-on",
   "output_directory": "results/",                 // run dirs created here (or use --out-root)
   "servers_directory": "/tmp/cbench-servers",      // base for isolated per-server temp dirs
   "benchmark_binary": "valkey-benchmark",          // overridable with --benchmark-binary
   "server_binary":    "valkey-server",             // top-level default; per-config override allowed
-  "iterations": 1,                                 // repeats per config (for statistics)
+  "iterations": 3,                                 // repeats per config (statistics + outlier detection)
   "reference_config": "off",                        // baseline config name; deltas are vs this
+  "setup_timeout_seconds": 180,                     // OPTIONAL (default 180): max wall-time for a
+                                                    //   compression config's setup (auto-train +
+                                                    //   compress-all) before the iteration FAILS.
+                                                    //   Large datasets need more (e.g. 900).
 
-  "data_model": {                                  // dataset shape (corpus is generated from this)
-    "value_shape": "json",                         //   kv | json | log | coordinates
-    "value_size_distribution": "constant:512",     //   constant:N | uniform:MIN:MAX | lognormal:MU:SIGMA
-    "value_size_min": 64, "value_size_max": 16384, //   clamps (esp. for lognormal)
+  "data_model": {                                  // dataset shape (corpus generated from this)
+    "value_shape": "json",                         //   json = realistic, compressible records;
+                                                    //   also kv | log | coordinates
+    "value_size_distribution": "lognormal:512:0.8", //   constant:N | uniform:MIN:MAX | lognormal:MU:SIGMA
+    "value_size_min": 256, "value_size_max": 8192, //   clamps (esp. for lognormal)
     "seed": 1234,                                   //   REQUIRED — reproducible corpus
     "corpus_entries": 50000,                        //   number of representative blobs
     "key_count": 1000000,                           //   dataset size (keys)
-    "key_distribution": "uniform"                   //   uniform | zipf:THETA
+    "key_distribution": "zipf:0.99"                 //   uniform | zipf:THETA
   },
 
   "workload": {
-    "target_tps": 50000,                            // offered TPS (open-loop, split by ratios)
+    "target_tps": 10000,                            // offered TPS (open-loop, split by ratios)
     "commands": [ {"type":"get","ratio":0.8},
                   {"type":"set","ratio":0.2} ],     // ratios must sum to 1.0
-    "connections_total": 50,
-    "max_clients_per_process": 50,                  // single-threaded benchmark per process
+    "connections_total": 16,
+    "max_clients_per_process": 8,                   // single-threaded benchmark per process
     "pipeline": 1,
-    "measurement_duration_seconds": 15
+    "measurement_duration_seconds": 60              // longer windows → more tail samples (see coverage)
   },
 
-  "profile_prep": {                                 // (compression-ON plateau detection — Phase E)
+  "profile_prep": {                                 // compression-ON plateau detection under load
     "plateau_metric": "compression_compressed_objects",
-    "plateau_tolerance_pct": 2, "plateau_window_polls": 3,
-    "poll_interval_seconds": 5, "max_timeout_seconds": 600
+    "plateau_tolerance_pct": 5, "plateau_window_polls": 3,
+    "poll_interval_seconds": 2, "max_timeout_seconds": 300
   },
 
   "configs": [
-    { "name": "off", "compression": { "master_switch": "off" } }
+    { "name": "off", "compression": { "master_switch": "off" } },
+    { "name": "compression-on",
+      "compression": { "master_switch": "compression", "automatic_sweeper": "enabled",
+                       "min_value_size": 256, "max_value_size": 8192, "min_idle_seconds": 2,
+                       "threads": 4 },
+      "extra_args": ["--activedefrag", "yes"] }     // raw server flags, appended after the structured ones
   ]
 }
 ```
 
-**Per-config `compression` block** is *sparse* — only the knobs you set are rendered to
-`--compression-*` server flags; everything else uses the server default. A raw
-`extra_args` list (appended after the structured flags, so it overrides) and a per-config
-`server_binary` override are also supported. See `configs/examples/canonical.json` for the
-2-config before/after (off + compression-on) target example.
+The per-config `compression` block is *sparse* — only knobs you set are rendered to
+`--compression-*` flags. A raw `extra_args` list (e.g. to enable `active-defrag`) and a
+per-config `server_binary` override are also supported. The **authoritative field-by-field
+schema** is §5.1 of the [detailed design](../../.agents/planning/realtime-data-compression/benchmark/design/detailed-design.md);
+invalid configs are rejected up front with a specific `ConfigError` (use `--dry-run`).
 
-The **authoritative field-by-field schema** (types, defaults, validation rules) is §5.1 of
-the [detailed design](../../.agents/planning/realtime-data-compression/benchmark/design/detailed-design.md);
-the annotated example above is the practical reference. Invalid configs are rejected up front
-with a specific `ConfigError` (run `--dry-run` to validate without starting anything).
+> **Corpus realism matters.** The `json` shape models realistic customer/order records
+> (repeated keys + a bounded human-readable vocabulary) so it compresses like real data.
+> A corpus filled with random bytes sits at the entropy floor and makes compression look
+> useless — always sanity-check compressibility (e.g. `zstd -19` on a generated corpus).
 
 ---
 
@@ -175,40 +174,57 @@ with a specific `ConfigError` (run `--dry-run` to validate without starting anyt
 
 ```
 <out-root>/<timestamp>/
-  run-config.json          # echo of your input
+  run-config.json          # verbatim echo of your input
   provenance.json          # binary SHA-256s, machine info, seed, corpus hash
   orchestrator.log
-  run-status.json          # the verdict (below)
+  run-status.json          # the verdict
+  report.json              # (post-processor) reduced numbers: merged percentiles, memory
+  report.html              #   stats, deltas-vs-baseline, outliers, measurement coverage + charts
   <config-name>/<iteration-N>/
     server.log
-    mpstat.log
-    info-measurement.json  # used_memory (incl. MAX) + INFO compression + per-loader rps
-    load/loader-<cmd>-<i>.stdout   # raw valkey-benchmark output (latency distribution)
-    load/loader-<cmd>-<i>.stderr
+    mpstat.log                       # best-effort host CPU
+    info-measurement.json            # the STABLE CONTRACT (below)
+    load/loader-<cmd>-<i>.hist       # raw valkey-benchmark --latency-dump (recorded hdr buckets)
+    load/loader-<cmd>-<i>.stdout/.stderr
 ```
 
-`run-status.json`:
+`info-measurement.json` (the orchestrator→post-processor contract, design §3) carries, per
+iteration: a per-command **`latency`** histogram (summed across the iteration's loader
+processes, exact-merge-ready), a **`memory`** block (`used_memory` / `used_memory_rss` /
+`mem_fragmentation_ratio` series + steady-state window — RSS is the headline), `stats`
+(eviction/OOM, reported not gated), `server_cpu` (server-process %), plus `compression` INFO,
+`compression_config`, `dbsize`, and per-loader rps. The format is valkey-benchmark-independent
+(the orchestrator parses the raw dumps), guarded by a frozen-sample parser test.
 
-```json
-{
-  "overall": "SUCCESS",
-  "configs": {
-    "off": { "status": "SUCCESS", "iterations": [ { "status": "SUCCESS" } ] }
-  }
-}
-```
+A config iteration is **FAILED** (with a `reason`) when: achieved TPS < `target_tps`
+(`target_tps_not_achieved`), the compression profile doesn't stabilize
+(`profile_not_stabilized`), **compress-all doesn't finish within `setup_timeout_seconds`**, the
+server crashes (`server_error`), or a loader errors (`benchmark_error`).
 
-A config iteration is **FAILED** (with a `reason`) when: the achieved TPS falls below
-`target_tps` (`target_tps_not_achieved`), the compression profile doesn't stabilize
-(`profile_not_stabilized`, Phase E), the server crashes (`server_error`), or a loader
-errors (`benchmark_error`).
+---
+
+## The report (charts)
+
+`report.html` is self-contained (Plotly via CDN) and interactive (legend toggle/isolate,
+hover, an absolute↔%-delta toggle). It includes:
+
+- **Pareto** — memory-saved % (X) vs latency penalty (Y), one series per canonical percentile
+  ({p50, p99, p99.9} visible by default; all 7 legend-toggleable).
+- **Latency delta by percentile**, **memory saved %** (delta), **absolute memory** (median over
+  the steady window: RSS vs used_memory), **memory stability** (median + min–max), **per-command
+  heatmap**, **operational headroom** (CPU).
+- **Summary** + **Measurement coverage** tables — the latter shows per-config request counts (⇒
+  tail-percentile sample counts) and iterations kept/total, so limited-sample tail noise is
+  obvious at a glance.
+
+`report.json` is the same reduced data in machine-readable form (feed it to other tools / an LLM).
 
 ---
 
 ## Running the tests
 
 Tier-1 (pure Python) runs everywhere; Tier-2/3 are tagged `needs_server` / `needs_benchmark`
-and **skip** (not fail) when the binaries are absent:
+and **skip** (not fail) when binaries are absent:
 
 ```sh
 cd utils/compression-benchmark
@@ -219,16 +235,25 @@ VALKEY_SERVER="$SRC/valkey-server" VALKEY_BENCHMARK="$SRC/valkey-benchmark" \
     python3 -m pytest -q                   # full suite (Tier-1/2/3)
 ```
 
+The benchmark's `--latency-dump` flag has its own integration tests in
+`tests/integration/valkey-benchmark.tcl`.
+
 ---
 
 ## How it works (phases)
 
-- **OFF (reference) path** — skips training/compression; the path proven end-to-end today:
-  `start → populate (--sequential) → open-loop load + measure (--rps/--duration) → collect → verdict`.
-- **Compression-ON path** — `start → populate (--sequential, corpus values, compression
-  enabled) → auto-train (poll compression_active_dict_id until the server promotes a dict) →
-  compress-all (min-idle 0 + COMPRESSION SWEEP FORCE) → profile-prep under load until the
-  compressed-objects count plateaus → windowed measurement (record-start signal) → collect`.
+- **OFF (reference) path** — `start → populate (--sequential) → open-loop load + measure
+  (--rps/--duration, sampling memory/CPU + per-loader latency dumps) → collect → verdict`.
+- **Compression-ON path** — `start → populate (corpus values, compression enabled) →
+  auto-train (poll compression_active_dict_id) → compress-all (min-idle 0 + COMPRESSION SWEEP
+  FORCE, waiting for the worker queue to **drain** + compressed-objects to hold **steady** —
+  not a premature growth-plateau) → profile-prep under load to plateau → windowed measurement
+  (record-start signal) → collect`. If compress-all can't complete within
+  `setup_timeout_seconds`, the iteration fails (a half-compressed dataset can't be measured
+  at steady state).
+- **Post-processor** — discover SUCCESS iterations → merge per-command histograms across
+  iterations → true percentiles + median memory stats → consensus outlier detection (flag at
+  low iteration counts, drop at higher) → deltas vs baseline → `report.json` → render `report.html`.
 
 ---
 
@@ -237,24 +262,29 @@ VALKEY_SERVER="$SRC/valkey-server" VALKEY_BENCHMARK="$SRC/valkey-benchmark" \
 ```
 orchestrator.py                 # CLI entry / run driver
 lib/config.py                   # run-JSON parse / validate / render
-lib/corpus.py                   # deterministic corpus generation + cache
-lib/benchmark.py                # connection/TPS split math + loader orchestration (FIFO barrier)
-lib/info.py                     # plateau detector + live poller
-lib/server.py                   # valkey-server lifecycle (via valkey-cli)
-lib/dictgen.py                  # train a dict via gen-zstd-dict → DICT-IMPORT (test-time)
+lib/corpus.py                   # deterministic corpus generation (realistic shapes) + cache
+lib/benchmark.py                # split math + loader orchestration (FIFO barrier, --latency-dump)
+lib/info.py                     # plateau + compress-all completion (poll_until_swept) detectors
+lib/latency.py                  # parse/sum --latency-dump histograms → stable schema
+lib/server.py                   # valkey-server lifecycle + INFO + process-CPU sampling
 lib/provenance.py               # binary checksums, machine info, mpstat
 lib/runstatus.py                # SUCCESS/FAILED decision
-lib/phases.py                   # per-config-run phase machine (off path; compression = Phase E)
+lib/phases.py                   # per-config-run phase machine (off + compression-on)
 lib/env.py                      # binary resolution
-configs/examples/               # off-baseline.json (runnable), canonical.json (off + compression-on)
-tests/{unit,component,e2e}/     # Tier-1 / Tier-2 / Tier-3
+postprocessor/reduce.py         # pure reduction → report.json
+postprocessor/render.py         # report.json → interactive Plotly report.html
+postprocessor/postprocess.py    # CLI
+configs/examples/               # canonical.json + local-*.json runnable examples
+tests/{unit,component,e2e,postprocessor}/   # Tier-1 / Tier-2 / Tier-3 + post-processor
 ```
 
 ---
 
 ## Design docs
 
-- Detailed design: `.agents/planning/realtime-data-compression/benchmark/design/detailed-design.md`
-- Build plan: `.agents/planning/realtime-data-compression/benchmark/implementation/plan.md`
-- Requirements Q&A: `.agents/planning/realtime-data-compression/benchmark/idea-honing.md`
-- amz-orc reuse map: `.agents/planning/realtime-data-compression/benchmark/amz-orc-findings.md`
+- Orchestrator design / plan / idea-honing: `.agents/planning/realtime-data-compression/benchmark/`
+  (`design/detailed-design.md`, `implementation/plan.md`, `idea-honing.md`, `amz-orc-findings.md`)
+- Post-processor (+ latency-capture contract) design / plans / decisions:
+  `.agents/planning/realtime-data-compression/benchmark/postprocessor/`
+  (`design/detailed-design.md` incl. §11 empirical hardening, `implementation/plan-{1,2,3}-*.md`,
+  `idea-honing.md`)

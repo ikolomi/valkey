@@ -1,8 +1,17 @@
 # Implementation plan — Compression Benchmark Orchestrator (v1)
 
-**Status:** draft • 2026-06-25
+**Status:** DONE (Phases A–F / M4) + extended • 2026-06-25
 **Design of record:** [`../design/detailed-design.md`](../design/detailed-design.md) (R1.1–R9.2); idea-honing [`../idea-honing.md`](../idea-honing.md) (Q1–Q10)
 **Methodology:** Test-Driven Development (red → green → refactor), iterative, dependency-aware.
+
+> **STATUS BANNER.** Phases A–F are complete (M4). Work has continued **beyond this plan**:
+> the separate **post-processor** (reduction + `report.json` + interactive `report.html`) and a
+> round of **empirical hardening** (latency capture via `--latency-dump` + stable schema, RSS as
+> the headline memory metric, server-process CPU, true compress-all completion,
+> `setup_timeout_seconds`, realistic compressible corpus). Those are planned/tracked in
+> [`../postprocessor/`](../postprocessor/) — `idea-honing.md`, `design/detailed-design.md`
+> (§2 supersedes table, §11 empirical findings), `implementation/plan-{1,2,3}-*.md`. See the
+> design-doc banner for the superseded v1 requirements (R6.1/R6.3/R6.4/§5.5).
 
 ---
 

@@ -1,8 +1,30 @@
 # Detailed Design — Compression Benchmark Orchestrator
 
-_Status: proposed, v1_
+_Status: IMPLEMENTED + extended (see banner below)_
 _Scope: standalone benchmark orchestrator measuring the memory↔latency tradeoff of the in-tree real-time compression feature_
 _Source: [`idea-honing.md`](../idea-honing.md) Q1–Q10; rendering in [`research-rendering-proposal.md`](../research-rendering-proposal.md); reuse map in [`amz-orc-findings.md`](../amz-orc-findings.md)_
+
+> **⚠️ STATUS / SUPERSEDED-REQUIREMENTS BANNER (read first).** This document is the v1
+> orchestrator design as originally proposed. The orchestrator AND the separate
+> **post-processor** are now **implemented**, and several v1 requirements were **revised**
+> during implementation + empirical hardening. The authoritative current statements live in
+> [`../postprocessor/design/detailed-design.md`](../postprocessor/design/detailed-design.md)
+> — §2 (supersedes table) and §11 (empirical findings F1–F5). Specifically:
+> - **R6.1** (headline = MAX `used_memory`; "RSS not used in v1") → **SUPERSEDED**: headline =
+>   **`used_memory_rss`** (median over the steady-state window); `used_memory` + fragmentation
+>   are context. RSS series sampled alongside `used_memory`; **no `MEMORY PURGE`**.
+> - **R6.3** (process-total CPU via mpstat) → **REFINED**: **server-process CPU%**.
+> - **R6.4 / §5.5** (capture the windowed latency histogram; format = textual percentile
+>   distribution) → **IMPLEMENTED via `valkey-benchmark --latency-dump`** (raw hdr buckets) parsed
+>   into a **stable, valkey-benchmark-independent schema** in `info-measurement.json`
+>   (`lib/latency.py`); the textual distributions are NOT mergeable.
+> - **compress-all** now waits for **true completion** (worker queue drained + steady, fails on
+>   timeout) — not a growth-plateau.
+> - **`setup_timeout_seconds`** is a new run-JSON parameter bounding setup before failing.
+> - **value_shape `json`** now generates realistic, compressible records (not a random pad).
+> - The **post-processor** (reduction + `report.json` + interactive `report.html`) is built —
+>   §1.2/§1.4 below call it "future"/"separate"; it now exists under `postprocessor/`.
+
 
 ---
 
@@ -99,10 +121,10 @@ Per config × iteration, the orchestrator executes:
 
 ### 2.6 Metrics capture (Q4, Q9)
 
-- **R6.1** Memory headline = **MAX observed `used_memory`** during the measurement window (transient decompression views are real memory to provision for; MAX is the correct worst case). Full polled time-series retained. **RSS not used in v1.** (Q4, Q9)
+- **R6.1** ⚠️**SUPERSEDED — headline is now `used_memory_rss` (see banner).** ~~Memory headline = **MAX observed `used_memory`** during the measurement window (transient decompression views are real memory to provision for; MAX is the correct worst case). Full polled time-series retained. **RSS not used in v1.**~~ (Q4, Q9)
 - **R6.2** `compression_*` INFO fields captured at measurement end (ratio, compressed_objects, net_saved_bytes, totals, etc.). (Q9)
-- **R6.3** Process-total CPU captured via **mpstat** for the measurement window. (Q9, amz-orc)
-- **R6.4** Each loader process's **windowed latency histogram** (per-bucket counts / full end-of-run distribution) captured raw. (Q2, Q6, Q9)
+- **R6.3** ⚠️**REFINED — server-process CPU% (see banner).** Process CPU captured for the measurement window (now the `valkey-server` process specifically, not host-total mpstat). (Q9, amz-orc)
+- **R6.4** ✅**IMPLEMENTED — via `--latency-dump` → stable schema (see banner).** Each loader process's **windowed latency histogram** captured as raw hdr buckets (`valkey-benchmark --latency-dump`), parsed + summed per command by `lib/latency.py` into a valkey-benchmark-independent `latency` block in `info-measurement.json`. (The textual "percentile distribution" output is NOT cleanly mergeable across processes — raw buckets are.) (Q2, Q6, Q9)
 
 ### 2.7 Output and run-status (Q9)
 
@@ -340,6 +362,15 @@ A flat file of `corpus_entries` blobs consumable by `--value-data corpus:FILE` (
 ### 5.5 Loader windowed-histogram raw output (R6.4, R8.3)
 
 The benchmark emits, per process, the **windowed** "Latency by percentile distribution" including **cumulative per-bucket counts** (the format Q2 established as mergeable). Stored raw (`.hist`); the **post-processor** reconstructs per-bucket counts and sums across processes + iterations to compute true merged percentiles. The orchestrator does not parse these beyond existence/non-empty checks.
+
+> ⚠️ **SUPERSEDED by the implementation** (see banner + postprocessor design §2). The textual
+> "percentile distribution" is **not** cleanly mergeable across processes (per-process value
+> points). The shipped design instead adds **`valkey-benchmark --latency-dump <file>`** which
+> writes the recorded **raw hdr buckets** (`value_usec,count` + an hdr-params header) for the
+> windowed measurement. The **orchestrator** (not the post-processor) parses + sums these per
+> command (`lib/latency.py`) into the stable `latency` block of `info-measurement.json`; the
+> post-processor then merges those per-iteration histograms. A frozen-sample parser test guards
+> against valkey-benchmark format drift.
 
 ---
 
