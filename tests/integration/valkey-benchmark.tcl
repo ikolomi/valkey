@@ -317,6 +317,64 @@ tags {"benchmark network external:skip logreqres:skip"} {
             default_set_get_checks
         }
 
+        # --- T1.1/T1.3: --latency-dump (Plan 1, Piece 1) ---------------------
+        # Windowing composition with --record-start-signal is exercised at the
+        # orchestrator e2e layer (Plan 2), which can deliver the signal async.
+
+        test {benchmark: --latency-dump writes recorded histogram (sum == total == n)} {
+            set dumpfile [file join "/tmp" "vk-latdump-[pid]-[clock clicks].csv"]
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 100 -t set --latency-dump $dumpfile"]
+            common_bench_setup $cmd
+            assert {[file exists $dumpfile]}
+            set f [open $dumpfile r]; set data [read $f]; close $f
+            set lines [split [string trim $data] "\n"]
+            # header: "# hdr lowest=.. highest=.. sigfig=.. total_count=.."
+            assert_match {# hdr lowest=* highest=* sigfig=* total_count=*} [lindex $lines 0]
+            assert {[regexp {total_count=(\d+)} [lindex $lines 0] -> total]}
+            set sum 0
+            foreach ln [lrange $lines 1 end] {
+                if {$ln eq ""} continue
+                lassign [split $ln ","] val cnt
+                incr sum $cnt
+            }
+            assert_equal $total $sum
+            assert_equal 100 $sum
+            file delete $dumpfile
+        }
+
+        test {benchmark: --latency-dump is independent of -q} {
+            set dumpfile [file join "/tmp" "vk-latdump-[pid]-[clock clicks].csv"]
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 100 -t set -q --latency-dump $dumpfile"]
+            set output [common_bench_setup $cmd]
+            # -q stdout still emitted
+            assert {[string match -nocase "*requests per second*" $output]}
+            # dump still written despite -q
+            assert {[file exists $dumpfile]}
+            set f [open $dumpfile r]; set data [read $f]; close $f
+            assert {[regexp {total_count=(\d+)} [string trim $data] -> total]}
+            assert_equal 100 $total
+            file delete $dumpfile
+        }
+
+        test {benchmark: --latency-dump buckets are valid latencies within hdr range} {
+            set dumpfile [file join "/tmp" "vk-latdump-[pid]-[clock clicks].csv"]
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 200 -t set --latency-dump $dumpfile"]
+            common_bench_setup $cmd
+            set f [open $dumpfile r]; set data [read $f]; close $f
+            set lines [split [string trim $data] "\n"]
+            assert {[regexp {lowest=(\d+) highest=(\d+)} [lindex $lines 0] -> lo hi]}
+            set nbuckets 0
+            foreach ln [lrange $lines 1 end] {
+                if {$ln eq ""} continue
+                lassign [split $ln ","] val cnt
+                assert {$val >= $lo && $val <= $hi}
+                assert {$cnt > 0}
+                incr nbuckets
+            }
+            assert {$nbuckets >= 1}
+            file delete $dumpfile
+        }
+
         # tls specific tests
         if {$::tls} {
             test {benchmark: specific tls-ciphers} {

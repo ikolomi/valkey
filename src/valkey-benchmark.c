@@ -96,6 +96,10 @@ typedef enum readFromReplica {
 #define FUZZ_MODE_MALFORMED_COMMANDS (1 << 0)
 #define FUZZ_MODE_CONFIG_COMMANDS (1 << 1)
 
+/* --key-distribution modes (R8.x) */
+#define KEY_DIST_UNIFORM 0
+#define KEY_DIST_ZIPF 1
+
 static struct config {
     aeEventLoop *el;
     enum valkeyConnectionType ct;
@@ -119,6 +123,11 @@ static struct config {
     int replace_placeholders;
     int keyspacelen;
     int sequential_replacement;
+    const char *value_corpus_path;           /* --value-data corpus:FILE; NULL = default random data */
+    int key_distribution;                    /* KEY_DIST_* */
+    double zipf_theta;                       /* --zipf-theta (zipf skew; != 1.0) */
+    double zipf_zetan, zipf_eta, zipf_alpha; /* precomputed by zipfInit() */
+    int record_start_signal;                 /* --record-start-signal SIGNUM; 0 = off (timer warmup) */
     int keepalive;
     int pipeline;
     long long start;
@@ -128,6 +137,7 @@ static struct config {
     list *paused_clients;
     int quiet;
     int csv;
+    const char *latency_dump_file; /* --latency-dump FILE; NULL = off. Dumps recorded hdr buckets. */
     int loop;
     int idlemode;
     sds input_dbnumstr;
@@ -453,6 +463,33 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
     return;
 }
 
+/* Zipfian key generator (R8.x) — Gray et al. / YCSB ZipfianGenerator. zetan, eta
+ * and alpha are precomputed once by zipfInit() over the keyspace [0, keyspacelen);
+ * item 0 is the hottest. random() is already used across threads on this path. */
+static double zipfZeta(uint64_t n, double theta) {
+    double sum = 0.0;
+    for (uint64_t i = 1; i <= n; i++) sum += 1.0 / pow((double)i, theta);
+    return sum;
+}
+
+static void zipfInit(void) {
+    uint64_t n = (uint64_t)config.keyspacelen;
+    double theta = config.zipf_theta;
+    config.zipf_zetan = zipfZeta(n, theta);
+    config.zipf_alpha = 1.0 / (1.0 - theta);
+    double zeta2 = 1.0 + pow(0.5, theta); /* zeta(2, theta) */
+    config.zipf_eta = (1.0 - pow(2.0 / (double)n, 1.0 - theta)) / (1.0 - zeta2 / config.zipf_zetan);
+}
+
+static uint64_t zipfNext(void) {
+    double u = (double)random() / ((double)RAND_MAX + 1.0);
+    double uz = u * config.zipf_zetan;
+    if (uz < 1.0) return 0;
+    if (uz < 1.0 + pow(0.5, config.zipf_theta)) return 1;
+    return (uint64_t)((double)config.keyspacelen *
+                      pow(config.zipf_eta * u - config.zipf_eta + 1.0, config.zipf_alpha));
+}
+
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
     if (count == 0) return;
 
@@ -460,6 +497,8 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
     if (config.keyspacelen != 0) {
         if (config.sequential_replacement) {
             key = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
+        } else if (config.key_distribution == KEY_DIST_ZIPF) {
+            key = zipfNext();
         } else {
             key = random();
         }
@@ -503,6 +542,128 @@ static void replacePlaceholders(char *cmd_data, int cmd_count) {
             replacePlaceholder(indices, count, cmd, key_counter);
         }
     }
+}
+
+/* ---- corpus-backed value data (--value-data corpus:FILE), R8.1 ----
+ * A separate, mutually-exclusive command-generation path. Incompatible with the
+ * in-place fixed-stride mechanism (which bakes one value and pokes only the key),
+ * so corpus mode rebuilds the SET command per request from the next corpus entry.
+ * The corpus file (orchestrator format: [4-byte BE len][bytes]* ) is loaded once
+ * into a single buffer; entries index into it. Read-only and static after load,
+ * so it is shared lock-free across client threads (only an atomic round-robin
+ * cursor is mutated). Pipeline is forced to 1 in corpus mode. */
+typedef struct {
+    const char *ptr;
+    uint32_t len;
+} corpusEntry;
+
+static struct {
+    char *buf;
+    size_t buflen;
+    corpusEntry *entries;
+    size_t n;
+    _Atomic uint64_t cursor;
+} corpus = {0};
+
+static int g_corpus_set_active = 0; /* 1 while the corpus SET benchmark runs */
+static sds g_corpus_head = NULL;    /* "*3\r\n$3\r\nSET\r\n$<klen>\r\nkey<tag>:" */
+static size_t g_corpus_headlen = 0;
+static _Atomic uint64_t g_corpus_seqkey = 0;
+
+static void loadCorpus(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Could not open corpus file %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    if (fseek(fp, 0, SEEK_END) != 0 || ftell(fp) < 0) {
+        fprintf(stderr, "corpus file %s: seek/size error\n", path);
+        exit(1);
+    }
+    long sz = ftell(fp);
+    rewind(fp);
+    corpus.buf = zmalloc((size_t)sz);
+    if (sz > 0 && fread(corpus.buf, 1, (size_t)sz, fp) != (size_t)sz) {
+        fprintf(stderr, "corpus file %s: read error\n", path);
+        exit(1);
+    }
+    fclose(fp);
+    corpus.buflen = (size_t)sz;
+
+    /* Parse [4-byte big-endian len][bytes]* */
+    size_t cap = 1024;
+    corpus.entries = zmalloc(sizeof(corpusEntry) * cap);
+    corpus.n = 0;
+    size_t off = 0;
+    while (off + 4 <= corpus.buflen) {
+        unsigned char *p = (unsigned char *)corpus.buf + off;
+        uint32_t l = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        off += 4;
+        if (off + l > corpus.buflen) {
+            fprintf(stderr, "corpus file %s: truncated/malformed at offset %zu\n", path, off);
+            exit(1);
+        }
+        if (corpus.n == cap) {
+            cap *= 2;
+            corpus.entries = zrealloc(corpus.entries, sizeof(corpusEntry) * cap);
+        }
+        corpus.entries[corpus.n].ptr = corpus.buf + off;
+        corpus.entries[corpus.n].len = l;
+        corpus.n++;
+        off += l;
+    }
+    if (corpus.n == 0) {
+        fprintf(stderr, "corpus file %s contains no entries\n", path);
+        exit(1);
+    }
+}
+
+/* Precompute the constant command head for corpus SET. The key field is fixed
+ * width ("key<tag>:" + 12 digits), so its bulk header is constant; only the value
+ * bulk header varies per request. */
+static void prepareCorpusSetHead(const char *tag) {
+    int klen = 3 + (int)strlen(tag) + 1 + 12; /* "key" + tag + ":" + 12-digit */
+    g_corpus_head = sdscatprintf(sdsempty(), "*3\r\n$3\r\nSET\r\n$%d\r\nkey%s:", klen, tag);
+    g_corpus_headlen = sdslen(g_corpus_head);
+    atomic_store_explicit(&g_corpus_seqkey, 0, memory_order_relaxed);
+    atomic_store_explicit(&corpus.cursor, 0, memory_order_relaxed);
+}
+
+/* Rebuild "SET key<tag>:<12-digit> <value>" from the next corpus entry into the
+ * client's obuf (after its prefix), reusing the buffer's capacity. Hot path:
+ * one small snprintf for the value bulk header + one memcpy of the value bytes. */
+static void buildCorpusSetObuf(client c) {
+    uint64_t idx = atomic_fetch_add_explicit(&corpus.cursor, 1, memory_order_relaxed) % corpus.n;
+    const char *val = corpus.entries[idx].ptr;
+    uint32_t vlen = corpus.entries[idx].len;
+
+    uint64_t key = 0;
+    if (config.keyspacelen != 0) {
+        if (config.sequential_replacement)
+            key = atomic_fetch_add_explicit(&g_corpus_seqkey, 1, memory_order_relaxed);
+        else if (config.key_distribution == KEY_DIST_ZIPF)
+            key = zipfNext();
+        else
+            key = (uint64_t)random();
+        key %= (uint64_t)config.keyspacelen;
+    }
+
+    sds o = c->obuf;
+    sdssetlen(o, c->prefixlen);
+    o[c->prefixlen] = '\0';
+    o = sdscatlen(o, g_corpus_head, g_corpus_headlen);
+    char kd[12];
+    for (int j = 11; j >= 0; j--) {
+        kd[j] = (char)('0' + key % 10);
+        key /= 10;
+    }
+    o = sdscatlen(o, kd, 12);
+    char vh[24];
+    int vhlen = snprintf(vh, sizeof(vh), "\r\n$%u\r\n", (unsigned)vlen);
+    o = sdscatlen(o, vh, (size_t)vhlen);
+    o = sdscatlen(o, val, vlen);
+    o = sdscatlen(o, "\r\n", 2);
+    c->obuf = o;
 }
 
 static void releasePausedClient(client c) {
@@ -865,7 +1026,10 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         /* Really initialize: replace keys and set start time. */
-        if (config.replace_placeholders) replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
+        if (g_corpus_set_active)
+            buildCorpusSetObuf(c);
+        else if (config.replace_placeholders)
+            replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
         if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
@@ -1121,6 +1285,27 @@ static void showRPSReport(void) {
     }
 }
 
+/* Dump the recorded latency-histogram buckets to config.latency_dump_file as
+ * "value_usec,count" lines (preceded by an hdr-params header), so the windowed
+ * per-process distributions can be summed losslessly across processes and
+ * iterations by a post-processor. Runs regardless of -q / --csv. */
+static void dumpLatencyHistogram(void) {
+    if (config.latency_dump_file == NULL) return;
+    FILE *fp = fopen(config.latency_dump_file, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "Could not open --latency-dump file \"%s\": %s\n", config.latency_dump_file, strerror(errno));
+        exit(1);
+    }
+    struct hdr_histogram *h = config.latency_histogram;
+    fprintf(fp, "# hdr lowest=%lld highest=%lld sigfig=%d total_count=%lld\n", (long long)h->lowest_discernible_value, (long long)h->highest_trackable_value, (int)h->significant_figures, (long long)h->total_count);
+    struct hdr_iter iter;
+    hdr_iter_recorded_init(&iter, h);
+    while (hdr_iter_next(&iter)) {
+        fprintf(fp, "%lld,%lld\n", (long long)iter.value_iterated_to, (long long)iter.count);
+    }
+    fclose(fp);
+}
+
 static void showReport(void) {
     const float reqpersec = (float)config.requests_finished / ((float)config.totlatency / 1000.0f);
     const float p0 = ((float)hdr_min(config.latency_histogram)) / 1000.0f;
@@ -1129,6 +1314,9 @@ static void showReport(void) {
     const float p99 = hdr_value_at_percentile(config.latency_histogram, 99.0) / 1000.0f;
     const float p100 = ((float)hdr_max(config.latency_histogram)) / 1000.0f;
     const float avg = hdr_mean(config.latency_histogram) / 1000.0f;
+
+    /* Dump the raw windowed histogram first — independent of -q / --csv. */
+    dumpLatencyHistogram();
 
     if (!config.quiet && !config.csv) {
         printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
@@ -1658,6 +1846,10 @@ int parseOptions(int argc, char **argv) {
             config.duration = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--warmup")) {
             if (lastarg) goto invalid;
+            if (config.record_start_signal > 0) {
+                fprintf(stderr, "Options --warmup and --record-start-signal are mutually exclusive.\n");
+                exit(1);
+            }
             config.warmup_duration = atoi(argv[++i]);
 
         } else if (!strcmp(argv[i], "-k")) {
@@ -1720,6 +1912,43 @@ int parseOptions(int argc, char **argv) {
             if (config.keyspacelen < 0) config.keyspacelen = 0;
         } else if (!strcmp(argv[i], "--sequential")) {
             config.sequential_replacement = 1;
+        } else if (!strcmp(argv[i], "--value-data")) {
+            if (lastarg) goto invalid;
+            char *m = argv[++i];
+            if (!strncmp(m, "corpus:", 7)) {
+                config.value_corpus_path = m + 7;
+            } else {
+                printf("Unsupported --value-data '%s' (expected corpus:FILE)\n", m);
+                exit(1);
+            }
+        } else if (!strcmp(argv[i], "--key-distribution")) {
+            if (lastarg) goto invalid;
+            char *m = argv[++i];
+            if (!strcmp(m, "uniform")) {
+                config.key_distribution = KEY_DIST_UNIFORM;
+            } else if (!strcmp(m, "zipf")) {
+                config.key_distribution = KEY_DIST_ZIPF;
+            } else {
+                printf("Unsupported --key-distribution '%s' (expected uniform|zipf)\n", m);
+                exit(1);
+            }
+        } else if (!strcmp(argv[i], "--zipf-theta")) {
+            if (lastarg) goto invalid;
+            config.zipf_theta = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--record-start-signal")) {
+            if (lastarg) goto invalid;
+            if (config.warmup_duration > 0) {
+                fprintf(stderr, "Options --warmup and --record-start-signal are mutually exclusive.\n");
+                exit(1);
+            }
+            config.record_start_signal = atoi(argv[++i]);
+            if (config.record_start_signal <= 0) {
+                printf("--record-start-signal requires a positive signal number\n");
+                exit(1);
+            }
+        } else if (!strcmp(argv[i], "--latency-dump")) {
+            if (lastarg) goto invalid;
+            config.latency_dump_file = argv[++i];
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -1981,6 +2210,9 @@ usage:
         "                    the number of times the command sequence is sent in each\n"
         "                    pipeline.\n",
         " -q                 Quiet. Just show query/sec values\n"
+        " --latency-dump <file> After the measured window, dump the recorded latency\n"
+        "                    histogram to <file> ('value_usec,count' per line, with an\n"
+        "                    hdr-params header) for lossless cross-process merging. Works with -q.\n"
         " --precision        Number of decimal places to display in latency output\n"
         "                    (default 0)\n"
         " --csv              Output in CSV format\n"
@@ -2033,6 +2265,17 @@ usage:
     exit(exit_status);
 }
 
+/* Windowed recording (R8.3): with --record-start-signal the measurement window
+ * starts when this signal is received (not on a timer), so the orchestrator can
+ * begin measuring exactly at the compression plateau. The handler is async-signal-
+ * safe (only sets the flag); showThroughput performs the warmup-exit reset when it
+ * observes the flag. */
+static volatile sig_atomic_t g_record_start = 0;
+static void recordStartSignalHandler(int sig) {
+    (void)sig;
+    g_record_start = 1;
+}
+
 long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
@@ -2048,7 +2291,12 @@ long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clie
     }
     int warmup_duration = atomic_load_explicit(&config.current_warmup_duration, memory_order_relaxed);
     if (warmup_duration > 0) {
-        if ((current_tick - config.start) >= (warmup_duration * 1000LL)) {
+        /* Exit warmup on the record-start signal (windowed recording, R8.3) when
+         * --record-start-signal is set; otherwise on the warmup timer (#2581). */
+        int exit_warmup = (config.record_start_signal > 0)
+                              ? (g_record_start != 0)
+                              : ((current_tick - config.start) >= (warmup_duration * 1000LL));
+        if (exit_warmup) {
             /* exit the warmup period, clear all stats */
             atomic_store_explicit(&config.current_warmup_duration, 0, memory_order_relaxed);
 
@@ -2187,8 +2435,13 @@ int main(int argc, char **argv) {
     config.replace_placeholders = 0;
     config.keyspacelen = 0;
     config.sequential_replacement = 0;
+    config.value_corpus_path = NULL;
+    config.key_distribution = KEY_DIST_UNIFORM;
+    config.zipf_theta = 0.99;
+    config.record_start_signal = 0;
     config.quiet = 0;
     config.csv = 0;
+    config.latency_dump_file = NULL;
     config.loop = 0;
     config.idlemode = 0;
     config.clients = listCreate();
@@ -2226,6 +2479,36 @@ int main(int argc, char **argv) {
 
     /* Set default for requests if not specified */
     if (config.requests < 0) config.requests = 100000;
+
+    /* Initialize the Zipfian key generator if requested (R8.x). */
+    if (config.key_distribution == KEY_DIST_ZIPF) {
+        if (config.keyspacelen < 2) {
+            fprintf(stderr, "--key-distribution zipf requires -r >= 2\n");
+            exit(1);
+        }
+        if (config.zipf_theta <= 0.0 || config.zipf_theta == 1.0) {
+            fprintf(stderr, "--zipf-theta must be > 0 and != 1.0 (got %g)\n", config.zipf_theta);
+            exit(1);
+        }
+        zipfInit();
+    }
+
+    /* Windowed recording (R8.3): start the measured window on a signal, not a timer.
+     * Enter warmup (so isBenchmarkFinished waits) and install the handler; the
+     * warmup-exit in showThroughput is gated on the signal flag instead of time. */
+    if (config.record_start_signal > 0) {
+        if (config.warmup_duration <= 0) config.warmup_duration = 1; /* enter warmup; gated by the signal */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = recordStartSignalHandler;
+        sa.sa_flags = SA_RESTART; /* don't surface EINTR to the client I/O paths */
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(config.record_start_signal, &sa, NULL) != 0) {
+            fprintf(stderr, "Could not install --record-start-signal handler for signal %d: %s\n",
+                    config.record_start_signal, strerror(errno));
+            exit(1);
+        }
+    }
 
     tag = "";
 
@@ -2429,6 +2712,13 @@ int main(int argc, char **argv) {
     }
 
     /* Run default benchmark suite. */
+    if (config.value_corpus_path != NULL) {
+        loadCorpus(config.value_corpus_path);
+        if (config.pipeline != 1) {
+            fprintf(stderr, "Note: --value-data corpus forces pipeline=1 (was %d)\n", config.pipeline);
+            config.pipeline = 1;
+        }
+    }
     data = zmalloc(config.datasize + 1);
     do {
         genBenchmarkRandomData(data, config.datasize);
@@ -2443,9 +2733,22 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
-            benchmark("SET", cmd, len);
-            free(cmd);
+            if (config.value_corpus_path != NULL) {
+                /* Separate corpus path: rebuild the SET command per request from
+                 * the next corpus entry (writeHandler -> buildCorpusSetObuf). */
+                prepareCorpusSetHead(tag);
+                g_corpus_set_active = 1;
+                len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+                benchmark("SET", cmd, len);
+                free(cmd);
+                g_corpus_set_active = 0;
+                sdsfree(g_corpus_head);
+                g_corpus_head = NULL;
+            } else {
+                len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+                benchmark("SET", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("get")) {

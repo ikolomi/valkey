@@ -1,0 +1,9 @@
+# Python / pytest
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Run + corpus artifacts
+results/
+.corpus-cache/
+*.run/

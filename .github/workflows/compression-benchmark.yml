@@ -1,0 +1,55 @@
+name: Compression-benchmark orchestrator
+
+# Validates the standalone compression-benchmark orchestrator
+# (utils/compression-benchmark) against freshly-built Valkey binaries.
+# Additive + path-filtered: it only runs when the orchestrator, the server-side
+# compression feature, or the valkey-benchmark modifications it depends on change.
+
+on:
+  push:
+    paths:
+      - 'utils/compression-benchmark/**'
+      - 'src/compression*'
+      - 'src/valkey-benchmark.c'
+      - '.github/workflows/compression-benchmark.yml'
+  pull_request:
+    paths:
+      - 'utils/compression-benchmark/**'
+      - 'src/compression*'
+      - 'src/valkey-benchmark.c'
+      - '.github/workflows/compression-benchmark.yml'
+
+concurrency:
+  group: compression-benchmark-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrator-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install build + test deps
+        # pkg-config: server build; python3-pytest: test runner (apt avoids PEP668);
+        # sysstat: provides mpstat for the orchestrator's CPU capture.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config python3-pytest sysstat
+      - name: Build valkey-server + valkey-benchmark (BUILD_ZSTD=yes)
+        # The default `all` target also builds tests/helpers/gen-zstd-dict
+        # (it is in ALL_BUILD_PREREQUISITES when BUILD_ZSTD=yes), which the
+        # DICT-IMPORT component test uses.
+        run: make -j4 BUILD_ZSTD=yes SERVER_CFLAGS=-Werror
+      - name: Run orchestrator tests (Tier-1/2/3)
+        # -v: per-test names + result; -ra: end-of-run summary of skips/xfails/etc
+        # (so a silently-skipped tier is visible); --durations: the slowest tests.
+        run: |
+          cd utils/compression-benchmark
+          SRC="$(cd ../../src && pwd)"
+          VALKEY_SERVER="$SRC/valkey-server" \
+          VALKEY_BENCHMARK="$SRC/valkey-benchmark" \
+          VALKEY_CLI="$SRC/valkey-cli" \
+            python3 -m pytest -v -ra --durations=20

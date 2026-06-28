@@ -1,0 +1,44 @@
+{
+  "description": "off baseline — 80/20 GET/SET, 50K TPS, 1M keys, 512B JSON values",
+  "output_directory": "results/",
+  "servers_directory": "/tmp/cbench-servers",
+  "benchmark_binary": "valkey-benchmark",
+  "server_binary": "valkey-server",
+  "iterations": 1,
+  "reference_config": "off",
+
+  "data_model": {
+    "value_shape": "json",
+    "value_size_distribution": "constant:512",
+    "value_size_min": 64,
+    "value_size_max": 16384,
+    "seed": 1234,
+    "corpus_entries": 50000,
+    "key_count": 1000000,
+    "key_distribution": "uniform"
+  },
+
+  "workload": {
+    "target_tps": 50000,
+    "commands": [
+      { "type": "get", "ratio": 0.8 },
+      { "type": "set", "ratio": 0.2 }
+    ],
+    "connections_total": 50,
+    "max_clients_per_process": 50,
+    "pipeline": 1,
+    "measurement_duration_seconds": 15
+  },
+
+  "profile_prep": {
+    "plateau_metric": "compression_compressed_objects",
+    "plateau_tolerance_pct": 2,
+    "plateau_window_polls": 3,
+    "poll_interval_seconds": 5,
+    "max_timeout_seconds": 600
+  },
+
+  "configs": [
+    { "name": "off", "compression": { "master_switch": "off" } }
+  ]
+}
