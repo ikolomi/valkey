@@ -1,0 +1,597 @@
+{
+  "workload": {
+    "description": "1M keys, 75 KTPS, 60s window, active-defrag OFF, compressible realistic JSON corpus. Studies the memory<->latency tradeoff with stabilized tails + defrag RSS reclaim.",
+    "target_tps": 75000,
+    "commands": [
+      {
+        "type": "get",
+        "ratio": 0.8
+      },
+      {
+        "type": "set",
+        "ratio": 0.2
+      }
+    ],
+    "connections_total": 128,
+    "max_clients_per_process": 16,
+    "pipeline": 1,
+    "measurement_duration_seconds": 60,
+    "iterations": 1,
+    "value_size_distribution": "lognormal:512:0.8",
+    "value_size_min": 256,
+    "value_size_max": 8192,
+    "key_distribution": "zipf:0.99",
+    "key_count": 1000000,
+    "corpus_entries": 50000,
+    "seed": 1234,
+    "corpus_sha256": "sha256:64c90b3cce6e31c8c008ee27b7f27daa23d6559346cdd13d23c43f45aebf0c08"
+  },
+  "baseline": "compression-off",
+  "overall": "SUCCESS",
+  "configs": {
+    "compression-off": {
+      "status": "SUCCESS",
+      "iterations": {
+        "kept": [
+          0
+        ],
+        "flagged_outliers": []
+      },
+      "memory": {
+        "rss_bytes": 715206656.0,
+        "used_memory_bytes": 698865000.0,
+        "frag_ratio": 1.0233831369434727,
+        "memory_saved_pct": 0.0,
+        "used_memory_saved_pct": 0.0,
+        "rss_stats": {
+          "min": 715206656,
+          "max": 719724544,
+          "mean": 715472827.7333333,
+          "median": 715206656.0,
+          "p25": 715206656,
+          "p75": 715206656,
+          "p90": 715546624,
+          "p95": 715546624,
+          "p99": 719462400,
+          "stddev": 911177.7302276775,
+          "samples": 120
+        },
+        "used_stats": {
+          "min": 698606544,
+          "max": 700831040,
+          "mean": 698908137.5333333,
+          "median": 698865000.0,
+          "p25": 698864960,
+          "p75": 698865000,
+          "p90": 698865000,
+          "p95": 698865000,
+          "p99": 700692800,
+          "stddev": 269365.58283749287,
+          "samples": 120
+        },
+        "per_iteration_rss_median": [
+          715206656.0
+        ]
+      },
+      "latency": {
+        "aggregate": {
+          "p50": {
+            "usec": 344,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          },
+          "p90": {
+            "usec": 1176,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          },
+          "p95": {
+            "usec": 1512,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          },
+          "p99": {
+            "usec": 2128,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          },
+          "p99.9": {
+            "usec": 4032,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          },
+          "p99.99": {
+            "usec": 7568,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          },
+          "p99.999": {
+            "usec": 12136,
+            "delta_usec": 0,
+            "delta_pct": 0.0
+          }
+        },
+        "per_command": {
+          "get": {
+            "p50": {
+              "usec": 352,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p90": {
+              "usec": 1176,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p95": {
+              "usec": 1512,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99": {
+              "usec": 2128,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99.9": {
+              "usec": 4024,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99.99": {
+              "usec": 7504,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99.999": {
+              "usec": 10856,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            }
+          },
+          "set": {
+            "p50": {
+              "usec": 320,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p90": {
+              "usec": 1192,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p95": {
+              "usec": 1520,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99": {
+              "usec": 2128,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99.9": {
+              "usec": 4056,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99.99": {
+              "usec": 7728,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            },
+            "p99.999": {
+              "usec": 13704,
+              "delta_usec": 0,
+              "delta_pct": 0.0
+            }
+          }
+        }
+      },
+      "cpu": {
+        "pct_total": 85.61518763631459,
+        "delta_pct": 0.0
+      },
+      "stats": {
+        "evicted_keys": 0,
+        "rejected_connections": 0,
+        "expired_keys": 0,
+        "keyspace_misses": 0
+      },
+      "compression": {
+        "ratio": "0.0000",
+        "net_saved_bytes": "0",
+        "compressed_objects": "0"
+      },
+      "samples": {
+        "requests_total": 4499847,
+        "per_command": {
+          "get": 3599839,
+          "set": 900008
+        },
+        "per_iteration_p99": [
+          2128
+        ],
+        "memory_samples": 120,
+        "iterations_kept": 1,
+        "iterations_total": 1
+      }
+    },
+    "compression-on-idle-1s": {
+      "status": "SUCCESS",
+      "iterations": {
+        "kept": [
+          0
+        ],
+        "flagged_outliers": []
+      },
+      "memory": {
+        "rss_bytes": 434180096.0,
+        "used_memory_bytes": 368480424.0,
+        "frag_ratio": 1.1782989481145407,
+        "memory_saved_pct": 39.29305713843916,
+        "used_memory_saved_pct": 47.2744487132708,
+        "rss_stats": {
+          "min": 386732032,
+          "max": 483332096,
+          "mean": 433643690.6666667,
+          "median": 434180096.0,
+          "p25": 406523904,
+          "p75": 460001280,
+          "p90": 474025984,
+          "p95": 478744576,
+          "p99": 482545664,
+          "stddev": 29950526.768615622,
+          "samples": 120
+        },
+        "used_stats": {
+          "min": 304016040,
+          "max": 414664488,
+          "mean": 365716752.73333335,
+          "median": 368480424.0,
+          "p25": 339553256,
+          "p75": 392708816,
+          "p90": 405793912,
+          "p95": 410074896,
+          "p99": 413846264,
+          "stddev": 31283484.56439846,
+          "samples": 120
+        },
+        "per_iteration_rss_median": [
+          434180096.0
+        ]
+      },
+      "latency": {
+        "aggregate": {
+          "p50": {
+            "usec": 400,
+            "delta_usec": 56,
+            "delta_pct": 16.27906976744186
+          },
+          "p90": {
+            "usec": 1376,
+            "delta_usec": 200,
+            "delta_pct": 17.006802721088434
+          },
+          "p95": {
+            "usec": 1656,
+            "delta_usec": 144,
+            "delta_pct": 9.523809523809524
+          },
+          "p99": {
+            "usec": 2336,
+            "delta_usec": 208,
+            "delta_pct": 9.774436090225564
+          },
+          "p99.9": {
+            "usec": 3952,
+            "delta_usec": -80,
+            "delta_pct": -1.9841269841269842
+          },
+          "p99.99": {
+            "usec": 5816,
+            "delta_usec": -1752,
+            "delta_pct": -23.150105708245242
+          },
+          "p99.999": {
+            "usec": 10240,
+            "delta_usec": -1896,
+            "delta_pct": -15.622940013183916
+          }
+        },
+        "per_command": {
+          "get": {
+            "p50": {
+              "usec": 400,
+              "delta_usec": 48,
+              "delta_pct": 13.636363636363637
+            },
+            "p90": {
+              "usec": 1376,
+              "delta_usec": 200,
+              "delta_pct": 17.006802721088434
+            },
+            "p95": {
+              "usec": 1656,
+              "delta_usec": 144,
+              "delta_pct": 9.523809523809524
+            },
+            "p99": {
+              "usec": 2336,
+              "delta_usec": 208,
+              "delta_pct": 9.774436090225564
+            },
+            "p99.9": {
+              "usec": 3968,
+              "delta_usec": -56,
+              "delta_pct": -1.3916500994035785
+            },
+            "p99.99": {
+              "usec": 5680,
+              "delta_usec": -1824,
+              "delta_pct": -24.307036247334754
+            },
+            "p99.999": {
+              "usec": 8672,
+              "delta_usec": -2184,
+              "delta_pct": -20.117907148120853
+            }
+          },
+          "set": {
+            "p50": {
+              "usec": 376,
+              "delta_usec": 56,
+              "delta_pct": 17.5
+            },
+            "p90": {
+              "usec": 1384,
+              "delta_usec": 192,
+              "delta_pct": 16.107382550335572
+            },
+            "p95": {
+              "usec": 1664,
+              "delta_usec": 144,
+              "delta_pct": 9.473684210526315
+            },
+            "p99": {
+              "usec": 2336,
+              "delta_usec": 208,
+              "delta_pct": 9.774436090225564
+            },
+            "p99.9": {
+              "usec": 3904,
+              "delta_usec": -152,
+              "delta_pct": -3.747534516765286
+            },
+            "p99.99": {
+              "usec": 6032,
+              "delta_usec": -1696,
+              "delta_pct": -21.946169772256727
+            },
+            "p99.999": {
+              "usec": 12104,
+              "delta_usec": -1600,
+              "delta_pct": -11.675423234092236
+            }
+          }
+        }
+      },
+      "cpu": {
+        "pct_total": 89.43825986599468,
+        "delta_pct": 4.465413596849372
+      },
+      "stats": {
+        "evicted_keys": 0,
+        "rejected_connections": 0,
+        "expired_keys": 0,
+        "keyspace_misses": 0
+      },
+      "compression": {
+        "ratio": "0.2879",
+        "net_saved_bytes": "401977764",
+        "compressed_objects": "779975"
+      },
+      "samples": {
+        "requests_total": 4499862,
+        "per_command": {
+          "get": 3599852,
+          "set": 900010
+        },
+        "per_iteration_p99": [
+          2336
+        ],
+        "memory_samples": 120,
+        "iterations_kept": 1,
+        "iterations_total": 1
+      }
+    },
+    "compression-on-idle-2s": {
+      "status": "SUCCESS",
+      "iterations": {
+        "kept": [
+          0
+        ],
+        "flagged_outliers": []
+      },
+      "memory": {
+        "rss_bytes": 431599616.0,
+        "used_memory_bytes": 368627864.0,
+        "frag_ratio": 1.1708274337069646,
+        "memory_saved_pct": 39.6538591497672,
+        "used_memory_saved_pct": 47.25335164874475,
+        "rss_stats": {
+          "min": 380678144,
+          "max": 480423936,
+          "mean": 430573977.6,
+          "median": 431599616.0,
+          "p25": 403877888,
+          "p75": 457486336,
+          "p90": 471379968,
+          "p95": 475967488,
+          "p99": 479375360,
+          "stddev": 30463372.53406735,
+          "samples": 120
+        },
+        "used_stats": {
+          "min": 304013248,
+          "max": 414596824,
+          "mean": 365866761.6666667,
+          "median": 368627864.0,
+          "p25": 339862720,
+          "p75": 393097448,
+          "p90": 406057008,
+          "p95": 410352216,
+          "p99": 413880160,
+          "stddev": 31316114.037468527,
+          "samples": 120
+        },
+        "per_iteration_rss_median": [
+          431599616.0
+        ]
+      },
+      "latency": {
+        "aggregate": {
+          "p50": {
+            "usec": 448,
+            "delta_usec": 104,
+            "delta_pct": 30.232558139534884
+          },
+          "p90": {
+            "usec": 1592,
+            "delta_usec": 416,
+            "delta_pct": 35.374149659863946
+          },
+          "p95": {
+            "usec": 1800,
+            "delta_usec": 288,
+            "delta_pct": 19.047619047619047
+          },
+          "p99": {
+            "usec": 2568,
+            "delta_usec": 440,
+            "delta_pct": 20.67669172932331
+          },
+          "p99.9": {
+            "usec": 3992,
+            "delta_usec": -40,
+            "delta_pct": -0.9920634920634921
+          },
+          "p99.99": {
+            "usec": 5672,
+            "delta_usec": -1896,
+            "delta_pct": -25.052854122621564
+          },
+          "p99.999": {
+            "usec": 7680,
+            "delta_usec": -4456,
+            "delta_pct": -36.717205009887934
+          }
+        },
+        "per_command": {
+          "get": {
+            "p50": {
+              "usec": 456,
+              "delta_usec": 104,
+              "delta_pct": 29.545454545454547
+            },
+            "p90": {
+              "usec": 1592,
+              "delta_usec": 416,
+              "delta_pct": 35.374149659863946
+            },
+            "p95": {
+              "usec": 1800,
+              "delta_usec": 288,
+              "delta_pct": 19.047619047619047
+            },
+            "p99": {
+              "usec": 2568,
+              "delta_usec": 440,
+              "delta_pct": 20.67669172932331
+            },
+            "p99.9": {
+              "usec": 4000,
+              "delta_usec": -24,
+              "delta_pct": -0.5964214711729622
+            },
+            "p99.99": {
+              "usec": 5664,
+              "delta_usec": -1840,
+              "delta_pct": -24.520255863539447
+            },
+            "p99.999": {
+              "usec": 7664,
+              "delta_usec": -3192,
+              "delta_pct": -29.403095062638172
+            }
+          },
+          "set": {
+            "p50": {
+              "usec": 432,
+              "delta_usec": 112,
+              "delta_pct": 35.0
+            },
+            "p90": {
+              "usec": 1600,
+              "delta_usec": 408,
+              "delta_pct": 34.22818791946309
+            },
+            "p95": {
+              "usec": 1808,
+              "delta_usec": 288,
+              "delta_pct": 18.94736842105263
+            },
+            "p99": {
+              "usec": 2560,
+              "delta_usec": 432,
+              "delta_pct": 20.30075187969925
+            },
+            "p99.9": {
+              "usec": 3936,
+              "delta_usec": -120,
+              "delta_pct": -2.9585798816568047
+            },
+            "p99.99": {
+              "usec": 5680,
+              "delta_usec": -2048,
+              "delta_pct": -26.501035196687372
+            },
+            "p99.999": {
+              "usec": 7864,
+              "delta_usec": -5840,
+              "delta_pct": -42.61529480443666
+            }
+          }
+        }
+      },
+      "cpu": {
+        "pct_total": 91.12619756598866,
+        "delta_pct": 6.4369536315032505
+      },
+      "stats": {
+        "evicted_keys": 0,
+        "rejected_connections": 0,
+        "expired_keys": 0,
+        "keyspace_misses": 0
+      },
+      "compression": {
+        "ratio": "0.2882",
+        "net_saved_bytes": "401594317",
+        "compressed_objects": "780136"
+      },
+      "samples": {
+        "requests_total": 4499818,
+        "per_command": {
+          "get": 3599815,
+          "set": 900003
+        },
+        "per_iteration_p99": [
+          2568
+        ],
+        "memory_samples": 120,
+        "iterations_kept": 1,
+        "iterations_total": 1
+      }
+    }
+  }
+}

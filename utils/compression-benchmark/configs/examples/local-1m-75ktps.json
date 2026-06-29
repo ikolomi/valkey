@@ -1,0 +1,79 @@
+{
+  "description": "1M keys, 75 KTPS, 60s window, active-defrag OFF, compressible realistic JSON corpus. Studies the memory<->latency tradeoff with stabilized tails + defrag RSS reclaim.",
+  "output_directory": "/tmp/cbench-1m-defrag/results",
+  "servers_directory": "/tmp/cbench-1m-defrag/servers",
+  "benchmark_binary": "valkey-benchmark",
+  "server_binary": "valkey-server",
+  "iterations": 1,
+  "reference_config": "compression-off",
+  "setup_timeout_seconds": 900,
+
+  "data_model": {
+    "value_shape": "json",
+    "value_size_distribution": "lognormal:512:0.8",
+    "value_size_min": 256,
+    "value_size_max": 8192,
+    "seed": 1234,
+    "corpus_entries": 50000,
+    "key_count": 1000000,
+    "key_distribution": "zipf:0.99"
+  },
+
+  "workload": {
+    "target_tps": 75000,
+    "commands": [
+      { "type": "get", "ratio": 0.8 },
+      { "type": "set", "ratio": 0.2 }
+    ],
+    "connections_total": 128,
+    "max_clients_per_process": 16,
+    "pipeline": 1,
+    "measurement_duration_seconds": 60
+  },
+
+  "profile_prep": {
+    "plateau_metric": "compression_compressed_objects",
+    "plateau_tolerance_pct": 5,
+    "plateau_window_polls": 3,
+    "poll_interval_seconds": 2,
+    "max_timeout_seconds": 300
+  },
+  "configs_ref_only": [
+    {
+      "name": "compression-off",
+      "compression": { "master_switch": "off" },
+      "extra_args": ["--activedefrag", "no", "--active-defrag-ignore-bytes", "10mb", "--active-defrag-threshold-lower", "5"]
+    }
+  ],
+  "configs": [
+    {
+      "name": "compression-off",
+      "compression": { "master_switch": "off" },
+      "extra_args": ["--activedefrag", "no", "--active-defrag-ignore-bytes", "10mb", "--active-defrag-threshold-lower", "5"]
+    },
+    {
+      "name": "compression-on-idle-1s",
+      "compression": {
+        "master_switch": "compression",
+        "automatic_sweeper": "enabled",
+        "min_value_size": 256,
+        "max_value_size": 8192,
+        "min_idle_seconds": 1,
+        "threads": 4
+      },
+      "extra_args": ["--activedefrag", "no", "--active-defrag-ignore-bytes", "10mb", "--active-defrag-threshold-lower", "5"]
+    },
+    {
+      "name": "compression-on-idle-2s",
+      "compression": {
+        "master_switch": "compression",
+        "automatic_sweeper": "enabled",
+        "min_value_size": 256,
+        "max_value_size": 8192,
+        "min_idle_seconds": 2,
+        "threads": 4
+      },
+      "extra_args": ["--activedefrag", "no", "--active-defrag-ignore-bytes", "10mb", "--active-defrag-threshold-lower", "5"]
+    }
+  ]
+}
