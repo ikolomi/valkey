@@ -1,231 +1,91 @@
-# Session checkpoint — 2026-05-20
+# Session checkpoint — 2026-06-22 (post S2.14)
 
-_Written before context restart. Read this first when resuming the session._
-
----
-
-## What we're doing
-
-Implementing the **inline-compression feature** for Valkey, tracked at
-[`valkey-io/valkey#3423`](https://github.com/valkey-io/valkey/issues/3423). User is
-[@ikolomi](https://github.com/ikolomi) (lead engineer). Co-owner is `@GilboaAWS`.
-
-Working directory: `/home/ANT.AMAZON.COM/ikolomin/valkey-private/valkey`
-Fork remote: `origin → https://github.com/ikolomi/valkey.git`
-**Don't push to upstream `valkey-io/valkey` ever.**
+_Written before context compaction. Read this first when resuming._
 
 ---
 
-## Current branch + commit state
+## Where we are
 
-- Active branch: **`ikolomi/s2-hot-path`** (off `unstable`)
-- HEAD commit: **`5909950dc`** — *Inline compression: S2.1 — header codec + compressed-object alloc/free*
-- `unstable` HEAD: `204420ef7` (ZSTD vendor merge, PR #5)
-- **Branch is local-only — not pushed.**
+`unstable` HEAD: `1dc7f7238` ([S2.14] Fix DEBUG DIGEST crash on compressed values, #43).
 
-To verify after restart:
+Realtime-compression v1, post-S2 sequencing override. **Phase A is DONE.** Next: **the user will start a discussion of next steps** (likely Phase B transparency mode §7.1, now unblocked, vs. helping @GilboaAWS on S1.x, vs. Phase C benchmarks). Do NOT pick the next task unilaterally — wait for the discussion.
 
+### Recent merge history (unstable)
+
+```
+1dc7f7238  [S2.14] Fix DEBUG DIGEST crash on compressed values (#43)   <- just merged (mine)
+546174b30  [S2.13] COW-invariant merge-blocker test (#41)              <- mine
+7cdcf7ee5  fix(S2): remove install-path frame-ref double-count (#42)   <- @GilboaAWS fixed bug #3
+279d5cfd7  [S4.1 / Phase A item 1] Wire INFO compression observability counters (#39)  <- mine
+499c73e1c  [planning] plan.md sequencing override (#37)
+```
+
+## What PR #43 (S2.14) delivered — MERGED
+
+- **Fix (`src/debug.c`):** `DEBUG DIGEST` / `DEBUG DIGEST-VALUE` crashed (`serverPanic "Unknown encoding type"`, object.c:945) on compressed values. They read the kvstore directly (`computeDatasetDigest`→`kvstoreIteratorNext`; DIGEST-VALUE→`dbFind`) to digest logically-expired keys, bypassing the `lookupKey` transient-view hook, and fed compressed robjs into `getDecodedObject`. Fixed by routing `mixStringObjectDigest` + `xorStringObjectDigest` through `objectGetUncompressedView` (R2.5.2) — same pattern PR #24 used for `rdbSaveStringObject`/`rioWriteBulkObject`. Compressed → digest the scratch sds directly (NOT via getDecodedObject: incrRefCount on the OBJ_STATIC_REFCOUNT view panics); else getDecodedObject (INT). Added `#include "compression.h"` to debug.c.
+- **Test:** `tests/unit/compression-debug-readers.tcl` (`external:skip`, auto-discovered). 3 tests — DIGEST transparency (digest byte-identical compressed vs decompressed over 20 keys), DIGEST-VALUE transparency, DEBUG RELOAD round-trip.
+- **Docs:** design R2.5.7 lists DEBUG DIGEST/DIGEST-VALUE among explicit-decompression kvstore-direct readers; plan.md S2.14 marked done.
+- **Full audit outcome:** only the two digest paths crashed. Safe: OBJECT* (LOOKUP_NO_BYTES→strEncoding "compressed"), DEBUG SDSLEN (guarded by !sdsEncodedObject), DEBUG OBJECT (strEncoding + PR#24-fixed rdbSavedObjectLen), argv/already-lookupKey'd getDecodedObject callers, dbUnshareStringValue (write-path, lookupKeyWrite decompresses first).
+
+## Known deferred items (NOT mine to fix; flag to owners)
+
+- **MEMORY USAGE reports UNCOMPRESSED size** on compressed values (decompresses via transient view since it doesn't pass LOOKUP_NO_BYTES → objectComputeSize sees RAW). No crash, but R2.7.3 wants compressed footprint. = **S3.5, @GilboaAWS** (persistence/accounting subsystem, unchecked in plan.md). Worth flagging to him.
+- **DEBUG OBJECT** missing R2.7.2 fields (`dictID/compressedlength/uncompressedlength`) — feature gap, separate.
+- **Bug #3 (frame-ref leak)** — @GilboaAWS fixed via #42 ("remove install-path frame-ref double-count"). If the lingering-dict / can't-reclaim-registry behavior matters again, re-verify it's resolved.
+
+## @GilboaAWS activity (relevant)
+- #42 merged (frame-ref double-count fix). #40 = "[S1/S4] Training metrics (INFO compression) + integration tests" (overlaps the 3 rolling-rate INFO fields I left stubbed in #39 + the `training` state — check if merged/in-flight).
+- Origin branches: `gilboa/s1-training-metrics-and-integ-tests`, `gilboa/fix-install-double-count`.
+- **S1.x (auto-training) status is the key input** for choosing Phase B vs Phase C — establish it in the next-steps discussion.
+
+## Candidate next steps (for the upcoming discussion — do not start unprompted)
+1. **Phase B — transparency mode (§7.1):** run the full Tcl corpus under `--compression`. NOW UNBLOCKED (S4.x counters #39, S2.13 COW #41, S2.14 digest #43 all landed — the crashes/false-positives that would have plagued it are closed). Add `--compression` flag to runtest, audit corpus for legitimate encoding-specific assertions, tag `compression:skip`, CI matrix cell. This is the natural next @ikolomi piece.
+2. **Help @GilboaAWS on S1.x** (auto-training) — if it's stuck/lagging, pairing here unblocks Phase C and the customer-experience story.
+3. **Phase C — benchmarks (§7.5)** — needs S1.x auto-trained dicts first (else measures an import-dict setup, not the customer experience). S5.1 flag scaffolding could start independently.
+4. Small cleanups: flag MEMORY USAGE (S3.5) to @GilboaAWS; the 3 stubbed INFO rolling-rate fields from #39 (may be covered by @GilboaAWS #40).
+
+See `implementation/post-s2-strategy.md` for the full Phase A/B/C reasoning and review triggers.
+
+## Standing rules (carried forward)
+- **Discuss-then-implement** for scope; don't modify files until told go/proceed.
+- **TODO-mark** superseded/placeholder code with `TODO(target):`.
+- **When amending code, audit comments for staleness.**
+- **Targeted `git add`** — never `-A`. Skip SESSION_CHECKPOINT.md, post-s2-strategy.md, pr-body-*.md, tests/helpers/gen-zstd-dict, .pr-body-*.tmp.md.
+- **`--force-with-lease`**; push only to `origin` (ikolomi fork), NEVER upstream valkey-io. Never push to unstable directly.
+- **Build:** `make -j2 -C src SERVER_CFLAGS=-Werror`; verify both `BUILD_ZSTD={yes,no}`.
+- **gtest:** `PKG_CONFIG_PATH=/usr/local/lib/pkgconfig make -j2 -C src test-unit`. NEVER mention this in commits/PR bodies.
+- **clang-format-18 not installed locally**; CI validates.
+- **gh CLI** for PR ops. **`gh pr create --body-file` needs a repo-relative path** (gh's mount ns can't read /tmp).
+- **PR body / commit text:** never mention the local gtest PKG_CONFIG path.
+
+## Hard-won gotchas (still relevant)
+1. **`return` inside a Tcl `test {} {body}` crashes the framework.** Use if/else.
+2. **`external:skip` tag** = `start_server {tags {"compression" "external:skip"}}` — skips the whole block when `$::external`. Use for tests that reconfigure the server globally. (tests/support/server.tcl:249)
+3. **Shared external server**: ALL test files share ONE server (unit, unit/type, unit/cluster, integration order). Stateful compression tests must be external:skip or they pollute unit/type/compression's pristine-defaults assertions and crash later DEBUG DIGEST (well, DIGEST is fixed now, but the pollution principle stands).
+4. **R2.5.7 transient-view memory cap**: reading a compressed value when cumulative savings < its uncompressed size → PERMANENT decompress (memory-safe by design). NOTE: the DEBUG DIGEST fix decodes via objectGetUncompressedView DIRECTLY (no side-map, no cap) — cap is irrelevant to digest.
+5. **master=decompression auto-retires the active dict (R2.1.5).** So after decompressing, re-compressing needs a NEW imported/trained dict (R2.1.7 third state otherwise). This bit the debug-readers test — dbg_compress_all re-imports a fresh dict each call.
+6. **Default `compression-min-idle-seconds=60`** skips freshly-written keys from compression. Tests must set it to 0 (plus min-value-size low, min-savings-ratio 0) to compress promptly.
+7. **`pkill -f 'valkey-server.*PORT'` matches the shell script's own text** (heredoc/command contains those strings) → SIGTERMs own shell → empty output, exit "signal: 15". AVOID; use `valkey-cli -p PORT shutdown nosave` and distinct ports.
+8. Flaky CI on compression branches: `build-32bit` (`CompressionTrainTest.BufferCapStopsCollection`) and `test-external-cluster` (`unit/type/compression` DICT-IMPORT) — both pre-existing in @GilboaAWS's training/dict-import code; re-run to clear.
+
+## Build / test cheatsheet
 ```sh
 cd /home/ANT.AMAZON.COM/ikolomin/valkey-private/valkey
-git -P branch --show-current        # → ikolomi/s2-hot-path
-git -P log --oneline -n 5
-git -P log --oneline @{upstream}..HEAD 2>/dev/null
+make -j2 -C src SERVER_CFLAGS=-Werror              # add BUILD_ZSTD=no to verify the other flavor
+PKG_CONFIG_PATH=/usr/local/lib/pkgconfig make -j2 -C src test-unit
+./runtest --single unit/compression-debug-readers  # normal mode (3 tests)
+./runtest --single unit/compression-cow-invariant
+./runtest --single integration/compression
+# external sim (verify a stateful test skips / doesn't pollute):
+./src/valkey-server --port 7844 --daemonize yes --save "" --logfile /tmp/ext.log --dir /tmp \
+  --enable-protected-configs yes --enable-debug-command yes --enable-module-command yes
+./runtest --host 127.0.0.1 --port 7844 --singledb --single unit/compression-debug-readers --single unit/other --single unit/type/compression
+./src/valkey-cli -p 7844 shutdown nosave
 ```
 
----
-
-## What just landed (S2.1)
-
-Per [`implementation/plan.md`](implementation/plan.md) Phase 1 / S2.1 — the first piece of
-the @ikolomi-owned S2 (compression hot path) subsystem.
-
-**Files changed in commit `5909950dc`:**
-
-| File | Change |
-|---|---|
-| `src/server.h` | Added `OBJ_ENCODING_COMPRESSED 12` constant per design §5.1 |
-| `src/compression_header.c` | Filled in `createCompressedObject` + `freeCompressedObject` (Phase 0 had stubs) |
-| `src/object.c` | `freeStringObject` dispatches to `freeCompressedObject` for the new encoding; added `#include "compression_header.h"` |
-| `src/unit/test_compression_header.cpp` | New gtest, 270 lines, 11 test cases |
-
-**Verified locally:**
-- `make -j$(nproc) -C src` — server build green
-- `./runtest --single unit/type/compression` — Phase 0 fixture still 10/10
-- Runtime smoke: SET/GET/OBJECT ENCODING — works; values still `embstr`/`raw`
-  because no active dict in registry yet (registry is still Phase 0 stubs)
-
-**NOT verified locally — depends on CI when pushed:**
-- `gtest` unit tests — `libgtest-dev` / `libgmock-dev` not installed locally
-- `clang-format-18` — not installed locally
-
-The new test file follows the same patterns as existing `src/unit/test_*.cpp`
-(particularly `test_endianconv.cpp`, `test_object.cpp`). Syntactic risk is low.
+## Next action when resuming
+**Wait for the user's next-steps discussion.** Likely outcome = Phase B (transparency mode) since it's now unblocked, but confirm @GilboaAWS's S1.x status first (it decides Phase B vs Phase C vs help-on-S1.x). Reference `post-s2-strategy.md` review triggers.
 
 ---
 
-## Pending decision (was on the table when user asked for checkpoint)
-
-After S2.1 commit, three options were offered:
-
-1. **Push the branch and let CI validate** — same pattern as Phase 0 PR #3:
-   if `clang-format-18` or gtest catches issues, fix in a follow-up commit on
-   the same branch. Establishes a remote PR for review visibility.
-
-2. **Stay local and start S2.2 (eligibility predicate)** — keep stacking S2
-   sub-tasks on the branch before pushing. Can also do S2.3 / S2.4 / S2.6
-   locally before push since none have hard S1 dependencies.
-
-3. **Install `gtest` + `clang-format-18` locally** — requires sudo:
-   `sudo apt install libgtest-dev libgmock-dev clang-format-18`. Faster
-   iteration on subsequent S2.x sub-tasks, but a one-time setup cost.
-
-User has not chosen yet — pick this up after restart.
-
----
-
-## S2 sub-task plan (revised order — see `plan.md` §5 for full task list)
-
-S2 (`L` effort, 4+ weeks, 10 sub-tasks) is the @ikolomi track for Phase 1.
-Recommended order:
-
-1. ✅ **S2.1** header codec — *DONE in commit `5909950dc`*
-2. **S2.2** eligibility predicate — independent of S1, can land next
-3. **S2.3** incompressible-keys hashtable — independent of S1
-4. **S2.4** worker pool — independent of S1
-5. **S2.6** decoder path (with fixture DDict in tests) — soft dep on S1
-6. **S2.5** encoder path (with fixture CDict in tests) — soft dep on S1
-7. **S2.7** write-path hook — depends on S2.2/S2.5
-8. **S2.8** read-path hook — depends on S2.6
-9. **S2.9** master switch + sweep — depends on S2.7
-10. **S2.10** cron integration — final integration
-
-Decoder before encoder because decoder is simpler (sync, one-shot) vs.
-encoder (async, worker-pool plumbing).
-
-**S2.5 / S2.6 dependency on S1**: real registry hasn't landed yet. The
-`gilboa/s1-dict-lifecycle` PR (#4) was misleadingly named — it was only an
-ownership-doc reassignment in `plan.md`, not actual S1 code. Registry stubs
-still return NULL for everything. For S2.5/S2.6 we'll build test-only fixture
-CDict/DDict pairs in the gtest, since you can't test encode/decode without a
-dict in the registry.
-
----
-
-## Critical context corrections (lessons learned)
-
-- **Don't trust branch names for delivery state.** I (the agent) initially
-  read `gilboa/s1-dict-lifecycle` and assumed S1 was implemented. The user
-  caught the error. Always verify with `git diff --stat <commit>^..<commit>`
-  and read the actual files.
-- **Phase 0 is more complete than the plan summary suggested.** The codec
-  `compressionHeaderEncode`/`Decode` were already real implementations
-  (not stubs) in Phase 0. Only `createCompressedObject` /
-  `freeCompressedObject` needed filling in for S2.1.
-- **Phase 0 skeleton conventions are documented in headers.** Read
-  `src/compression_*.h` headers carefully — they have detailed
-  `Phase 0:` / `Phase 1:` markers and an explicit ownership contract for
-  the buffer.
-
----
-
-## Standing rules carried across the session
-
-- **Never push to upstream `valkey-io/valkey`.** Push only to fork `origin`
-  (= `ikolomi/valkey`).
-- **Don't push without explicit user confirmation.** This includes when
-  adding follow-up commits to an already-pushed branch.
-- **Don't commit without explicit user ask** — except when the user has
-  established a working pattern of asking and committing in batch (true
-  for the most recent S2.1 commit; user said "let's proceed" and
-  expected the work to land).
-- **GitHub auth:** `gh` CLI with token at `~/kiro-cli.tok`. Use as
-  `export GH_TOKEN=$(cat ~/kiro-cli.tok)` then call `gh api …`.
-
----
-
-## Key file references
-
-| File | Role |
-|---|---|
-| [`design/detailed-design.md`](design/detailed-design.md) | The detailed design (§1–§7 + Appendices A–D). Authoritative. |
-| [`idea-honing.md`](idea-honing.md) | Q1–Q16 requirements with walkthrough decisions folded in |
-| [`implementation/plan.md`](implementation/plan.md) | Phased parallel-ownership implementation plan, sub-task lists |
-| [`DESIGN_TODO.md`](DESIGN_TODO.md) | 31-thread review walkthrough audit trail (all addressed) |
-| [`pr-feedback.json`](pr-feedback.json) | Machine-readable mirror of DESIGN_TODO |
-| [`summary.md`](summary.md) | Single-page feature summary |
-| [`proposal-issue.md`](proposal-issue.md) | Working copy of the upstream GitHub issue text + extensions (untracked locally; user may post to upstream issue) |
-| [`research/`](research/) | 7 research notes |
-| [`tools/{fetch,normalize,post}-pr-comments.py`](tools/) | PR roundtrip toolchain |
-
-The `proposal-issue.md` is **untracked** in git (intentionally — user said
-"forget about proposal-issue.md" when starting S2 work). It contains the
-upstream-issue extension drafted earlier with v1/v2 scope summary + "case
-for sync decompression in v1" section.
-
----
-
-## Build / test commands cheatsheet
-
-```sh
-# Build server (BUILD_ZSTD default = yes; the deps/zstd vendor is in place)
-cd /home/ANT.AMAZON.COM/ikolomin/valkey-private/valkey/src
-make -j$(nproc) 2>&1 | tail -3
-
-# Integration tests (Tcl-based, no gtest needed)
-cd /home/ANT.AMAZON.COM/ikolomin/valkey-private/valkey
-./runtest --single unit/type/compression
-./runtest --single unit/introspection
-
-# Unit tests (gtest-based, NEEDS libgtest-dev installed)
-make -C src test-unit
-
-# Quick server runtime smoke
-./src/valkey-server --port 16385 --daemonize yes --logfile /tmp/vk-smoke.log --dir /tmp
-sleep 1
-./src/valkey-cli -p 16385 SET k v
-./src/valkey-cli -p 16385 OBJECT ENCODING k
-./src/valkey-cli -p 16385 shutdown nosave 2>/dev/null; true
-```
-
----
-
-## Recent commits on `unstable` (timeline context)
-
-```
-204420ef7  vendor ZSTD 1.5.5 library for inline compression (#5)   ← Phase 0 deps
-78783ff32  Merge PR #4 from ikolomi/gilboa/s1-dict-lifecycle       ← ownership reassign only
-f30fb3509  docs(plan): reassign S5 to @ikolomi, S6 to @GilboaAWS
-15d2d0a3f  docs(plan): reassign S1 to @GilboaAWS, S6 to @ikolomi, mark Phase 0 complete
-8d3859b40  Merge PR #3 from ikolomi/phase-0-skeleton               ← Phase 0 skeleton
-9b38836aa  Inline compression: drop legacy underscore alias on compression-cpulist
-d6598971a  Inline compression: fix CI failures on Phase 0 skeleton PR
-c1ca5173a  Inline compression: queue back-pressure observability
-7c00e9f08  Inline compression: Phase 0 review follow-ups
-1c6d68f34  Inline compression: Phase 0 skeleton
-```
-
-Then on `ikolomi/s2-hot-path`:
-
-```
-5909950dc  Inline compression: S2.1 — header codec + compressed-object alloc/free  ← HEAD
-```
-
----
-
-## Open items / context not blocking S2 work
-
-1. **`proposal-issue.md` extensions** — the user drafted v1/v2 scope + sync-decompression
-   case but hasn't posted to upstream issue yet. Two unresolved nits flagged but
-   intentionally left in: dash ambiguity in v1/v2 table; `LZ4 / snappy / hardware
-   emitted` cell over-claim. User said "forget about proposal-issue.md" when starting
-   S2 work — these are deferred.
-2. **CI re-run on push** — when we push `ikolomi/s2-hot-path`, expect to repeat the
-   PR #3 pattern: clang-format / gtest may flag issues. Plan is to fix as follow-up
-   commits on the same branch, not amend.
-3. **S1 still pending @GilboaAWS** — affects when S2.5/S2.6 can move from "test
-   fixture" to real integration.
-
----
-
-_End of checkpoint. Resume by reading `implementation/plan.md` Phase 1 / S2 task
-list, then ask the user whether to push S2.1 or continue locally with S2.2._
+_End of checkpoint. Safe to compact: PR #43 merged to unstable; working tree clean; no uncommitted real work._
